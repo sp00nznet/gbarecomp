@@ -394,10 +394,76 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
                     block->is_return = true;
                     block->num_successors = 0;
                 } else {
-                    block->has_indirect = true;
-                    block->num_successors = 0;
-                    /* BX to a register - might switch to ARM mode.
-                     * We can't resolve this statically without data flow analysis. */
+                    /* Check for POP {Rn}; BX Rn return pattern */
+                    bool is_pop_bx_return = false;
+                    u8 bx_reg = (u8)insn.rs;
+
+                    /* Scan backward for POP that loaded this register */
+                    for (u32 scan = addr - 2; scan >= start; scan -= 2) {
+                        u16 scan_raw = rom_read16(ctx->rom, scan);
+                        ThumbInsn scan_insn = thumb_decode(scan_raw);
+
+                        /* POP {Rn} where Rn matches BX operand */
+                        if (scan_insn.type == THUMB_PUSH_POP && scan_insn.is_load &&
+                            (scan_insn.rlist & (1 << bx_reg))) {
+                            is_pop_bx_return = true;
+                            break;
+                        }
+
+                        /* If something else writes to bx_reg, it's not a return */
+                        if (scan_insn.type == THUMB_MOV_CMP_ADD_SUB_IMM &&
+                            (u8)scan_insn.rd == bx_reg) break;
+                        if ((scan_insn.type == THUMB_ALU_OPS ||
+                             scan_insn.type == THUMB_HI_REG_OPS ||
+                             scan_insn.type == THUMB_MOVE_SHIFTED ||
+                             scan_insn.type == THUMB_ADD_SUB) &&
+                            (u8)scan_insn.rd == bx_reg) break;
+                        if (scan_insn.type == THUMB_PC_REL_LOAD &&
+                            (u8)scan_insn.rd == bx_reg) break;
+
+                        /* Don't scan too far */
+                        if (addr - scan > 20) break;
+                        if (scan == 0) break;
+                    }
+
+                    if (is_pop_bx_return) {
+                        block->is_return = true;
+                        block->num_successors = 0;
+                    } else {
+                        /* Try to resolve via literal pool (same as ARM) */
+                        bool resolved = false;
+                        for (u32 scan = addr - 2; scan >= start; scan -= 2) {
+                            u16 scan_raw = rom_read16(ctx->rom, scan);
+                            ThumbInsn scan_insn = thumb_decode(scan_raw);
+
+                            if (scan_insn.type == THUMB_PC_REL_LOAD &&
+                                (u8)scan_insn.rd == bx_reg) {
+                                u32 pc_val = (scan + 4) & ~3u;
+                                u32 pool_addr = pc_val + scan_insn.imm;
+                                u32 target = rom_read32(ctx->rom, pool_addr);
+                                bool target_thumb = (target & 1) != 0;
+                                target &= ~1u;
+
+                                if (addr_in_rom(ctx, target)) {
+                                    block->successors[0] = target;
+                                    block->num_successors = 1;
+                                    block->has_indirect = false;
+                                    resolved = true;
+                                    queue_push(ctx, target,
+                                              target_thumb ? CODE_THUMB : CODE_ARM,
+                                              addr, false);
+                                }
+                                break;
+                            }
+                            if (addr - scan > 20) break;
+                            if (scan == 0) break;
+                        }
+
+                        if (!resolved) {
+                            block->has_indirect = true;
+                            block->num_successors = 0;
+                        }
+                    }
                 }
             } else {
                 block->num_successors = 0;
@@ -763,6 +829,70 @@ void analysis_run(AnalysisCtx* ctx) {
     detect_jump_tables(ctx);
     printf("[analysis] Found %d jump tables, now %d blocks, %d functions\n",
            ctx->num_jump_tables, ctx->num_blocks, ctx->num_functions);
+
+    /* Phase 4: Scan for Thumb function prologues in unanalyzed regions.
+     * Most GBA Thumb functions begin with PUSH {... LR} (0xB5xx).
+     * This finds functions not reachable from the entry point. */
+    printf("[analysis] Phase 4: Scanning for function prologues...\n");
+    {
+        int found = 0;
+        for (u32 offset = 0; offset + 2 <= ctx->rom->size; offset += 2) {
+            u32 addr = GBA_ROM_START + offset;
+
+            /* Skip already-analyzed regions */
+            if (is_visited(ctx, addr)) continue;
+
+            u16 raw = rom_read16(ctx->rom, addr);
+
+            /* Thumb PUSH {... LR}: top byte = 0xB5 (bits 15:8 = 10110101) */
+            if ((raw & 0xFF00) == 0xB500) {
+                /* Validate: next few instructions should look like code, not data */
+                bool looks_valid = true;
+                for (int i = 1; i <= 3 && looks_valid; i++) {
+                    u32 check_addr = addr + (u32)(i * 2);
+                    if (check_addr + 2 > GBA_ROM_START + ctx->rom->size) {
+                        looks_valid = false;
+                        break;
+                    }
+                    u16 check = rom_read16(ctx->rom, check_addr);
+                    /* Reject if it looks like an ARM instruction or garbage */
+                    /* 0x0000 and 0xFFFF are suspicious */
+                    if (check == 0x0000 || check == 0xFFFF) {
+                        looks_valid = false;
+                    }
+                }
+
+                if (looks_valid) {
+                    queue_push(ctx, addr, CODE_THUMB, 0, true);
+                    found++;
+                }
+            }
+
+            /* ARM function prologue: STMDB SP!, {... LR} = 0xE92Dxxxx with bit 14 set */
+            if (offset % 4 == 0 && offset + 4 <= ctx->rom->size) {
+                u32 raw32 = rom_read32(ctx->rom, addr);
+                if ((raw32 & 0xFFFF0000) == 0xE92D0000 && (raw32 & (1 << 14))) {
+                    queue_push(ctx, addr, CODE_ARM, 0, true);
+                    found++;
+                }
+            }
+        }
+        printf("[analysis] Found %d potential function prologues\n", found);
+
+        /* Process all newly found functions */
+        int new_iteration = 0;
+        while (!queue_empty(ctx)) {
+            WorkItem item = queue_pop(ctx);
+            process_work_item(ctx, &item);
+            new_iteration++;
+            if (new_iteration % 10000 == 0) {
+                printf("[analysis] Phase 4: %d items processed, %d blocks, %d functions\n",
+                       new_iteration, ctx->num_blocks, ctx->num_functions);
+            }
+        }
+        printf("[analysis] Phase 4 complete: %d blocks, %d functions\n",
+               ctx->num_blocks, ctx->num_functions);
+    }
 
     /* Sort blocks and functions by address */
     qsort(ctx->blocks, ctx->num_blocks, sizeof(BasicBlock), block_cmp);
