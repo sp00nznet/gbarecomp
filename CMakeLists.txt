@@ -18,6 +18,8 @@ set(SOURCES
     src/arm.c
     src/thumb.c
     src/disasm.c
+    src/analysis.c
+    src/translate.c
 )
 
 # Main executable
