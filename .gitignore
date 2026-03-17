@@ -1,0 +1,35 @@
+# Build artifacts
+build/
+*.o
+*.obj
+*.exe
+*.elf
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Generated output
+output/
+
+# ROMs - do not commit copyrighted game data
+*.gba
+*.zip
+*.7z
+*.rar
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Dependencies
+deps/
+external/
