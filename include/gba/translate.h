@@ -14,6 +14,9 @@ typedef struct {
     const AnalysisCtx* analysis;
     FILE* out;              /* Output C file */
     int indent;             /* Current indentation level */
+    /* Current function's local block addresses (for goto validation) */
+    u32* local_blocks;
+    int num_local_blocks;
 } TranslateCtx;
 
 /* Create a translator context. `out` is the output file to write C code to. */

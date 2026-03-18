@@ -4,6 +4,39 @@
 #include <string.h>
 #include <stdarg.h>
 
+/* ---- Goto target validation ---- */
+
+/* Check if target address is a block owned by the current function */
+static bool is_local_label(TranslateCtx* ctx, u32 addr) {
+    for (int i = 0; i < ctx->num_local_blocks; i++) {
+        if (ctx->local_blocks[i] == addr) return true;
+    }
+    return false;
+}
+
+/* Emit a goto or tail-call depending on whether the target is local */
+static void emit_goto_or_tailcall(TranslateCtx* ctx, u32 target) {
+    if (is_local_label(ctx, target)) {
+        for (int i = 0; i < ctx->indent; i++) fprintf(ctx->out, "    ");
+        fprintf(ctx->out, "goto label_%08X;\n", target);
+    } else {
+        /* Target is in a different function - emit tail call */
+        for (int i = 0; i < ctx->indent; i++) fprintf(ctx->out, "    ");
+        fprintf(ctx->out, "func_%08X(); return; /* tail branch */\n", target);
+    }
+}
+
+/* Emit a conditional goto or tail-call */
+static void emit_cond_goto_or_tailcall(TranslateCtx* ctx, const char* cond, u32 target) {
+    if (is_local_label(ctx, target)) {
+        for (int i = 0; i < ctx->indent; i++) fprintf(ctx->out, "    ");
+        fprintf(ctx->out, "if (%s) goto label_%08X;\n", cond, target);
+    } else {
+        for (int i = 0; i < ctx->indent; i++) fprintf(ctx->out, "    ");
+        fprintf(ctx->out, "if (%s) { func_%08X(); return; } /* tail branch */\n", cond, target);
+    }
+}
+
 /* ---- Output helpers ---- */
 
 static void emit(TranslateCtx* ctx, const char* fmt, ...) {
@@ -358,9 +391,12 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
     /* ---- Branch ---- */
     case ARM_B: {
         u32 target = addr + 8 + (u32)insn->branch_offset;
-        begin_cond(ctx, insn->cond);
-        emit(ctx, "goto label_%08X;", target);
-        end_cond(ctx, insn->cond);
+        if (insn->cond == COND_AL) {
+            emit_goto_or_tailcall(ctx, target);
+        } else {
+            const char* c = cond_to_c(insn->cond);
+            if (c) emit_cond_goto_or_tailcall(ctx, c, target);
+        }
         break;
     }
 
@@ -912,9 +948,9 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
         u32 target = addr + 4 + (u32)insn->offset;
         const char* c = cond_to_c(insn->cond);
         if (c) {
-            emit(ctx, "if (%s) goto label_%08X;", c, target);
+            emit_cond_goto_or_tailcall(ctx, c, target);
         } else {
-            emit(ctx, "goto label_%08X;", target);
+            emit_goto_or_tailcall(ctx, target);
         }
         break;
     }
@@ -925,7 +961,7 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
 
     case THUMB_BRANCH: {
         u32 target = addr + 4 + (u32)insn->offset;
-        emit(ctx, "goto label_%08X;", target);
+        emit_goto_or_tailcall(ctx, target);
         break;
     }
 
@@ -998,6 +1034,10 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
     emit_raw(ctx, "void func_%08X(void) {\n", func->entry);
     ctx->indent = 1;
 
+    /* Build local block address set for goto validation */
+    ctx->local_blocks = (u32*)func->block_addrs;
+    ctx->num_local_blocks = func->num_blocks;
+
     /* Translate each block */
     for (int b = 0; b < func->num_blocks; b++) {
         u32 block_addr = func->block_addrs[b];
@@ -1052,6 +1092,8 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
     }
 
     ctx->indent = 0;
+    ctx->local_blocks = NULL;
+    ctx->num_local_blocks = 0;
     emit_raw(ctx, "}\n");
 }
 
@@ -1075,13 +1117,86 @@ void translate_all(TranslateCtx* ctx) {
 #define MKDIR(path) mkdir(path, 0755)
 #endif
 
+/* Collect all block start addresses that are branch targets but not function entries.
+ * These need stub functions generated for them. */
+static void collect_missing_targets(const AnalysisCtx* analysis,
+                                    u32** out_stubs, int* out_count) {
+    /* For each function, find branch targets that are NOT in that function's block list
+     * and NOT already known function entries. These will become tail calls needing stubs. */
+    int cap = 4096;
+    u32* targets = malloc(sizeof(u32) * cap);
+    int count = 0;
+
+    for (int fi = 0; fi < analysis->num_functions; fi++) {
+        const Function* func = &analysis->functions[fi];
+
+        for (int bi = 0; bi < func->num_blocks; bi++) {
+            /* Find this block */
+            const BasicBlock* block = NULL;
+            for (int j = 0; j < analysis->num_blocks; j++) {
+                if (analysis->blocks[j].start == func->block_addrs[bi]) {
+                    block = &analysis->blocks[j];
+                    break;
+                }
+            }
+            if (!block) continue;
+
+            for (int s = 0; s < block->num_successors; s++) {
+                u32 target = block->successors[s];
+                if (target == 0) continue;
+
+                /* Is it in this function's blocks? (would be a goto, not a call) */
+                bool is_local = false;
+                for (int k = 0; k < func->num_blocks; k++) {
+                    if (func->block_addrs[k] == target) {
+                        is_local = true;
+                        break;
+                    }
+                }
+                if (is_local) continue;
+
+                /* Is it a known function entry? (already has implementation) */
+                bool is_function = false;
+                for (int j = 0; j < analysis->num_functions; j++) {
+                    if (analysis->functions[j].entry == target) {
+                        is_function = true;
+                        break;
+                    }
+                }
+                if (is_function) continue;
+
+                /* Check for duplicates */
+                bool dup = false;
+                for (int j = 0; j < count; j++) {
+                    if (targets[j] == target) { dup = true; break; }
+                }
+                if (dup) continue;
+
+                if (count >= cap) {
+                    cap *= 2;
+                    targets = realloc(targets, sizeof(u32) * cap);
+                }
+                targets[count++] = target;
+            }
+        }
+    }
+
+    *out_stubs = targets;
+    *out_count = count;
+}
+
 int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* outdir) {
     MKDIR(outdir);
 
     int funcs_per_file = 100;
     int num_func_files = (analysis->num_functions + funcs_per_file - 1) / funcs_per_file;
 
-    /* 1. Write game.h - forward declarations */
+    /* Collect block addresses that need stub functions */
+    u32* stubs = NULL;
+    int num_stubs = 0;
+    collect_missing_targets(analysis, &stubs, &num_stubs);
+
+    /* 1. Write game.h - forward declarations (including stubs) */
     {
         char path[512];
         snprintf(path, sizeof(path), "%s/game.h", outdir);
@@ -1093,6 +1208,9 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "#include \"gba_runtime.h\"\n\n");
         for (int i = 0; i < analysis->num_functions; i++) {
             fprintf(f, "void func_%08X(void);\n", analysis->functions[i].entry);
+        }
+        for (int i = 0; i < num_stubs; i++) {
+            fprintf(f, "void func_%08X(void);\n", stubs[i]);
         }
         fprintf(f, "\nvoid game_entry(void);\n");
         fprintf(f, "\n#endif /* GAME_H */\n");
@@ -1124,7 +1242,23 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fclose(f);
     }
 
-    /* 3. Write game_entry.c */
+    /* 3. Write stubs.c for orphan block targets */
+    if (num_stubs > 0) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/stubs.c", outdir);
+        FILE* f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "/* Auto-generated stub functions for %d cross-function branch targets */\n", num_stubs);
+            fprintf(f, "#include \"game.h\"\n\n");
+
+            for (int i = 0; i < num_stubs; i++) {
+                fprintf(f, "void func_%08X(void) { /* stub: orphan block */ }\n", stubs[i]);
+            }
+            fclose(f);
+        }
+    }
+
+    /* 4. Write game_entry.c */
     {
         char path[512];
         snprintf(path, sizeof(path), "%s/game_entry.c", outdir);
@@ -1169,6 +1303,9 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "set(SOURCES\n");
         fprintf(f, "    game_entry.c\n");
         fprintf(f, "    runtime.c\n");
+        if (num_stubs > 0) {
+            fprintf(f, "    stubs.c\n");
+        }
         for (int i = 0; i < num_func_files; i++) {
             fprintf(f, "    funcs_%03d.c\n", i);
         }
@@ -1190,5 +1327,6 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         }
     }
 
-    return num_func_files + 3; /* func files + game.h + game_entry.c + CMakeLists.txt */
+    free(stubs);
+    return num_func_files + 3 + (num_stubs > 0 ? 1 : 0);
 }
