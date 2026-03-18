@@ -252,7 +252,7 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
         begin_cond(ctx, insn->cond);
         operand2_to_c(insn, op2, sizeof(op2));
         if (insn->s && insn->rd != REG_PC) {
-            emit(ctx, "cpu_add(%s, %s, %s, true);",
+            emit(ctx, "cpu_add(&%s, %s, %s, true);",
                  reg_c(insn->rd), reg_c(insn->rn), op2);
         } else {
             emit(ctx, "%s = %s + %s;", reg_c(insn->rd), reg_c(insn->rn), op2);
@@ -273,7 +273,7 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
         begin_cond(ctx, insn->cond);
         operand2_to_c(insn, op2, sizeof(op2));
         if (insn->s && insn->rd != REG_PC) {
-            emit(ctx, "cpu_sub(%s, %s, %s, true);",
+            emit(ctx, "cpu_sub(&%s, %s, %s, true);",
                  reg_c(insn->rd), reg_c(insn->rn), op2);
         } else {
             emit(ctx, "%s = %s - %s;", reg_c(insn->rd), reg_c(insn->rn), op2);
@@ -700,11 +700,11 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
 
     case THUMB_ADD_SUB:
         if (insn->is_imm) {
-            emit(ctx, "cpu_%s(%s, %s, %uu, true);",
+            emit(ctx, "cpu_%s(&%s, %s, %uu, true);",
                  insn->is_subtract ? "sub" : "add",
                  reg_c((u8)insn->rd), reg_c((u8)insn->rs), insn->imm);
         } else {
-            emit(ctx, "cpu_%s(%s, %s, %s, true);",
+            emit(ctx, "cpu_%s(&%s, %s, %s, true);",
                  insn->is_subtract ? "sub" : "add",
                  reg_c((u8)insn->rd), reg_c((u8)insn->rs), reg_c((u8)insn->rm));
         }
@@ -721,11 +721,11 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
                 emit(ctx, "cpu_sub(NULL, %s, 0x%Xu, true);", reg_c((u8)insn->rd), insn->imm);
                 break;
             case 2: /* ADD */
-                emit(ctx, "cpu_add(%s, %s, 0x%Xu, true);",
+                emit(ctx, "cpu_add(&%s, %s, 0x%Xu, true);",
                      reg_c((u8)insn->rd), reg_c((u8)insn->rd), insn->imm);
                 break;
             case 3: /* SUB */
-                emit(ctx, "cpu_sub(%s, %s, 0x%Xu, true);",
+                emit(ctx, "cpu_sub(&%s, %s, 0x%Xu, true);",
                      reg_c((u8)insn->rd), reg_c((u8)insn->rd), insn->imm);
                 break;
         }
@@ -755,7 +755,7 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
                      reg_c((u8)insn->rd), reg_c((u8)insn->rs), reg_c((u8)insn->rd));
                 break;
             case THUMB_ALU_NEG:
-                emit(ctx, "cpu_sub(%s, 0, %s, true);",
+                emit(ctx, "cpu_sub(&%s, 0, %s, true);",
                      reg_c((u8)insn->rd), reg_c((u8)insn->rs));
                 break;
             case THUMB_ALU_CMP:
