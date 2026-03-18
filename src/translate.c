@@ -1078,7 +1078,7 @@ void translate_all(TranslateCtx* ctx) {
 int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* outdir) {
     MKDIR(outdir);
 
-    int funcs_per_file = 500;
+    int funcs_per_file = 100;
     int num_func_files = (analysis->num_functions + funcs_per_file - 1) / funcs_per_file;
 
     /* 1. Write game.h - forward declarations */
