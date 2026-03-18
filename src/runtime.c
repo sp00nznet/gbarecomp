@@ -358,12 +358,7 @@ void gba_swi(u32 number) {
     }
 }
 
-/* ---- Indirect Branch Dispatch ---- */
-
-void cpu_bx(u32 target) {
-    fprintf(stderr, "[runtime] Unresolved BX to 0x%08X at PC=0x%08X\n", target, r[15]);
-    /* TODO: function pointer table lookup */
-}
+/* cpu_bx() is generated in game_entry.c with a dispatch table */
 
 void cpu_undefined(u32 insn) {
     fprintf(stderr, "[runtime] Undefined instruction 0x%08X at PC=0x%08X\n", insn, r[15]);
@@ -419,6 +414,7 @@ void gba_init(const char* rom_path) {
     cpsr  = 0x0000001F; /* System mode */
 
     printf("[runtime] GBA initialized, ROM: %u bytes\n", rom_size);
+    fflush(stdout);
 }
 
 void gba_shutdown(void) {
