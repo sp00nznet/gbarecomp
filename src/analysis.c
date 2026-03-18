@@ -980,6 +980,97 @@ void analysis_run(AnalysisCtx* ctx) {
         printf("[analysis] Split %d blocks\n", splits);
     }
 
+    /* Phase 6: Merge branch-connected blocks into the same function.
+     * For each function, follow all non-BL branch successors and pull those blocks
+     * into the function. This ensures switch/case, state machines, and loop structures
+     * stay within a single function instead of being broken by tail calls. */
+    printf("[analysis] Phase 6: Merging branch-connected blocks into functions...\n");
+    {
+        int merged = 0;
+        bool changed = true;
+        int pass = 0;
+
+        while (changed && pass < 20) {
+            changed = false;
+            pass++;
+
+            for (int fi = 0; fi < ctx->num_functions; fi++) {
+                Function* func = &ctx->functions[fi];
+
+                /* For each block in this function, check successors */
+                for (int bi = 0; bi < func->num_blocks; bi++) {
+                    u32 block_addr = func->block_addrs[bi];
+
+                    /* Find the block */
+                    BasicBlock* blk = NULL;
+                    for (int j = 0; j < ctx->num_blocks; j++) {
+                        if (ctx->blocks[j].start == block_addr) {
+                            blk = &ctx->blocks[j];
+                            break;
+                        }
+                    }
+                    if (!blk) continue;
+
+                    for (int s = 0; s < blk->num_successors; s++) {
+                        u32 target = blk->successors[s];
+                        if (target == 0) continue;
+
+                        /* Is this target already in our function? */
+                        bool is_local = false;
+                        for (int k = 0; k < func->num_blocks; k++) {
+                            if (func->block_addrs[k] == target) {
+                                is_local = true;
+                                break;
+                            }
+                        }
+                        if (is_local) continue;
+
+                        /* Is this target a function entry? If so, it's a tail call - skip */
+                        bool is_func_entry = false;
+                        for (int k = 0; k < ctx->num_functions; k++) {
+                            if (ctx->functions[k].entry == target) {
+                                is_func_entry = true;
+                                break;
+                            }
+                        }
+                        if (is_func_entry) continue;
+
+                        /* Find which function currently owns this block */
+                        bool found_block = false;
+                        for (int j = 0; j < ctx->num_blocks; j++) {
+                            if (ctx->blocks[j].start == target) {
+                                found_block = true;
+                                break;
+                            }
+                        }
+                        if (!found_block) continue;
+
+                        /* Steal it: remove from other function, add to ours */
+                        for (int oi = 0; oi < ctx->num_functions; oi++) {
+                            if (oi == fi) continue;
+                            Function* other = &ctx->functions[oi];
+                            for (int ok = 0; ok < other->num_blocks; ok++) {
+                                if (other->block_addrs[ok] == target) {
+                                    /* Remove from other */
+                                    other->block_addrs[ok] = other->block_addrs[other->num_blocks - 1];
+                                    other->num_blocks--;
+                                    goto stolen;
+                                }
+                            }
+                        }
+                        stolen:
+
+                        /* Add to our function */
+                        function_add_block(func, target);
+                        merged++;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        printf("[analysis] Merged %d blocks across %d passes\n", merged, pass);
+    }
+
     /* Sort blocks and functions by address */
     qsort(ctx->blocks, ctx->num_blocks, sizeof(BasicBlock), block_cmp);
     qsort(ctx->functions, ctx->num_functions, sizeof(Function), func_cmp);
