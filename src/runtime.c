@@ -113,6 +113,16 @@ static void advance_cycles(u32 cycles) {
             gba_shutdown();
             exit(0);
         }
+
+        /* Force-fire VBlank interrupt flag periodically.
+         * Many games poll DISPSTAT bit 0 or check IME for VBlank.
+         * Without real interrupt handling, we fake it here. */
+        u16 ie = io_regs[0x200] | (io_regs[0x201] << 8);
+        u16 ime = io_regs[0x208] | (io_regs[0x209] << 8);
+        if (ie & 1) { /* VBlank interrupt enabled */
+            /* Set IF VBlank bit */
+            io_regs[0x202] |= 1;
+        }
     }
 }
 
@@ -242,10 +252,17 @@ u32 bus_read32(u32 addr) {
         return iwram[offset] | (iwram[offset+1] << 8) |
                (iwram[offset+2] << 16) | (iwram[offset+3] << 24);
 
-    case 0x04: /* I/O */
+    case 0x04: { /* I/O */
+        static int io_read_count = 0;
         offset = addr & 0x3FF;
+        io_read_count++;
+        if (io_read_count <= 30 && offset < 0x200) {
+            fprintf(stderr, "[io_rd #%d] read 0x%03X\n", io_read_count, offset);
+            fflush(stderr);
+        }
         return io_regs[offset] | (io_regs[offset+1] << 8) |
                (io_regs[offset+2] << 16) | (io_regs[offset+3] << 24);
+    }
 
     case 0x05: /* Palette */
         offset = addr & 0x3FF;
