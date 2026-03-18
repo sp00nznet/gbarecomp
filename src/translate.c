@@ -1459,7 +1459,11 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "            hi = mid - 1;\n");
         fprintf(f, "        }\n");
         fprintf(f, "    }\n");
-        fprintf(f, "    fprintf(stderr, \"[bx] No function for address 0x%%08X\\n\", target);\n");
+        fprintf(f, "    /* NULL or RAM targets - can't dispatch statically */\n");
+        fprintf(f, "    if (target == 0 || target == 1) return;\n");
+        fprintf(f, "    if ((target >> 24) == 0x02 || (target >> 24) == 0x03) return;\n");
+        fprintf(f, "    static int _bxmiss = 0;\n");
+        fprintf(f, "    if (++_bxmiss <= 20) fprintf(stderr, \"[bx] No function for 0x%%08X\\n\", target);\n");
         fprintf(f, "}\n\n");
 
         /* Add main() */
