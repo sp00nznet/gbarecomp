@@ -34,6 +34,14 @@ void translate_function(TranslateCtx* ctx, const Function* func);
 /* Translate all discovered functions. */
 void translate_all(TranslateCtx* ctx);
 
+/* Translate to multiple C files in a directory. Creates files like:
+ *   outdir/funcs_000.c, funcs_001.c, ... (functions, ~500 per file)
+ *   outdir/game.h (forward declarations)
+ *   outdir/game_entry.c (entry point)
+ *   outdir/CMakeLists.txt (build system)
+ * Returns number of files created, or -1 on error. */
+int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* outdir);
+
 /* Translate a single ARM instruction to C statements. */
 void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr);
 

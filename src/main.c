@@ -149,15 +149,20 @@ static int cmd_analyze(const char* rom_path, int argc, char* argv[]) {
 
 static int cmd_translate(const char* rom_path, int argc, char* argv[]) {
     const char* output_path = NULL;
+    bool multi_file = false;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_path = argv[++i];
+        } else if (strcmp(argv[i], "--multi") == 0) {
+            multi_file = true;
         }
     }
 
     if (!output_path) {
-        fprintf(stderr, "Error: -o <output.c> is required\n");
+        fprintf(stderr, "Error: -o <output> is required\n");
+        fprintf(stderr, "  Single file: gbarecomp translate rom.gba -o output.c\n");
+        fprintf(stderr, "  Multi file:  gbarecomp translate rom.gba -o output_dir/ --multi\n");
         return 1;
     }
 
@@ -174,6 +179,22 @@ static int cmd_translate(const char* rom_path, int argc, char* argv[]) {
 
     /* Translate */
     printf("\n--- Translation Phase ---\n");
+
+    if (multi_file) {
+        int num_files = translate_multi(rom, analysis, output_path);
+        if (num_files < 0) {
+            fprintf(stderr, "Error: failed to create output directory '%s'\n", output_path);
+            analysis_free(analysis);
+            rom_free(rom);
+            return 1;
+        }
+        printf("Generated %d files in: %s\n", num_files, output_path);
+        printf("Functions translated: %d\n", analysis->num_functions);
+        analysis_free(analysis);
+        rom_free(rom);
+        return 0;
+    }
+
     FILE* out = fopen(output_path, "w");
     if (!out) {
         fprintf(stderr, "Error: cannot open '%s' for writing\n", output_path);
