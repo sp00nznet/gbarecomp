@@ -1013,7 +1013,7 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
         if (!block) continue;
 
         /* Emit label for this block */
-        emit_raw(ctx, "label_%08X:\n", block->start);
+        emit_raw(ctx, "label_%08X: ;\n", block->start);
 
         if (block->mode == CODE_ARM) {
             for (u32 addr = block->start; addr < block->end; addr += 4) {

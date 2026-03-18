@@ -855,9 +855,14 @@ void analysis_run(AnalysisCtx* ctx) {
                         break;
                     }
                     u16 check = rom_read16(ctx->rom, check_addr);
-                    /* Reject if it looks like an ARM instruction or garbage */
-                    /* 0x0000 and 0xFFFF are suspicious */
-                    if (check == 0x0000 || check == 0xFFFF) {
+                    /* Reject if it looks like garbage/erased flash/padding */
+                    if (check == 0x0000 || check == 0xFFFF ||
+                        check == 0xDEAD || check == 0xBEEF) {
+                        looks_valid = false;
+                    }
+                    /* Reject BL suffix without preceding prefix (orphaned) */
+                    if ((check & 0xF800) == 0xF800 && i == 1) {
+                        /* First instruction after PUSH is BL suffix = suspicious */
                         looks_valid = false;
                     }
                 }
