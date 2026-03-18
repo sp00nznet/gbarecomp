@@ -1194,7 +1194,59 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
     /* Collect block addresses that need stub functions */
     u32* stubs = NULL;
     int num_stubs = 0;
+    int cap = 4096;
     collect_missing_targets(analysis, &stubs, &num_stubs);
+    cap = num_stubs > cap ? num_stubs * 2 : cap;
+    stubs = realloc(stubs, sizeof(u32) * cap);
+
+    /* Also collect BL targets not in function list */
+    for (int i = 0; i < analysis->num_blocks; i++) {
+        const BasicBlock* block = &analysis->blocks[i];
+        if (block->mode == CODE_THUMB) {
+            for (u32 addr = block->start; addr + 4 <= block->end; addr += 2) {
+                u16 raw = rom_read16(rom, addr);
+                if (thumb_is_bl_prefix(raw)) {
+                    u16 next = rom_read16(rom, addr + 2);
+                    if (thumb_is_bl_suffix(next)) {
+                        ThumbInsn prefix = thumb_decode(raw);
+                        ThumbInsn suffix = thumb_decode(next);
+                        u32 bl_target = (addr + 4) + (u32)prefix.offset + suffix.imm;
+
+                        bool known = false;
+                        for (int j = 0; j < analysis->num_functions && !known; j++)
+                            if (analysis->functions[j].entry == bl_target) known = true;
+                        for (int j = 0; j < num_stubs && !known; j++)
+                            if (stubs[j] == bl_target) known = true;
+
+                        if (!known) {
+                            if (num_stubs >= cap) { cap *= 2; stubs = realloc(stubs, sizeof(u32) * cap); }
+                            stubs[num_stubs++] = bl_target;
+                        }
+                        addr += 2;
+                    }
+                }
+            }
+        }
+        if (block->mode == CODE_ARM) {
+            for (u32 addr = block->start; addr < block->end; addr += 4) {
+                u32 raw32 = rom_read32(rom, addr);
+                ArmInsn insn = arm_decode(raw32);
+                if (insn.type == ARM_BL) {
+                    u32 bl_target = addr + 8 + (u32)insn.branch_offset;
+                    bool known = false;
+                    for (int j = 0; j < analysis->num_functions && !known; j++)
+                        if (analysis->functions[j].entry == bl_target) known = true;
+                    for (int j = 0; j < num_stubs && !known; j++)
+                        if (stubs[j] == bl_target) known = true;
+                    if (!known) {
+                        if (num_stubs >= cap) { cap *= 2; stubs = realloc(stubs, sizeof(u32) * cap); }
+                        stubs[num_stubs++] = bl_target;
+                    }
+                }
+            }
+        }
+    }
+    printf("[translate] %d stub functions needed\n", num_stubs);
 
     /* 1. Write game.h - forward declarations (including stubs) */
     {
@@ -1242,17 +1294,16 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fclose(f);
     }
 
-    /* 3. Write stubs.c for orphan block targets */
-    if (num_stubs > 0) {
+    /* 3. Write stubs.c for all missing function targets */
+    {
         char path[512];
         snprintf(path, sizeof(path), "%s/stubs.c", outdir);
         FILE* f = fopen(path, "w");
         if (f) {
-            fprintf(f, "/* Auto-generated stub functions for %d cross-function branch targets */\n", num_stubs);
+            fprintf(f, "/* %d stub functions for unresolved targets */\n", num_stubs);
             fprintf(f, "#include \"game.h\"\n\n");
-
             for (int i = 0; i < num_stubs; i++) {
-                fprintf(f, "void func_%08X(void) { /* stub: orphan block */ }\n", stubs[i]);
+                fprintf(f, "void func_%08X(void) { /* stub */ }\n", stubs[i]);
             }
             fclose(f);
         }
