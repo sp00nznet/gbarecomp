@@ -54,7 +54,7 @@ static bool queue_empty(const AnalysisCtx* ctx) {
     return ctx->queue_head == ctx->queue_tail;
 }
 
-static void queue_push(AnalysisCtx* ctx, u32 addr, CodeType mode, u32 caller, bool is_call) {
+static void queue_push_ex(AnalysisCtx* ctx, u32 addr, CodeType mode, u32 caller, bool is_call, u32 parent_func) {
     /* Don't queue already-visited addresses */
     if (is_visited(ctx, addr)) return;
     if (!addr_in_rom(ctx, addr)) return;
@@ -81,7 +81,12 @@ static void queue_push(AnalysisCtx* ctx, u32 addr, CodeType mode, u32 caller, bo
     ctx->queue[ctx->queue_tail].mode = mode;
     ctx->queue[ctx->queue_tail].caller = caller;
     ctx->queue[ctx->queue_tail].is_call = is_call;
+    ctx->queue[ctx->queue_tail].parent_func = parent_func;
     ctx->queue_tail = (ctx->queue_tail + 1) % ctx->queue_cap;
+}
+
+static void queue_push(AnalysisCtx* ctx, u32 addr, CodeType mode, u32 caller, bool is_call) {
+    queue_push_ex(ctx, addr, mode, caller, is_call, 0);
 }
 
 static WorkItem queue_pop(AnalysisCtx* ctx) {
@@ -202,8 +207,9 @@ static void analyze_arm_block(AnalysisCtx* ctx, u32 start, Function* func) {
                 if (func) func->is_leaf = false;
                 /* Queue the call target as a new function */
                 queue_push(ctx, target, CODE_ARM, addr, true);
-                /* Continue analyzing after the BL */
-                queue_push(ctx, addr + 4, CODE_ARM, addr, false);
+                /* Continue analyzing after the BL - stays in current function */
+                queue_push_ex(ctx, addr + 4, CODE_ARM, addr, false,
+                             func ? func->entry : 0);
             } else if (insn.type == ARM_BX) {
                 if (insn.rm == REG_LR) {
                     block->is_return = true;
@@ -357,8 +363,9 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
 
                 /* Queue call target as new function (Thumb mode) */
                 queue_push(ctx, target, CODE_THUMB, addr, true);
-                /* Continue after BL */
-                queue_push(ctx, addr + 2, CODE_THUMB, addr, false);
+                /* Continue after BL - stays in current function */
+                queue_push_ex(ctx, addr + 2, CODE_THUMB, addr, false,
+                             func ? func->entry : 0);
             } else {
                 /* Orphaned BL suffix - shouldn't happen, treat as block end */
                 block->end = addr + 2;
@@ -491,6 +498,16 @@ static void process_work_item(AnalysisCtx* ctx, WorkItem* item) {
     Function* func = NULL;
     if (item->is_call || item->caller == 0) {
         func = add_function(ctx, item->addr, item->mode);
+    } else if (item->parent_func != 0) {
+        /* Use explicit parent function if provided (e.g., BL continuation) */
+        for (int i = 0; i < ctx->num_functions; i++) {
+            if (ctx->functions[i].entry == item->parent_func) {
+                func = &ctx->functions[i];
+                break;
+            }
+        }
+        /* Fallback if parent not found */
+        if (!func) func = add_function(ctx, item->parent_func, item->mode);
     } else {
         /* Find which function we belong to by looking up the caller */
         for (int i = ctx->num_functions - 1; i >= 0; i--) {

@@ -78,6 +78,27 @@ static void advance_cycles(u32 cycles) {
             io_regs[0x130] = (u8)(keys);
             io_regs[0x131] = (u8)(keys >> 8);
 
+            /* Debug: print DISPCNT and VRAM status every 60 frames */
+            if (frame_count <= 5 || frame_count % 60 == 0) {
+                u16 dispcnt = io_regs[0] | (io_regs[1] << 8);
+                /* Check if VRAM has any non-zero data */
+                int vram_nonzero = 0;
+                for (int i = 0; i < 0x18000; i++) {
+                    if (vram[i] != 0) { vram_nonzero++; }
+                }
+                int pal_nonzero = 0;
+                for (int i = 0; i < 0x400; i++) {
+                    if (palette[i] != 0) { pal_nonzero++; }
+                }
+                fprintf(stderr, "[frame %u] DISPCNT=0x%04X mode=%d BG_en=%d%d%d%d OBJ=%d | VRAM: %d bytes | PAL: %d bytes\n",
+                        frame_count, dispcnt, dispcnt & 7,
+                        (dispcnt >> 8) & 1, (dispcnt >> 9) & 1,
+                        (dispcnt >> 10) & 1, (dispcnt >> 11) & 1,
+                        (dispcnt >> 12) & 1,
+                        vram_nonzero, pal_nonzero);
+                fflush(stderr);
+            }
+
             display_render_frame();
 
             /* Frame timing (~60fps) */
@@ -103,6 +124,7 @@ static void advance_cycles(u32 cycles) {
 #define DMA_DAD(n)    (DMA_REG_BASE + (n) * 12 + 4)
 #define DMA_CNT(n)    (DMA_REG_BASE + (n) * 12 + 8)
 
+static int dma_count = 0;
 static void dma_execute(int channel) {
     u32 base = DMA_REG_BASE + channel * 12;
     u32 src = io_regs[base] | (io_regs[base+1] << 8) |
@@ -125,6 +147,14 @@ static void dma_execute(int channel) {
     int dst_ctrl = (cnt_hi >> 5) & 3;   /* 0=inc, 1=dec, 2=fixed, 3=inc/reload */
     int src_ctrl = (cnt_hi >> 7) & 3;   /* 0=inc, 1=dec, 2=fixed */
     int timing = (cnt_hi >> 12) & 3;    /* 0=immediate, 1=VBlank, 2=HBlank, 3=special */
+
+    dma_count++;
+    if (dma_count <= 20) {
+        fprintf(stderr, "[dma #%d] ch%d: 0x%08X -> 0x%08X, cnt=%u, %s, timing=%d\n",
+                dma_count, channel, src, dst, count,
+                word ? "word" : "half", timing);
+        fflush(stderr);
+    }
 
     /* Only handle immediate DMA for now */
     if (timing != 0) {
@@ -164,7 +194,14 @@ static void dma_execute(int channel) {
 
 /* ---- I/O Write Hook ---- */
 
+static int io_write_count = 0;
 static void io_write_hook(u32 offset, u32 value, int size) {
+    io_write_count++;
+    if (io_write_count <= 30) {
+        fprintf(stderr, "[io #%d] write 0x%03X = 0x%04X (size=%d)\n",
+                io_write_count, offset, value & 0xFFFF, size);
+        fflush(stderr);
+    }
     /* Check for DMA enable writes */
     for (int ch = 0; ch < 4; ch++) {
         u32 cnt_hi_offset = DMA_REG_BASE + ch * 12 + 10;
@@ -428,7 +465,13 @@ void cpu_set_spsr(u32 value, u32 mask) {
 
 /* ---- Software Interrupts (BIOS Calls) ---- */
 
+static int swi_count = 0;
 void gba_swi(u32 number) {
+    swi_count++;
+    if (swi_count <= 20) {
+        fprintf(stderr, "[swi #%d] SWI 0x%02X\n", swi_count, number);
+        fflush(stderr);
+    }
     switch (number) {
     case 0x00: /* SoftReset */
         /* TODO: reset state */
@@ -510,6 +553,28 @@ void gba_swi(u32 number) {
     default:
         fprintf(stderr, "[runtime] Unhandled SWI 0x%02X at PC=0x%08X\n", number, r[15]);
         break;
+    }
+}
+
+/* ---- BX Dispatch Tracing ---- */
+static int bx_call_count = 0;
+static u32 last_bx_target = 0;
+static int last_bx_repeat = 0;
+
+void cpu_bx_trace(u32 target) {
+    bx_call_count++;
+    if (target == last_bx_target) {
+        last_bx_repeat++;
+    } else {
+        if (last_bx_repeat > 0 && bx_call_count < 200) {
+            fprintf(stderr, "  (repeated %d times)\n", last_bx_repeat);
+        }
+        last_bx_repeat = 0;
+        last_bx_target = target;
+        if (bx_call_count <= 100) {
+            fprintf(stderr, "[bx #%d] -> 0x%08X\n", bx_call_count, target);
+            fflush(stderr);
+        }
     }
 }
 

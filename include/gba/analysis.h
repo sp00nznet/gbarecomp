@@ -52,6 +52,7 @@ typedef struct WorkItem {
     CodeType mode;
     u32 caller;             /* Address that led to this (0 = entry point) */
     bool is_call;           /* true if reached via BL/BLX */
+    u32 parent_func;        /* Entry address of the function this belongs to (0 = unknown) */
 } WorkItem;
 
 /* Main analysis context */
