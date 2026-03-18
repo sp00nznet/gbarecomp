@@ -1310,19 +1310,107 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fclose(f);
     }
 
-    /* 3. Write stubs.c for all missing function targets */
+    /* 3. Write stub files with real translated code where possible */
     {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/stubs.c", outdir);
-        FILE* f = fopen(path, "w");
-        if (f) {
-            fprintf(f, "/* %d stub functions for unresolved targets */\n", num_stubs);
+        int stubs_per_file = 500;
+        int num_stub_files = (num_stubs + stubs_per_file - 1) / stubs_per_file;
+
+        for (int sf = 0; sf < num_stub_files; sf++) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/stubs_%03d.c", outdir, sf);
+            FILE* f = fopen(path, "w");
+            if (!f) continue;
+
+            fprintf(f, "/* Stub functions - part %d/%d */\n", sf + 1, num_stub_files);
             fprintf(f, "#include \"game.h\"\n\n");
-            for (int i = 0; i < num_stubs; i++) {
-                fprintf(f, "void func_%08X(void) { /* stub */ }\n", stubs[i]);
+
+            TranslateCtx* stub_ctx = translate_create(rom, analysis, f);
+
+            int start_idx = sf * stubs_per_file;
+            int end_idx = start_idx + stubs_per_file;
+            if (end_idx > num_stubs) end_idx = num_stubs;
+
+            for (int i = start_idx; i < end_idx; i++) {
+                u32 addr = stubs[i];
+
+                /* Try to find the block at this address and translate it */
+                bool found = false;
+                for (int j = 0; j < analysis->num_blocks; j++) {
+                    if (analysis->blocks[j].start == addr) {
+                        /* Build a mini-function with this block and reachable successors */
+                        Function temp_func;
+                        memset(&temp_func, 0, sizeof(temp_func));
+                        temp_func.entry = addr;
+                        temp_func.mode = analysis->blocks[j].mode;
+
+                        int temp_cap = 256;
+                        temp_func.block_addrs = malloc(sizeof(u32) * temp_cap);
+                        temp_func.num_blocks = 0;
+
+                        /* BFS: collect this block and all reachable non-function blocks */
+                        u32 queue[256];
+                        int qh = 0, qt = 0;
+                        queue[qt++] = addr;
+
+                        while (qh < qt && temp_func.num_blocks < temp_cap) {
+                            u32 cur = queue[qh++];
+
+                            /* Skip if already added */
+                            bool dup = false;
+                            for (int k = 0; k < temp_func.num_blocks; k++) {
+                                if (temp_func.block_addrs[k] == cur) { dup = true; break; }
+                            }
+                            if (dup) continue;
+
+                            /* Find this block in analysis */
+                            const BasicBlock* blk = NULL;
+                            for (int k = 0; k < analysis->num_blocks; k++) {
+                                if (analysis->blocks[k].start == cur) {
+                                    blk = &analysis->blocks[k];
+                                    break;
+                                }
+                            }
+                            if (!blk) continue;
+
+                            temp_func.block_addrs[temp_func.num_blocks++] = cur;
+
+                            /* Queue successors that aren't function entries */
+                            for (int s = 0; s < blk->num_successors && qt < 256; s++) {
+                                u32 succ = blk->successors[s];
+                                if (succ == 0) continue;
+                                bool is_func = false;
+                                for (int k = 0; k < analysis->num_functions; k++) {
+                                    if (analysis->functions[k].entry == succ) {
+                                        is_func = true;
+                                        break;
+                                    }
+                                }
+                                if (!is_func) {
+                                    queue[qt++] = succ;
+                                }
+                            }
+                        }
+
+                        if (temp_func.num_blocks > 0) {
+                            translate_function(stub_ctx, &temp_func);
+                            found = true;
+                        }
+                        free(temp_func.block_addrs);
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    fprintf(f, "void func_%08X(void) { /* no block found */ }\n", addr);
+                }
             }
+
+            translate_free(stub_ctx);
             fclose(f);
         }
+
+        /* Update CMakeLists to use stub files */
+        /* (handled below in CMakeLists generation) */
     }
 
     /* 4. Write game_entry.c with BX dispatch table */
@@ -1406,8 +1494,12 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    game_entry.c\n");
         fprintf(f, "    runtime.c\n");
         fprintf(f, "    display.c\n");
-        if (num_stubs > 0) {
-            fprintf(f, "    stubs.c\n");
+        {
+            int stubs_per_file = 500;
+            int nsf = (num_stubs + stubs_per_file - 1) / stubs_per_file;
+            for (int i = 0; i < nsf; i++) {
+                fprintf(f, "    stubs_%03d.c\n", i);
+            }
         }
         for (int i = 0; i < num_func_files; i++) {
             fprintf(f, "    funcs_%03d.c\n", i);

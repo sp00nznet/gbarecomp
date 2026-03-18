@@ -916,6 +916,70 @@ void analysis_run(AnalysisCtx* ctx) {
                ctx->num_blocks, ctx->num_functions);
     }
 
+    /* Phase 5: Split blocks at branch targets that land mid-block.
+     * If a branch targets address X, and X is inside block [A, B) where A < X < B,
+     * split the block into [A, X) and [X, B). */
+    printf("[analysis] Phase 5: Splitting blocks at mid-block branch targets...\n");
+    {
+        int splits = 0;
+        /* Collect all branch targets */
+        for (int i = 0; i < ctx->num_blocks; i++) {
+            for (int s = 0; s < ctx->blocks[i].num_successors; s++) {
+                u32 target = ctx->blocks[i].successors[s];
+                if (target == 0) continue;
+
+                /* Find the block containing this target */
+                for (int j = 0; j < ctx->num_blocks; j++) {
+                    BasicBlock* blk = &ctx->blocks[j];
+                    if (target > blk->start && target < blk->end) {
+                        /* Target is mid-block - split it */
+                        BasicBlock* new_blk = add_block(ctx);
+                        new_blk->start = target;
+                        new_blk->end = blk->end;
+                        new_blk->mode = blk->mode;
+                        new_blk->num_successors = blk->num_successors;
+                        new_blk->successors[0] = blk->successors[0];
+                        new_blk->successors[1] = blk->successors[1];
+                        new_blk->is_return = blk->is_return;
+                        new_blk->has_indirect = blk->has_indirect;
+
+                        /* Original block now ends at the split point, falls through */
+                        blk->end = target;
+                        blk->successors[0] = target;
+                        blk->num_successors = 1;
+                        blk->is_return = false;
+                        blk->has_indirect = false;
+
+                        /* Add new block to the function that owns the original */
+                        for (int fi = 0; fi < ctx->num_functions; fi++) {
+                            for (int bi = 0; bi < ctx->functions[fi].num_blocks; bi++) {
+                                if (ctx->functions[fi].block_addrs[bi] == blk->start ||
+                                    ctx->functions[fi].block_addrs[bi] == target) {
+                                    /* Add the new block to this function if not already there */
+                                    bool has_new = false;
+                                    for (int k = 0; k < ctx->functions[fi].num_blocks; k++) {
+                                        if (ctx->functions[fi].block_addrs[k] == target) {
+                                            has_new = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!has_new) {
+                                        function_add_block(&ctx->functions[fi], target);
+                                    }
+                                    goto next_target;
+                                }
+                            }
+                        }
+                        next_target:
+                        splits++;
+                        break; /* Found the containing block, move to next target */
+                    }
+                }
+            }
+        }
+        printf("[analysis] Split %d blocks\n", splits);
+    }
+
     /* Sort blocks and functions by address */
     qsort(ctx->blocks, ctx->num_blocks, sizeof(BasicBlock), block_cmp);
     qsort(ctx->functions, ctx->num_functions, sizeof(Function), func_cmp);
