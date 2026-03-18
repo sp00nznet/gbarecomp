@@ -1312,7 +1312,7 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
 
     /* 3. Write stub files with real translated code where possible */
     {
-        int stubs_per_file = 500;
+        int stubs_per_file = 200;
         int num_stub_files = (num_stubs + stubs_per_file - 1) / stubs_per_file;
 
         for (int sf = 0; sf < num_stub_files; sf++) {
@@ -1343,12 +1343,12 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
                         temp_func.entry = addr;
                         temp_func.mode = analysis->blocks[j].mode;
 
-                        int temp_cap = 256;
+                        int temp_cap = 32; /* Limit block count per stub */
                         temp_func.block_addrs = malloc(sizeof(u32) * temp_cap);
                         temp_func.num_blocks = 0;
 
-                        /* BFS: collect this block and all reachable non-function blocks */
-                        u32 queue[256];
+                        /* BFS: collect this block and nearby reachable non-function blocks */
+                        u32 queue[32];
                         int qh = 0, qt = 0;
                         queue[qt++] = addr;
 
@@ -1375,7 +1375,7 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
                             temp_func.block_addrs[temp_func.num_blocks++] = cur;
 
                             /* Queue successors that aren't function entries */
-                            for (int s = 0; s < blk->num_successors && qt < 256; s++) {
+                            for (int s = 0; s < blk->num_successors && qt < 32; s++) {
                                 u32 succ = blk->successors[s];
                                 if (succ == 0) continue;
                                 bool is_func = false;
@@ -1495,7 +1495,7 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    runtime.c\n");
         fprintf(f, "    display.c\n");
         {
-            int stubs_per_file = 500;
+            int stubs_per_file = 200;
             int nsf = (num_stubs + stubs_per_file - 1) / stubs_per_file;
             for (int i = 0; i < nsf; i++) {
                 fprintf(f, "    stubs_%03d.c\n", i);
