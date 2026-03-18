@@ -9,6 +9,8 @@
  */
 
 #include "gba/gba_runtime.h"
+#include "gba/display.h"
+#include <SDL2/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -29,10 +31,10 @@ static u32 spsr = 0;
 static u8* bios_mem  = NULL;  /* 16KB */
 static u8* ewram     = NULL;  /* 256KB */
 static u8* iwram     = NULL;  /* 32KB */
-static u8* io_regs   = NULL;  /* 1KB */
-static u8* palette   = NULL;  /* 1KB */
-static u8* vram      = NULL;  /* 96KB */
-static u8* oam       = NULL;  /* 1KB */
+u8* io_regs   = NULL;  /* 1KB - non-static for display.c access */
+u8* palette   = NULL;  /* 1KB - non-static for display.c access */
+u8* vram      = NULL;  /* 96KB - non-static for display.c access */
+u8* oam       = NULL;  /* 1KB - non-static for display.c access */
 static u8* rom_data  = NULL;  /* Up to 32MB */
 static u32 rom_size  = 0;
 static u8* sram      = NULL;  /* 64KB */
@@ -375,8 +377,38 @@ void timer_step(u32 cycles) { (void)cycles; }
 void irq_check(void) { }
 
 void gba_frame(void) {
-    /* Placeholder: one frame of hardware advancement */
-    /* In the future, this drives libmgba's PPU/APU/timers */
+    /* Update VCOUNT to simulate scanline progression */
+    /* Set VCOUNT to 160 (start of VBlank) */
+    io_regs[0x006] = 160;
+    io_regs[0x007] = 0;
+
+    /* Set VBlank flag in DISPSTAT */
+    u16 dispstat = io_regs[0x004] | (io_regs[0x005] << 8);
+    dispstat |= 1; /* VBlank flag */
+    io_regs[0x004] = (u8)(dispstat);
+    io_regs[0x005] = (u8)(dispstat >> 8);
+
+    /* Update KEYINPUT register */
+    u16 keys = display_get_keys();
+    io_regs[0x130] = (u8)(keys);
+    io_regs[0x131] = (u8)(keys >> 8);
+
+    /* Render the frame */
+    display_render_frame();
+
+    /* Poll events */
+    if (display_poll_events()) {
+        /* Quit requested */
+        gba_shutdown();
+        exit(0);
+    }
+
+    /* Frame timing (~60fps) */
+    SDL_Delay(16);
+
+    /* Clear VBlank flag for next frame */
+    io_regs[0x004] &= ~1;
+    io_regs[0x006] = 0; /* Reset VCOUNT */
 }
 
 /* ---- Init/Shutdown ---- */
@@ -413,11 +445,24 @@ void gba_init(const char* rom_path) {
     r[15] = 0x08000000; /* PC */
     cpsr  = 0x0000001F; /* System mode */
 
+    /* Initialize KEYINPUT to all buttons released (active-low) */
+    io_regs[0x130] = 0xFF;
+    io_regs[0x131] = 0x03;
+
     printf("[runtime] GBA initialized, ROM: %u bytes\n", rom_size);
+    fflush(stdout);
+
+    /* Initialize display */
+    if (display_init() != 0) {
+        fprintf(stderr, "[runtime] Failed to initialize display\n");
+        exit(1);
+    }
+    printf("[runtime] Display initialized (SDL2)\n");
     fflush(stdout);
 }
 
 void gba_shutdown(void) {
+    display_shutdown();
     free(ewram);   ewram = NULL;
     free(iwram);   iwram = NULL;
     free(io_regs); io_regs = NULL;

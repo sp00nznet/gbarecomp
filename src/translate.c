@@ -1405,6 +1405,7 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "set(SOURCES\n");
         fprintf(f, "    game_entry.c\n");
         fprintf(f, "    runtime.c\n");
+        fprintf(f, "    display.c\n");
         if (num_stubs > 0) {
             fprintf(f, "    stubs.c\n");
         }
@@ -1412,19 +1413,48 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
             fprintf(f, "    funcs_%03d.c\n", i);
         }
         fprintf(f, ")\n\n");
-        fprintf(f, "add_executable(%s ${SOURCES})\n", rom->game_code);
+        fprintf(f, "add_executable(%s ${SOURCES})\n\n", rom->game_code);
+        /* SDL2 integration */
+        fprintf(f, "# SDL2 display\n");
+        fprintf(f, "find_package(SDL2 CONFIG)\n");
+        fprintf(f, "if(SDL2_FOUND)\n");
+        fprintf(f, "    target_link_libraries(%s PRIVATE SDL2::SDL2 SDL2::SDL2main)\n", rom->game_code);
+        fprintf(f, "else()\n");
+        fprintf(f, "    # Fallback: manual SDL2 paths\n");
+        fprintf(f, "    target_include_directories(%s PRIVATE C:/vcpkg/installed/x64-windows/include)\n", rom->game_code);
+        fprintf(f, "    target_link_directories(%s PRIVATE C:/vcpkg/installed/x64-windows/lib)\n", rom->game_code);
+        fprintf(f, "    target_link_libraries(%s PRIVATE SDL2 SDL2main)\n", rom->game_code);
+        fprintf(f, "endif()\n\n");
+        /* Stack size for deep call chains */
+        fprintf(f, "if(MSVC)\n");
+        fprintf(f, "    target_link_options(%s PRIVATE /STACK:16777216 /SUBSYSTEM:CONSOLE)\n", rom->game_code);
+        fprintf(f, "endif()\n");
         fclose(f);
     }
 
-    /* 5. Copy runtime files */
+    /* 5. Write include shims pointing to real headers */
     {
         char path[512];
         snprintf(path, sizeof(path), "%s/gba_runtime.h", outdir);
-        /* Write a minimal note pointing to the real runtime */
         FILE* f = fopen(path, "w");
         if (f) {
-            fprintf(f, "/* Copy gba_runtime.h from gbarecomp/include/gba/ */\n");
+            fprintf(f, "/* Include shim - points to gbarecomp headers */\n");
             fprintf(f, "#include \"../../include/gba/gba_runtime.h\"\n");
+            fclose(f);
+        }
+        /* types.h shim (needed by display.h) */
+        snprintf(path, sizeof(path), "%s/gba", outdir);
+        MKDIR(path);
+        snprintf(path, sizeof(path), "%s/gba/types.h", outdir);
+        f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "#include \"../../../include/gba/types.h\"\n");
+            fclose(f);
+        }
+        snprintf(path, sizeof(path), "%s/gba/display.h", outdir);
+        f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "#include \"../../../include/gba/display.h\"\n");
             fclose(f);
         }
     }
