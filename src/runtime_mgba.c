@@ -540,6 +540,26 @@ void gba_init(const char* rom_path) {
     core->loadConfig(core, &core->config);
     fprintf(stderr, "[init] Config loaded\n"); fflush(stderr);
 
+    /* Set up save file (.sav next to ROM) */
+    {
+        char save_path[512];
+        strncpy(save_path, rom_path, sizeof(save_path) - 5);
+        save_path[sizeof(save_path) - 5] = '\0';
+        /* Replace .gba extension with .sav */
+        char* dot = strrchr(save_path, '.');
+        if (dot) strcpy(dot, ".sav");
+        else strcat(save_path, ".sav");
+
+        struct VFile* save_vf = VFileOpen(save_path, O_CREAT | O_RDWR);
+        if (save_vf) {
+            core->loadSave(core, save_vf);
+            fprintf(stderr, "[init] Save file: %s\n", save_path);
+        } else {
+            fprintf(stderr, "[init] Warning: could not open save file\n");
+        }
+        fflush(stderr);
+    }
+
     core->reset(core);
     fprintf(stderr, "[init] Core reset complete\n"); fflush(stderr);
 
