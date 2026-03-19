@@ -818,6 +818,22 @@ void analysis_run(AnalysisCtx* ctx) {
         }
     }
 
+    /* Add known function pointer targets (from BX dispatch misses) */
+    {
+        static const u32 extra_entries[] = {
+            0x0801A784, 0x0801A78A, 0x0801AFD0, 0x0801AFFE,
+            0x0801B01C, 0x08079716, 0x0807981E, 0x08079A74,
+            0x08079F92, 0x0807A0E0, 0x0807AE10, 0x080000E4,
+            0x0801B3CE, 0x08038734,
+            0x08015C0E, 0x08015C1A, 0x08015C26, 0x0801ADAC,
+            0x0803EC5C, 0x0803EC70,
+            0
+        };
+        for (int i = 0; extra_entries[i] != 0; i++) {
+            analysis_add_entry(ctx, extra_entries[i], CODE_THUMB);
+        }
+    }
+
     printf("[analysis] Starting recursive descent...\n");
 
     /* Phase 1: Recursive descent */
