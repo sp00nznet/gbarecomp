@@ -8,12 +8,14 @@
 
 #include "gba/gba_runtime.h"
 
-/* mGBA headers */
+/* mGBA headers - flags.h must come first for correct struct layout */
+#include <mgba/flags.h>
 #include <mgba/core/core.h>
-#include <mgba/core/blip_buf.h>
+#include <mgba/core/config.h>
+#include <mgba/core/log.h>
+#include <mgba/gba/core.h>
 #include <mgba/internal/gba/gba.h>
-#include <mgba/internal/gba/memory.h>
-#include <mgba/internal/gba/io.h>
+#include <mgba/internal/gba/video.h>
 #include <mgba/internal/arm/arm.h>
 #include <mgba-util/vfs.h>
 
@@ -21,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 /* ---- CPU State (owned by recompiled code, NOT mGBA's ARMCore) ---- */
 
@@ -32,6 +35,13 @@ bool CPU_V = false;
 
 static u32 cpsr_val = 0x0000001F;
 static u32 spsr_val = 0;
+
+/* ---- mGBA Logging ---- */
+static void _mgba_log(struct mLogger* logger, int category, enum mLogLevel level, const char* format, va_list args) {
+    (void)logger; (void)category; (void)level;
+    vfprintf(stderr, format, args);
+    fprintf(stderr, "\n");
+}
 
 /* ---- mGBA State ---- */
 
@@ -353,20 +363,30 @@ void cpu_undefined(u32 insn) {
 /* ---- Init / Shutdown ---- */
 
 void gba_init(const char* rom_path) {
+    fprintf(stderr, "[init] Starting mGBA init...\n"); fflush(stderr);
+
+    /* Initialize mGBA logging with a real callback */
+    static struct mLogger myLogger;
+    memset(&myLogger, 0, sizeof(myLogger));
+    myLogger.log = _mgba_log;
+    mLogSetDefaultLogger(&myLogger);
+
     /* Create mGBA core */
-    core = mCoreFindVF(NULL);
-    if (!core) {
-        core = GBACoreCreate();
-    }
+    core = GBACoreCreate();
     if (!core) {
         fprintf(stderr, "[runtime] Failed to create mGBA core\n");
         exit(1);
     }
+    fprintf(stderr, "[init] Core created\n"); fflush(stderr);
 
-    core->init(core);
+    fprintf(stderr, "[init] core=%p, init=%p\n", (void*)core, (void*)core->init); fflush(stderr);
+    bool ok = core->init(core);
+    fprintf(stderr, "[init] Core initialized: %d\n", ok); fflush(stderr);
 
     /* Set video buffer */
-    core->setVideoBuffer(core, videoBuf, GBA_WIDTH);
+    unsigned stride = GBA_WIDTH;
+    core->setVideoBuffer(core, videoBuf, stride);
+    fprintf(stderr, "[init] Video buffer set\n"); fflush(stderr);
 
     /* Load ROM */
     struct VFile* rom_vf = VFileOpen(rom_path, O_RDONLY);
@@ -374,14 +394,26 @@ void gba_init(const char* rom_path) {
         fprintf(stderr, "[runtime] Cannot open ROM: %s\n", rom_path);
         exit(1);
     }
+    fprintf(stderr, "[init] ROM file opened\n"); fflush(stderr);
 
     if (!core->loadROM(core, rom_vf)) {
         fprintf(stderr, "[runtime] Failed to load ROM\n");
         exit(1);
     }
+    fprintf(stderr, "[init] ROM loaded\n"); fflush(stderr);
 
-    /* Reset - initializes all hardware */
+    /* Reset - initializes all hardware (uses HLE BIOS if no BIOS loaded) */
+    fprintf(stderr, "[init] Calling reset...\n"); fflush(stderr);
+
+    /* Set skip BIOS option before reset */
+    mCoreConfigInit(&core->config, "gbarecomp");
+    mCoreConfigSetDefaultIntValue(&core->config, "skipBios", 1);
+    mCoreConfigSetDefaultIntValue(&core->config, "useBios", 0);
+    core->loadConfig(core, &core->config);
+    fprintf(stderr, "[init] Config loaded\n"); fflush(stderr);
+
     core->reset(core);
+    fprintf(stderr, "[init] Core reset complete\n"); fflush(stderr);
 
     /* Cache internal pointers */
     gba = core->board;
