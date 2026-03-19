@@ -534,13 +534,55 @@ void gba_init(const char* rom_path) {
             gba->video.frameCounter, gba->video.vcount);
     fflush(stderr);
 
-    /* Initialize our recompiled CPU state */
-    memset(r, 0, sizeof(r));
-    r[13] = 0x03007F00; /* SP */
-    r[15] = 0x08000000; /* PC */
-    cpsr_val = 0x0000001F; /* System mode */
+    /* Let mGBA's real CPU run the game's initialization.
+     * The game copies init code to IWRAM and executes it there,
+     * using BIOS decompression routines (LZ77, RLE) to unpack
+     * graphics into VRAM. This can't be done by recompiled code. */
+    printf("[runtime] Running init with mGBA CPU...\n");
+    fflush(stdout);
+    {
+        int init_frames = 0;
+        uint16_t prev_dispcnt = 0x0080;
+        while (init_frames < 600) {
+            core->runFrame(core);
+            init_frames++;
 
-    printf("[runtime] mGBA initialized, ROM loaded\n");
+            uint16_t dispcnt = gba->memory.io[0];
+            uint16_t ie = gba->memory.io[0x100];
+            uint16_t ime = gba->memory.io[0x104];
+
+            if (init_frames <= 5 || init_frames % 60 == 0 || dispcnt != prev_dispcnt) {
+                fprintf(stderr, "[init frame %d] DISPCNT=0x%04X IE=0x%04X IME=%d PC=0x%08X\n",
+                        init_frames, dispcnt, ie, ime, arm_cpu->gprs[15]);
+                fflush(stderr);
+            }
+
+            /* Stop when forced blank is cleared (game finished init) */
+            if (dispcnt != 0x0080 && dispcnt != 0x0000 && init_frames > 2) {
+                fprintf(stderr, "[init] Display active at frame %d! DISPCNT=0x%04X\n",
+                        init_frames, dispcnt);
+                fflush(stderr);
+                break;
+            }
+            prev_dispcnt = dispcnt;
+        }
+        fprintf(stderr, "[init] mGBA CPU ran %d frames\n", init_frames);
+        fflush(stderr);
+    }
+
+    /* Copy mGBA's CPU state to our recompiled register file */
+    for (int i = 0; i < 16; i++) {
+        r[i] = arm_cpu->gprs[i];
+    }
+    cpsr_val = arm_cpu->cpsr.packed;
+    CPU_N = arm_cpu->cpsr.n;
+    CPU_Z = arm_cpu->cpsr.z;
+    CPU_C = arm_cpu->cpsr.c;
+    CPU_V = arm_cpu->cpsr.v;
+
+    printf("[runtime] mGBA init complete, handing off to recompiled code\n");
+    printf("[runtime] SP=0x%08X PC=0x%08X DISPCNT=0x%04X\n",
+           r[13], r[15], gba->memory.io[0]);
     fflush(stdout);
 
     /* Initialize SDL display */
