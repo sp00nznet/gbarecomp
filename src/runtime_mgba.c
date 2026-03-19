@@ -63,6 +63,7 @@ static u16 key_state = 0x03FF; /* All released (active-low) */
 /* ---- Forward declarations ---- */
 void display_render_frame(void);
 int display_poll_events(void);
+extern void cpu_bx(u32 target); /* BX dispatch from game_entry.c */
 
 /* ---- Timing ---- */
 
@@ -83,18 +84,56 @@ static void advance_hardware(int cycles) {
         gba->cpu->irqh.processEvents(arm_cpu);
     }
 
-    /* Check if mGBA rendered a new frame */
+    /* Check if mGBA rendered a new frame (VBlank started) */
     if (gba->video.frameCounter != last_frame_counter) {
         last_frame_counter = gba->video.frameCounter;
         frame_count++;
 
+        /* Deliver VBlank interrupt to the recompiled game code.
+         * On real GBA: IRQ fires -> BIOS saves regs -> calls [0x03007FFC].
+         * We simulate this by directly calling the handler. */
+        u16 ie = core->busRead16(core, 0x04000200); /* IE */
+        u16 ime = core->busRead16(core, 0x04000208); /* IME */
+        u32 handler = core->busRead32(core, 0x03007FFC);
+        if (frame_count <= 5) {
+            fprintf(stderr, "[irq] IE=0x%04X IME=%d handler=0x%08X\n", ie, ime, handler);
+            fflush(stderr);
+        }
+        if ((ie & 1) && ime) { /* VBlank IRQ enabled + master enable */
+            /* Set IF VBlank bit */
+            u16 if_val = core->busRead16(core, 0x04000202);
+            core->busWrite16(core, 0x04000202, if_val | 1);
+
+            /* Read the game's IRQ handler address */
+            u32 handler = core->busRead32(core, 0x03007FFC);
+            if (handler != 0 && (handler >> 24) == 0x08) {
+                /* Save recompiled CPU state (like BIOS would) */
+                u32 saved_r[16];
+                bool saved_N = CPU_N, saved_Z = CPU_Z, saved_C = CPU_C, saved_V = CPU_V;
+                memcpy(saved_r, r, sizeof(r));
+
+                /* Call the handler via BX dispatch */
+                cpu_bx(handler);
+
+                /* Acknowledge VBlank in IF (handler should do this but just in case) */
+                u16 if_after = core->busRead16(core, 0x04000202);
+                core->busWrite16(core, 0x04000202, if_after & ~1);
+
+                /* Also set BIOS IF flag at 0x03007FF8 (IntrWait checks this) */
+                u16 bios_if = core->busRead16(core, 0x03007FF8);
+                core->busWrite16(core, 0x03007FF8, bios_if | 1);
+            }
+        }
+
         /* Debug: periodic status */
         if (frame_count <= 5 || frame_count % 60 == 0) {
             u16 dispcnt = gba->memory.io[0]; /* DISPCNT at IO offset 0 */
-            fprintf(stderr, "[frame %u] DISPCNT=0x%04X mode=%d\n",
-                    frame_count, dispcnt, dispcnt & 7);
+            fprintf(stderr, "[frame %u] DISPCNT=0x%04X bus_accesses=%u\n",
+                    frame_count, dispcnt, bus_access_count);
             fflush(stderr);
         }
+        static u32 prev_bus = 0;
+        if (frame_count == 2) prev_bus = bus_access_count;
 
         display_render_frame();
     }
@@ -143,10 +182,17 @@ u32 bus_read32(u32 addr) {
     return core->busRead32(core, addr);
 }
 
+static u32 dispstat_read_count = 0;
 u16 bus_read16(u32 addr) {
     bus_access_count++;
     advance_hardware(2);
-    return (u16)core->busRead16(core, addr);
+    u16 val = (u16)core->busRead16(core, addr);
+    /* Trace DISPSTAT reads */
+    if (addr == 0x04000004 && ++dispstat_read_count <= 10) {
+        fprintf(stderr, "[dispstat] read=0x%04X (vcount=%d)\n", val, gba->video.vcount);
+        fflush(stderr);
+    }
+    return val;
 }
 
 u8 bus_read8(u32 addr) {
