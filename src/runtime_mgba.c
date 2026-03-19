@@ -596,10 +596,35 @@ void gba_init(const char* rom_path) {
                 if (!found2) seen[unique++] = p;
             }
 
-            /* Stop when we see real varied graphics (not just solid backdrop) */
-            if (unique >= 6 && init_frames > 10) {
-                fprintf(stderr, "[init] Real graphics at frame %d! DISPCNT=0x%04X, %d colors\n",
-                        init_frames, dispcnt, unique);
+            /* Render each frame to SDL during init so we can see the intro */
+            if (unique >= 2 && init_frames > 10) {
+                /* Save frame and render */
+                memcpy(savedFrame, videoBuf, sizeof(savedFrame));
+                has_saved_frame = true;
+                display_render_frame();
+                if (display_poll_events()) { gba_shutdown(); exit(0); }
+
+                /* Feed keyboard input to mGBA */
+                const Uint8* keys = SDL_GetKeyboardState(NULL);
+                u16 state = 0;
+                if (keys[SDL_SCANCODE_Z])         state |= 0x001;
+                if (keys[SDL_SCANCODE_X])         state |= 0x002;
+                if (keys[SDL_SCANCODE_BACKSPACE]) state |= 0x004;
+                if (keys[SDL_SCANCODE_RETURN])    state |= 0x008;
+                if (keys[SDL_SCANCODE_RIGHT])     state |= 0x010;
+                if (keys[SDL_SCANCODE_LEFT])      state |= 0x020;
+                if (keys[SDL_SCANCODE_UP])        state |= 0x040;
+                if (keys[SDL_SCANCODE_DOWN])      state |= 0x080;
+                if (keys[SDL_SCANCODE_A])         state |= 0x100;
+                if (keys[SDL_SCANCODE_S])         state |= 0x200;
+                core->setKeys(core, state);
+            }
+
+            /* Keep running mGBA's CPU until the user presses a key
+             * or we hit 3600 frames (~60 seconds). This lets the full
+             * intro sequence play via mGBA's real CPU. */
+            if (init_frames >= 3600) {
+                fprintf(stderr, "[init] Max init frames reached (%d)\n", init_frames);
                 fflush(stderr);
                 break;
             }
