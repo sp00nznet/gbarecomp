@@ -68,6 +68,8 @@ static u16 key_state = 0x03FF; /* All released (active-low) */
 void display_render_frame(void);
 int display_poll_events(void);
 extern void cpu_bx(u32 target); /* BX dispatch from game_entry.c */
+static void deliver_vblank_irq(void);
+void run_iwram_function(u32 target);
 
 /* ---- Timing ---- */
 
