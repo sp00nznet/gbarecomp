@@ -68,7 +68,7 @@ static u16 key_state = 0x03FF; /* All released (active-low) */
 void display_render_frame(void);
 int display_poll_events(void);
 extern void cpu_bx(u32 target); /* BX dispatch from game_entry.c */
-static void deliver_vblank_irq(void);
+static void deliver_interrupts(void);
 void run_iwram_function(u32 target);
 
 /* ---- Timing ---- */
@@ -77,6 +77,8 @@ static u32 frame_count = 0;
 static u32 bus_access_count = 0;
 static bool recomp_mode = false; /* true when recompiled code is running */
 static u32 dispstat_poll_count = 0; /* consecutive DISPSTAT reads */
+static bool in_irq = false; /* Guard against re-entrant IRQ */
+static int irq_deliver_count = 0;
 
 /* Advance mGBA hardware by a number of cycles */
 static u32 total_cycles = 0;
@@ -92,6 +94,17 @@ static void advance_hardware(int cycles) {
         gba->cpu->irqh.processEvents(arm_cpu);
     }
 
+    /* Check for any pending interrupts after timing advance.
+     * Read IO registers directly (not via bus) to avoid recursive advance_hardware. */
+    if (recomp_mode && !in_irq) {
+        u16 ie = gba->memory.io[0x200 >> 1];   /* IE */
+        u16 if_val = gba->memory.io[0x202 >> 1]; /* IF */
+        u16 ime = gba->memory.io[0x208 >> 1];  /* IME */
+        if ((ie & if_val) && ime) {
+            deliver_interrupts();
+        }
+    }
+
     /* Check if mGBA rendered a new frame (VBlank started) */
     if (gba->video.frameCounter != last_frame_counter) {
         last_frame_counter = gba->video.frameCounter;
@@ -99,7 +112,9 @@ static void advance_hardware(int cycles) {
 
         /* Deliver VBlank interrupt to recompiled code */
         if (recomp_mode) {
-            deliver_vblank_irq();
+            /* Set IF VBlank bit since mGBA just hit VBlank */
+            gba->memory.io[0x202 >> 1] |= 1;
+            deliver_interrupts();
         }
 
         /* Legacy VBlank interrupt delivery (kept for reference)
@@ -566,29 +581,37 @@ void run_iwram_function(u32 target) {
 
 /* ---- VBlank Interrupt Delivery ---- */
 
-static bool in_irq = false; /* Guard against re-entrant IRQ */
-
-static void deliver_vblank_irq(void) {
+/* Deliver any pending interrupts to the recompiled game code.
+ * Checks IE & IF for ANY matching bits, not just VBlank. */
+static void deliver_interrupts(void) {
     if (in_irq) return;
 
-    u16 ie = core->busRead16(core, 0x04000200);
-    u16 ime = core->busRead16(core, 0x04000208);
-    if (!(ie & 1) || !ime) return;
+    /* Read IO directly to avoid recursive bus access */
+    u16 ie = gba->memory.io[0x200 >> 1];
+    u16 ime = gba->memory.io[0x208 >> 1];
+    u16 if_val = gba->memory.io[0x202 >> 1];
+
+    /* Check if any enabled interrupt is pending */
+    u16 pending = ie & if_val;
+    if (!pending || !ime) return;
 
     u32 handler = core->busRead32(core, 0x03007FFC);
     if (handler == 0) return;
 
-    /* Set IF VBlank bit */
-    u16 if_val = core->busRead16(core, 0x04000202);
-    core->busWrite16(core, 0x04000202, if_val | 1);
-
-    /* Set BIOS IF flag for IntrWait */
+    /* Set BIOS IF flags for IntrWait */
     u16 bios_if = core->busRead16(core, 0x03007FF8);
-    core->busWrite16(core, 0x03007FF8, bios_if | 1);
+    core->busWrite16(core, 0x03007FF8, bios_if | pending);
 
     in_irq = true;
+    irq_deliver_count++;
 
-    /* Save recompiled state (IRQ handler must not clobber game state) */
+    if (irq_deliver_count <= 20 || irq_deliver_count % 60 == 0) {
+        fprintf(stderr, "[irq #%d] IE=0x%04X IF=0x%04X pending=0x%04X\n",
+                irq_deliver_count, ie, if_val, pending);
+        fflush(stderr);
+    }
+
+    /* Save recompiled state */
     u32 saved_r[16];
     bool saved_N = CPU_N, saved_Z = CPU_Z, saved_C = CPU_C, saved_V = CPU_V;
     memcpy(saved_r, r, sizeof(r));
@@ -601,18 +624,25 @@ static void deliver_vblank_irq(void) {
         cpu_bx(handler);
     }
 
-    /* Restore game state */
+    /* Restore game state (IRQ handler state is discarded) */
     memcpy(r, saved_r, sizeof(r));
     CPU_N = saved_N; CPU_Z = saved_Z; CPU_C = saved_C; CPU_V = saved_V;
 
-    /* Acknowledge VBlank in IF */
-    core->busWrite16(core, 0x04000202,
-        core->busRead16(core, 0x04000202) & ~1);
-
-    /* Re-enable IME (BIOS normally restores this on IRQ return) */
-    core->busWrite16(core, 0x04000208, 1);
+    /* Re-enable IME (BIOS restores this on IRQ return) */
+    gba->memory.io[0x208 >> 1] = 1;
 
     in_irq = false;
+
+    /* Immediately check for more pending interrupts.
+     * The handler may have changed IE (e.g. VBlank -> Timer),
+     * and mGBA may have already set the new IF bits. */
+    {
+        u16 ie2 = gba->memory.io[0x200 >> 1];
+        u16 if2 = gba->memory.io[0x202 >> 1];
+        if (ie2 & if2) {
+            deliver_interrupts(); /* Recursive - safe due to in_irq guard */
+        }
+    }
 }
 
 /* ---- Menu Callbacks ---- */
