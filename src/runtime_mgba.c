@@ -20,6 +20,7 @@
 #include <mgba-util/vfs.h>
 
 #include <SDL2/SDL.h>
+#include "gba/menu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -384,33 +385,37 @@ void display_render_frame(void) {
     SDL_UpdateTexture(texture, NULL, renderBuf, GBA_WIDTH * sizeof(color_t));
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, NULL, NULL);
+    menu_render();
     SDL_RenderPresent(renderer);
 }
 
 int display_poll_events(void) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        /* Let ImGui process first */
+        menu_process_event(&event);
+
         if (event.type == SDL_QUIT) return 1;
-        if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) return 1;
+        if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE &&
+            !menu_wants_input()) return 1;
+
+        /* Toggle debug console with F12 */
+        if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_F12) {
+            extern bool show_debug_console;
+            /* Can't access C++ static from C - use menu API instead */
+        }
     }
 
-    /* Read keyboard state for GBA buttons */
-    const Uint8* keys = SDL_GetKeyboardState(NULL);
-    u16 state = 0;
-    if (keys[SDL_SCANCODE_Z])         state |= 0x001; /* A */
-    if (keys[SDL_SCANCODE_X])         state |= 0x002; /* B */
-    if (keys[SDL_SCANCODE_BACKSPACE]) state |= 0x004; /* Select */
-    if (keys[SDL_SCANCODE_RETURN])    state |= 0x008; /* Start */
-    if (keys[SDL_SCANCODE_RIGHT])     state |= 0x010; /* Right */
-    if (keys[SDL_SCANCODE_LEFT])      state |= 0x020; /* Left */
-    if (keys[SDL_SCANCODE_UP])        state |= 0x040; /* Up */
-    if (keys[SDL_SCANCODE_DOWN])      state |= 0x080; /* Down */
-    if (keys[SDL_SCANCODE_A])         state |= 0x100; /* R */
-    if (keys[SDL_SCANCODE_S])         state |= 0x200; /* L */
+    /* Use configurable key bindings from menu */
+    u16 state = menu_get_keys();
 
-    key_state = (~state) & 0x03FF; /* Active-low for KEYINPUT */
+    /* Don't send input to game if ImGui wants it */
+    if (menu_wants_input()) {
+        state = 0;
+    }
 
-    /* Feed keys to mGBA (mGBA uses active-high: bit set = pressed) */
+    key_state = (~state) & 0x03FF;
+
     if (core) {
         core->setKeys(core, state);
     }
@@ -490,6 +495,11 @@ void gba_init(const char* rom_path) {
         fprintf(stderr, "[runtime] Display init failed\n");
         exit(1);
     }
+    menu_init(window, renderer);
+
+    /* Set up menu callbacks */
+    /* TODO: implement save state via mGBA's state serialization */
+    menu_set_callbacks(NULL, NULL, NULL, NULL, NULL);
 
     fprintf(stderr, "[init] Starting mGBA init...\n"); fflush(stderr);
 
@@ -616,20 +626,13 @@ void gba_init(const char* rom_path) {
                 display_render_frame();
                 if (display_poll_events()) { gba_shutdown(); exit(0); }
 
-                /* Feed keyboard input to mGBA */
-                const Uint8* keys = SDL_GetKeyboardState(NULL);
-                u16 state = 0;
-                if (keys[SDL_SCANCODE_Z])         state |= 0x001;
-                if (keys[SDL_SCANCODE_X])         state |= 0x002;
-                if (keys[SDL_SCANCODE_BACKSPACE]) state |= 0x004;
-                if (keys[SDL_SCANCODE_RETURN])    state |= 0x008;
-                if (keys[SDL_SCANCODE_RIGHT])     state |= 0x010;
-                if (keys[SDL_SCANCODE_LEFT])      state |= 0x020;
-                if (keys[SDL_SCANCODE_UP])        state |= 0x040;
-                if (keys[SDL_SCANCODE_DOWN])      state |= 0x080;
-                if (keys[SDL_SCANCODE_A])         state |= 0x100;
-                if (keys[SDL_SCANCODE_S])         state |= 0x200;
-                core->setKeys(core, state);
+                /* Feed keyboard input to mGBA using configurable bindings */
+                u16 state = menu_get_keys();
+                if (!menu_wants_input()) {
+                    core->setKeys(core, state);
+                } else {
+                    core->setKeys(core, 0);
+                }
             }
 
             /* No frame limit - mGBA's CPU runs the game indefinitely.
@@ -693,6 +696,7 @@ void gba_init(const char* rom_path) {
 }
 
 void gba_shutdown(void) {
+    menu_shutdown();
     display_shutdown();
     if (core) {
         core->deinit(core);
