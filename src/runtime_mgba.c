@@ -370,22 +370,10 @@ int display_init(void) {
 void display_render_frame(void) {
     if (!texture) return;
 
-    /* Use saved frame if current videoBuf is empty/black */
-    color_t* src = videoBuf;
-    if (has_saved_frame) {
-        int nonblack = 0;
-        for (int i = 0; i < 100 && nonblack == 0; i++) {
-            if (videoBuf[i * 384] != 0) nonblack++; /* sample sparse pixels */
-        }
-        if (nonblack == 0) {
-            src = savedFrame; /* videoBuf is empty, use saved frame */
-        }
-    }
-
-    /* Force alpha to 0xFF on all pixels (mGBA outputs with alpha=0) */
+    /* Force alpha to 0xFF on all pixels (mGBA outputs with alpha=0x28) */
     static color_t renderBuf[GBA_WIDTH * GBA_HEIGHT];
     for (int i = 0; i < GBA_WIDTH * GBA_HEIGHT; i++) {
-        renderBuf[i] = src[i] | 0xFF000000;
+        renderBuf[i] = (videoBuf[i] & 0x00FFFFFF) | 0xFF000000;
     }
 
     /* Upload to SDL */
