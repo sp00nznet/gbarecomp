@@ -73,6 +73,8 @@ extern void cpu_bx(u32 target); /* BX dispatch from game_entry.c */
 
 static u32 frame_count = 0;
 static u32 bus_access_count = 0;
+static bool recomp_mode = false; /* true when recompiled code is running */
+static u32 dispstat_poll_count = 0; /* consecutive DISPSTAT reads */
 
 /* Advance mGBA hardware by a number of cycles */
 static u32 total_cycles = 0;
@@ -93,7 +95,13 @@ static void advance_hardware(int cycles) {
         last_frame_counter = gba->video.frameCounter;
         frame_count++;
 
-        /* Deliver VBlank interrupt to the recompiled game code.
+        /* Deliver VBlank interrupt to recompiled code */
+        if (recomp_mode) {
+            deliver_vblank_irq();
+        }
+
+        /* Legacy VBlank interrupt delivery (kept for reference)
+         * Deliver VBlank interrupt to the recompiled game code.
          * On real GBA: IRQ fires -> BIOS saves regs -> calls [0x03007FFC].
          * We simulate this by directly calling the handler. */
         u16 ie = core->busRead16(core, 0x04000200); /* IE */
@@ -189,16 +197,38 @@ u32 bus_read32(u32 addr) {
     return core->busRead32(core, addr);
 }
 
-static u32 dispstat_read_count = 0;
 u16 bus_read16(u32 addr) {
     bus_access_count++;
     advance_hardware(2);
     u16 val = (u16)core->busRead16(core, addr);
-    /* Trace DISPSTAT reads */
-    if (addr == 0x04000004 && ++dispstat_read_count <= 10) {
-        fprintf(stderr, "[dispstat] read=0x%04X (vcount=%d)\n", val, gba->video.vcount);
-        fflush(stderr);
+
+    /* DISPSTAT fast-forward: when recompiled code polls for VBlank in
+     * a tight loop, skip ahead to the next VBlank instead of spinning */
+    if (recomp_mode && addr == 0x04000004) {
+        if (!(val & 1)) { /* VBlank bit not set */
+            dispstat_poll_count++;
+            if (dispstat_poll_count > 4) {
+                /* Fast-forward to next VBlank */
+                u32 start_fc = gba->video.frameCounter;
+                while (gba->video.frameCounter == start_fc) {
+                    arm_cpu->cycles += 64;
+                    while (arm_cpu->cycles >= arm_cpu->nextEvent) {
+                        gba->cpu->irqh.processEvents(arm_cpu);
+                    }
+                }
+                val = (u16)core->busRead16(core, addr);
+                dispstat_poll_count = 0;
+
+                /* Render frame + poll events */
+                frame_count++;
+                display_render_frame();
+                if (display_poll_events()) { gba_shutdown(); exit(0); }
+            }
+        } else {
+            dispstat_poll_count = 0;
+        }
     }
+
     return val;
 }
 
@@ -495,6 +525,91 @@ void cpu_undefined(u32 insn) {
     fprintf(stderr, "[runtime] Undefined: 0x%08X\n", insn);
 }
 
+/* ---- IWRAM Interpreter Fallback ---- */
+
+/* Run an IWRAM/EWRAM function via mGBA's CPU interpreter.
+ * Syncs our register file to mGBA, steps until PC returns to ROM, syncs back. */
+void run_iwram_function(u32 target) {
+    if (!core || !arm_cpu) return;
+
+    /* Sync recompiled state -> mGBA's ARMCore */
+    for (int i = 0; i < 16; i++) arm_cpu->gprs[i] = r[i];
+    arm_cpu->cpsr.packed = cpu_get_cpsr();
+
+    /* Set PC to target (clear Thumb bit for BX) */
+    bool thumb = (target & 1) != 0;
+    arm_cpu->gprs[15] = target & ~1u;
+    arm_cpu->cpsr.t = thumb ? 1 : 0;
+
+    /* Step mGBA's interpreter until PC returns to ROM space */
+    int steps = 0;
+    while (steps < 500000) {
+        core->step(core);
+        steps++;
+
+        u32 pc = arm_cpu->gprs[15];
+        /* Check if we returned to ROM */
+        if ((pc >> 24) == 0x08) break;
+        /* Check if we returned to address 0 (BIOS return) */
+        if (pc < 0x100) break;
+    }
+
+    /* Sync mGBA state -> recompiled */
+    for (int i = 0; i < 16; i++) r[i] = arm_cpu->gprs[i];
+    CPU_N = arm_cpu->cpsr.n;
+    CPU_Z = arm_cpu->cpsr.z;
+    CPU_C = arm_cpu->cpsr.c;
+    CPU_V = arm_cpu->cpsr.v;
+}
+
+/* ---- VBlank Interrupt Delivery ---- */
+
+static bool in_irq = false; /* Guard against re-entrant IRQ */
+
+static void deliver_vblank_irq(void) {
+    if (in_irq) return;
+
+    u16 ie = core->busRead16(core, 0x04000200);
+    u16 ime = core->busRead16(core, 0x04000208);
+    if (!(ie & 1) || !ime) return;
+
+    u32 handler = core->busRead32(core, 0x03007FFC);
+    if (handler == 0) return;
+
+    /* Set IF VBlank bit */
+    u16 if_val = core->busRead16(core, 0x04000202);
+    core->busWrite16(core, 0x04000202, if_val | 1);
+
+    /* Set BIOS IF flag for IntrWait */
+    u16 bios_if = core->busRead16(core, 0x03007FF8);
+    core->busWrite16(core, 0x03007FF8, bios_if | 1);
+
+    in_irq = true;
+
+    /* Save recompiled state (IRQ handler must not clobber game state) */
+    u32 saved_r[16];
+    bool saved_N = CPU_N, saved_Z = CPU_Z, saved_C = CPU_C, saved_V = CPU_V;
+    memcpy(saved_r, r, sizeof(r));
+
+    /* Run interrupt handler */
+    if ((handler >> 24) == 0x03 || (handler >> 24) == 0x02) {
+        run_iwram_function(handler);
+    } else if ((handler >> 24) == 0x08) {
+        extern void cpu_bx(u32 target);
+        cpu_bx(handler);
+    }
+
+    /* Restore game state */
+    memcpy(r, saved_r, sizeof(r));
+    CPU_N = saved_N; CPU_Z = saved_Z; CPU_C = saved_C; CPU_V = saved_V;
+
+    /* Acknowledge VBlank in IF */
+    core->busWrite16(core, 0x04000202,
+        core->busRead16(core, 0x04000202) & ~1);
+
+    in_irq = false;
+}
+
 /* ---- Menu Callbacks ---- */
 
 static char rom_base_path[512] = {0};
@@ -649,7 +764,7 @@ void gba_init(const char* rom_path) {
     {
         int init_frames = 0;
         uint16_t prev_dispcnt = 0x0080;
-        while (1) { /* Run mGBA's CPU indefinitely */
+        while (init_frames < 600) { /* Run mGBA's CPU for init */
             core->runFrame(core);
             init_frames++;
 
@@ -690,9 +805,13 @@ void gba_init(const char* rom_path) {
                 }
             }
 
-            /* No frame limit - mGBA's CPU runs the game indefinitely.
-             * The game's IWRAM task dispatcher + VBlank polling requires
-             * the real ARM CPU. Our recompiled code handles the display. */
+            /* Stop init when we see real graphics AND interrupts are set up */
+            if (unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
+                fprintf(stderr, "[init] Init complete at frame %d, switching to recompiled code\n",
+                        init_frames);
+                fflush(stderr);
+                break;
+            }
             prev_dispcnt = dispcnt;
         }
         fprintf(stderr, "[init] mGBA CPU ran %d frames\n", init_frames);
@@ -724,30 +843,17 @@ void gba_init(const char* rom_path) {
            r[13], r[15], gba->memory.io[0]);
     fflush(stdout);
 
-    /* Save the init frame and render it */
-    memcpy(savedFrame, videoBuf, sizeof(savedFrame));
-    has_saved_frame = true;
-
-    /* Debug: dump pixel variety */
-    {
-        u32 unique[16] = {0};
-        int nunique = 0;
-        for (int i = 0; i < 240*160 && nunique < 16; i++) {
-            u32 p = videoBuf[i];
-            bool found = false;
-            for (int j = 0; j < nunique; j++) {
-                if (unique[j] == p) { found = true; break; }
-            }
-            if (!found) unique[nunique++] = p;
-        }
-        fprintf(stderr, "[init] %d unique colors: ", nunique);
-        for (int i = 0; i < nunique; i++) fprintf(stderr, "0x%08X ", unique[i]);
-        fprintf(stderr, "\n"); fflush(stderr);
-    }
-
+    /* Render the last init frame */
     display_render_frame();
-    printf("[runtime] Title screen rendered!\n");
+
+    /* Enable recompiled code mode */
+    recomp_mode = true;
+    printf("[runtime] Init complete - switching to recompiled code\n");
+    printf("[runtime] SP=0x%08X PC=0x%08X DISPCNT=0x%04X\n",
+           r[13], r[15], gba->memory.io[0]);
     fflush(stdout);
+
+    /* gba_init returns, then main() calls func_080386E4() (the main game function) */
 }
 
 void gba_shutdown(void) {

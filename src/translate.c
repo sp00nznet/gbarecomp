@@ -1459,18 +1459,39 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "            hi = mid - 1;\n");
         fprintf(f, "        }\n");
         fprintf(f, "    }\n");
-        fprintf(f, "    /* NULL or RAM targets - can't dispatch statically */\n");
+        fprintf(f, "    /* NULL targets */\n");
         fprintf(f, "    if (target == 0 || target == 1) return;\n");
-        fprintf(f, "    if ((target >> 24) == 0x02 || (target >> 24) == 0x03) return;\n");
+        fprintf(f, "    /* RAM targets: run via mGBA interpreter */\n");
+        fprintf(f, "    if ((target >> 24) == 0x02 || (target >> 24) == 0x03) {\n");
+        fprintf(f, "        run_iwram_function(target);\n");
+        fprintf(f, "        return;\n");
+        fprintf(f, "    }\n");
         fprintf(f, "    static int _bxmiss = 0;\n");
         fprintf(f, "    if (++_bxmiss <= 20) fprintf(stderr, \"[bx] No function for 0x%%08X\\n\", target);\n");
         fprintf(f, "}\n\n");
 
-        /* Add main() */
+        /* Add main() - after mGBA init, call the main game function directly */
         fprintf(f, "int main(int argc, char* argv[]) {\n");
         fprintf(f, "    const char* rom_path = argc > 1 ? argv[1] : \"game.gba\";\n");
-        fprintf(f, "    gba_init(rom_path);\n");
-        fprintf(f, "    game_entry();\n");
+        fprintf(f, "    gba_init(rom_path); /* mGBA runs init, then hands off */\n");
+        fprintf(f, "    /* Call the main game function directly (skip crt0 - mGBA did that) */\n");
+
+        /* Find the main game function by looking at the call chain:
+         * crt0 -> AgbMain -> quick_init -> MAIN_GAME_FUNCTION */
+        u32 main_func = 0;
+        for (int i = 0; i < analysis->num_functions; i++) {
+            /* The main game function is the largest one discovered from entry point */
+            if (analysis->functions[i].num_blocks > 100) {
+                main_func = analysis->functions[i].entry;
+                break;
+            }
+        }
+        if (main_func) {
+            fprintf(f, "    func_%08X(); /* main game function */\n", main_func);
+        } else {
+            fprintf(f, "    game_entry(); /* fallback to full entry */\n");
+        }
+
         fprintf(f, "    gba_shutdown();\n");
         fprintf(f, "    return 0;\n");
         fprintf(f, "}\n");
