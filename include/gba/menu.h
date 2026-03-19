@@ -25,6 +25,9 @@ unsigned short menu_get_keys(void);
 /* Returns 1 if ImGui wants keyboard/mouse input (menu is active). */
 int menu_wants_input(void);
 
+/* Get the height of the menu bar in pixels. */
+int menu_get_bar_height(void);
+
 /* Add a line to the debug console. */
 void menu_add_debug_log(const char* msg);
 

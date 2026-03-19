@@ -13,6 +13,7 @@
 #include <mgba/core/core.h>
 #include <mgba/core/config.h>
 #include <mgba/core/log.h>
+#include <mgba/core/serialize.h>
 #include <mgba/gba/core.h>
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/video.h>
@@ -384,7 +385,14 @@ void display_render_frame(void) {
     /* Upload to SDL */
     SDL_UpdateTexture(texture, NULL, renderBuf, GBA_WIDTH * sizeof(color_t));
     SDL_RenderClear(renderer);
-    SDL_RenderCopy(renderer, texture, NULL, NULL);
+
+    /* Offset game below menu bar */
+    int bar_h = menu_get_bar_height();
+    int win_w, win_h;
+    SDL_GetWindowSize(window, &win_w, &win_h);
+    SDL_Rect dst = { 0, bar_h, win_w, win_h - bar_h };
+    SDL_RenderCopy(renderer, texture, NULL, &dst);
+
     menu_render();
     SDL_RenderPresent(renderer);
 }
@@ -487,6 +495,49 @@ void cpu_undefined(u32 insn) {
     fprintf(stderr, "[runtime] Undefined: 0x%08X\n", insn);
 }
 
+/* ---- Menu Callbacks ---- */
+
+static char rom_base_path[512] = {0};
+
+static void cb_save_state(int slot) {
+    if (!core) return;
+    char path[512];
+    snprintf(path, sizeof(path), "%s.ss%d", rom_base_path, slot);
+    struct VFile* vf = VFileOpen(path, O_CREAT | O_TRUNC | O_WRONLY);
+    if (vf && mCoreSaveStateNamed(core, vf, SAVESTATE_ALL)) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "State saved to slot %d", slot);
+        menu_add_debug_log(msg);
+        fprintf(stderr, "[save] Slot %d -> %s\n", slot, path);
+    } else {
+        menu_add_debug_log("Save state failed!");
+    }
+    if (vf) vf->close(vf);
+}
+
+static void cb_load_state(int slot) {
+    if (!core) return;
+    char path[512];
+    snprintf(path, sizeof(path), "%s.ss%d", rom_base_path, slot);
+    struct VFile* vf = VFileOpen(path, O_RDONLY);
+    if (vf && mCoreLoadStateNamed(core, vf, SAVESTATE_ALL)) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "State loaded from slot %d", slot);
+        menu_add_debug_log(msg);
+        fprintf(stderr, "[load] Slot %d <- %s\n", slot, path);
+    } else {
+        menu_add_debug_log("Load state failed (no save in slot?)");
+    }
+    if (vf) vf->close(vf);
+}
+
+static void cb_set_scale(int scale) {
+    if (!window) return;
+    SDL_SetWindowSize(window, GBA_WIDTH * scale, GBA_HEIGHT * scale + menu_get_bar_height());
+    SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    fprintf(stderr, "[gfx] Scale set to %dx\n", scale);
+}
+
 /* ---- Init / Shutdown ---- */
 
 void gba_init(const char* rom_path) {
@@ -498,8 +549,12 @@ void gba_init(const char* rom_path) {
     menu_init(window, renderer);
 
     /* Set up menu callbacks */
-    /* TODO: implement save state via mGBA's state serialization */
-    menu_set_callbacks(NULL, NULL, NULL, NULL, NULL);
+    menu_set_callbacks(cb_save_state, cb_load_state, cb_set_scale, NULL, NULL);
+
+    /* Store base path for save states */
+    strncpy(rom_base_path, rom_path, sizeof(rom_base_path) - 1);
+    char* ext = strrchr(rom_base_path, '.');
+    if (ext) *ext = '\0'; /* Strip extension */
 
     fprintf(stderr, "[init] Starting mGBA init...\n"); fflush(stderr);
 

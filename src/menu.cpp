@@ -188,7 +188,6 @@ void menu_render(void) {
         /* Config Menu */
         if (ImGui::BeginMenu("Config")) {
             ImGui::MenuItem("Debug Console", "F12", &show_debug_console);
-            ImGui::MenuItem("Controller Config", NULL, &show_controller_config);
             ImGui::EndMenu();
         }
 
@@ -336,6 +335,11 @@ int menu_wants_input(void) {
     if (!menu_initialized) return 0;
     ImGuiIO& io = ImGui::GetIO();
     return io.WantCaptureKeyboard || io.WantCaptureMouse ? 1 : 0;
+}
+
+int menu_get_bar_height(void) {
+    if (!menu_initialized) return 0;
+    return (int)(ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2 + 2);
 }
 
 } /* extern "C" */
