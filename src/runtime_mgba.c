@@ -60,17 +60,78 @@ static SDL_Renderer* renderer = NULL;
 static SDL_Texture* texture = NULL;
 static u16 key_state = 0x03FF; /* All released (active-low) */
 
+/* ---- Forward declarations ---- */
+void display_render_frame(void);
+int display_poll_events(void);
+
 /* ---- Timing ---- */
 
 static u32 frame_count = 0;
 static u32 bus_access_count = 0;
 
 /* Advance mGBA hardware by a number of cycles */
+static u32 total_cycles = 0;
+static u32 last_poll = 0;
+static u32 last_frame_counter = 0;
+
 static void advance_hardware(int cycles) {
-    arm_cpu->cycles -= cycles;
-    /* When cycles go below nextEvent, mGBA processes pending events */
-    if (arm_cpu->cycles <= arm_cpu->nextEvent) {
+    arm_cpu->cycles += cycles;
+    total_cycles += cycles;
+
+    /* When cycles reach nextEvent, mGBA processes pending events */
+    while (arm_cpu->cycles >= arm_cpu->nextEvent) {
         gba->cpu->irqh.processEvents(arm_cpu);
+    }
+
+    /* Check if mGBA rendered a new frame */
+    if (gba->video.frameCounter != last_frame_counter) {
+        last_frame_counter = gba->video.frameCounter;
+        frame_count++;
+
+        /* Debug: periodic status */
+        if (frame_count <= 5 || frame_count % 60 == 0) {
+            u16 dispcnt = gba->memory.io[0]; /* DISPCNT at IO offset 0 */
+            fprintf(stderr, "[frame %u] DISPCNT=0x%04X mode=%d\n",
+                    frame_count, dispcnt, dispcnt & 7);
+            fflush(stderr);
+        }
+
+        display_render_frame();
+    }
+
+    /* Poll SDL events and force frame rendering periodically */
+    if (total_cycles - last_poll > 50000) {
+        last_poll = total_cycles;
+        if (display_poll_events()) {
+            gba_shutdown();
+            exit(0);
+        }
+
+        /* Force-render a frame by ticking mGBA's timing system.
+         * This ensures frames are produced even if the game is stuck. */
+        {
+            u32 start_fc = gba->video.frameCounter;
+            int ticks = 0;
+            while (gba->video.frameCounter == start_fc && ticks < 300000) {
+                /* Tick mGBA's timing by 4 cycles at a time */
+                arm_cpu->cycles += 4;
+                while (arm_cpu->cycles >= arm_cpu->nextEvent) {
+                    gba->cpu->irqh.processEvents(arm_cpu);
+                }
+                ticks++;
+            }
+            if (gba->video.frameCounter != start_fc) {
+                last_frame_counter = gba->video.frameCounter;
+                frame_count++;
+                if (frame_count <= 5 || frame_count % 60 == 0) {
+                    u16 dispcnt = gba->memory.io[0];
+                    fprintf(stderr, "[frame %u] DISPCNT=0x%04X\n", frame_count, dispcnt);
+                    fflush(stderr);
+                }
+                display_render_frame();
+                SDL_Delay(16); /* ~60fps */
+            }
+        }
     }
 }
 
@@ -326,8 +387,8 @@ void gba_frame(void) {
 
     /* Advance mGBA hardware until the next frame is rendered */
     int safety = 0;
-    while (gba->video.frameCounter == start_frame && safety < 300000) {
-        advance_hardware(16);
+    while (gba->video.frameCounter == start_frame && safety < 500000) {
+        advance_hardware(4);
         safety++;
     }
 
@@ -418,6 +479,14 @@ void gba_init(const char* rom_path) {
     /* Cache internal pointers */
     gba = core->board;
     arm_cpu = core->cpu;
+
+    fprintf(stderr, "[init] gba=%p, cpu=%p, video.renderer=%p\n",
+            (void*)gba, (void*)arm_cpu, (void*)gba->video.renderer);
+    fprintf(stderr, "[init] cpu->cycles=%d, nextEvent=%d\n",
+            arm_cpu->cycles, arm_cpu->nextEvent);
+    fprintf(stderr, "[init] video.frameCounter=%u, vcount=%d\n",
+            gba->video.frameCounter, gba->video.vcount);
+    fflush(stderr);
 
     /* Initialize our recompiled CPU state */
     memset(r, 0, sizeof(r));
