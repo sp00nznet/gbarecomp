@@ -13,6 +13,7 @@
 extern "C" {
 
 /* ---- State ---- */
+static SDL_Renderer* s_menu_renderer = NULL;
 static bool menu_initialized = false;
 static bool show_debug_console = false;
 static bool show_controller_config = false;
@@ -58,6 +59,7 @@ void menu_init(SDL_Window* window, SDL_Renderer* renderer) {
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer2_Init(renderer);
 
+    s_menu_renderer = renderer;
     menu_initialized = true;
 }
 
@@ -310,7 +312,7 @@ void menu_render(void) {
     }
 
     ImGui::Render();
-    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
+    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), s_menu_renderer);
 }
 
 /* Get current key state using configurable bindings */
