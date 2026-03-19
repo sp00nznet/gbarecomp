@@ -560,7 +560,7 @@ void gba_init(const char* rom_path) {
     {
         int init_frames = 0;
         uint16_t prev_dispcnt = 0x0080;
-        while (init_frames < 600) {
+        while (1) { /* Run mGBA's CPU indefinitely */
             core->runFrame(core);
             init_frames++;
 
@@ -608,14 +608,9 @@ void gba_init(const char* rom_path) {
                 core->setKeys(core, state);
             }
 
-            /* Keep running mGBA's CPU until the user presses a key
-             * or we hit 3600 frames (~60 seconds). This lets the full
-             * intro sequence play via mGBA's real CPU. */
-            if (init_frames >= 3600) {
-                fprintf(stderr, "[init] Max init frames reached (%d)\n", init_frames);
-                fflush(stderr);
-                break;
-            }
+            /* No frame limit - mGBA's CPU runs the game indefinitely.
+             * The game's IWRAM task dispatcher + VBlank polling requires
+             * the real ARM CPU. Our recompiled code handles the display. */
             prev_dispcnt = dispcnt;
         }
         fprintf(stderr, "[init] mGBA CPU ran %d frames\n", init_frames);
