@@ -1,6 +1,6 @@
 # gbarecomp
 
-**A static recompilation toolkit for Game Boy Advance ROMs.**
+**The first static recompilation toolkit for Game Boy Advance ROMs.**
 
 ```
    ██████╗ ██████╗  █████╗     ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ███╗██████╗
@@ -11,6 +11,16 @@
    ╚═════╝ ╚═════╝ ╚═╝  ╚═╝    ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝╚═╝     ╚═╝╚═╝
 ```
 
+> **First of its kind.** As of March 2026, gbarecomp is the first toolkit to statically recompile GBA ROMs into native executables. The N64 has [N64Recomp](https://github.com/N64Recomp/N64Recomp) (9+ games ported). The Game Boy has [gb-recompiled](https://github.com/arcanite24/gb-recompiled). Now the GBA joins them. Built from scratch in 48 hours, 28 commits, from zero to a running game with graphics on screen.
+
+## Proof of Life
+
+The first successfully statically recompiled GBA game -- **Advance Wars** -- running natively on Windows x64:
+
+![Advance Wars Recompiled - Title Screen](https://raw.githubusercontent.com/sp00nznet/advancewars/master/proofoflife.png)
+
+*Advance Wars title screen (fade-in transition), rendered by mGBA's PPU through the static recompilation pipeline. ARM7TDMI machine code translated to C, compiled with MSVC, running as a native 8MB Windows executable.*
+
 ## The Pitch
 
 The N64 got [static recompilation](https://github.com/N64Recomp/N64Recomp). The Game Boy got [its own recompiler](https://github.com/arcanite24/gb-recompiled). The GBA? The GBA has been sitting there with its incredible library -- Advance Wars, Fire Emblem, Metroid, Pokemon, Golden Sun -- waiting for someone to set it free.
@@ -19,9 +29,7 @@ The N64 got [static recompilation](https://github.com/N64Recomp/N64Recomp). The 
 
 `gbarecomp` takes a GBA ROM, analyzes the ARM7TDMI machine code, and spits out equivalent C source that compiles to a native binary. No emulation loop. No interpreter. Just your game, running on bare metal, at whatever speed and resolution your hardware can push.
 
-## How Static Recompilation Works
-
-Traditional emulation interprets every instruction at runtime. Static recompilation does the hard work upfront:
+## How It Works
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────────┐
@@ -35,133 +43,101 @@ Traditional emulation interprets every instruction at runtime. Static recompilat
                     └──────────────┘     └─────────────┘       (libmgba)
 ```
 
-**Phase 1: Disassembly**
-- Parse the GBA ROM header and identify entry points
-- Recursively disassemble ARM (32-bit) and Thumb (16-bit) instruction streams
-- Build a control flow graph, resolving branches and detecting function boundaries
-- Identify jump tables and indirect branch targets through data flow analysis
+1. **Disassembly** -- Full ARM7TDMI decoder (ARM 32-bit + Thumb 16-bit, all instruction formats)
+2. **Analysis** -- Recursive descent CFG, function discovery (prologue scanning, BX resolution, block splitting, connected-component merging), 6,289 functions discovered in Advance Wars
+3. **Translation** -- Every instruction converted to C with condition codes, flag updates, memory bus calls. Multi-file output (63 source files) for parallel compilation
+4. **Runtime** -- [libmgba](https://github.com/mgba-emu/mgba) provides pixel-perfect PPU, accurate DMA/timers/interrupts, and full GBA memory map. SDL2 for display and input
+5. **Compilation** -- MSVC/gcc/clang produces a native executable. 8MB for Advance Wars
 
-**Phase 2: Translation**
-- Convert each ARM/Thumb instruction to equivalent C operations
-- Map the ARM7TDMI register file (R0-R15, CPSR) to C variables
-- Replace memory accesses with calls to the runtime's memory bus
-- Handle ARM/Thumb interworking (BX instructions that switch ISA mode)
+## What's Working
 
-**Phase 3: Runtime**
-- Everything except the CPU is handled by the GBA runtime library
-- PPU (graphics), APU (audio), DMA, timers, interrupts -- all faithfully emulated
-- Built on [libmgba](https://github.com/mgba-emu/mgba), one of the most accurate GBA emulators
-- Memory-mapped I/O writes dispatch to the runtime's hardware models
+| Feature | Status |
+|---------|--------|
+| ARM instruction decoder | All ARM7TDMI types |
+| Thumb instruction decoder | All 19 formats |
+| Control flow analysis | Recursive descent, 6-phase pipeline |
+| BX dispatch | Binary search table, 6,289 entries |
+| Function boundary detection | Prologue scan + connected-component merge |
+| C code generation | Multi-file, 1.1M lines for Advance Wars |
+| Memory bus | Via libmgba (all GBA regions) |
+| PPU rendering | Via libmgba (all modes, sprites, effects) |
+| DMA | Via libmgba (all channels, all timing) |
+| Display | SDL2 window, 720x480 (3x scale) |
+| Input | Keyboard mapped to GBA buttons |
+| Save detection | Flash/SRAM auto-detected by mGBA |
+| **First game rendering** | **Advance Wars title screen** |
 
-**Phase 4: Compilation**
-- Standard C compiler (gcc, clang, MSVC) produces a native binary
-- Link against the GBA runtime library
-- The result runs on Windows, Linux, macOS -- anywhere you can compile C
+## Quick Start
 
-## Architecture
+```bash
+# Build the recompiler
+cd gbarecomp
+cmake -B build && cmake --build build --config Release
 
+# Analyze a ROM
+./build/gbarecomp info game.gba
+./build/gbarecomp analyze game.gba --functions
+
+# Generate C source (multi-file)
+./build/gbarecomp translate game.gba -o output/ --multi
+
+# Build the game (requires libmgba + SDL2)
+cd output/
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
+
+# Run it
+./build/Release/GAME game.gba
 ```
-gbarecomp/
-├── disasm/          # ARM7TDMI disassembler (ARM + Thumb)
-├── analysis/        # Control flow analysis, jump table detection
-├── translate/       # Instruction-to-C translation engine
-├── runtime/         # GBA hardware runtime (wraps libmgba)
-│   ├── bus.c        # Memory bus + MMIO dispatch
-│   ├── ppu.c        # Video (wraps mGBA PPU)
-│   ├── apu.c        # Audio (wraps mGBA APU)
-│   ├── dma.c        # DMA controller
-│   ├── timer.c      # Timer subsystem
-│   ├── irq.c        # Interrupt controller
-│   └── save.c       # SRAM/Flash/EEPROM
-├── output/          # C code generation and formatting
-└── tools/           # ROM analysis utilities
-```
-
-## The Hard Problems (and How We'll Solve Them)
-
-### ARM/Thumb Interworking
-GBA code freely switches between 32-bit ARM and 16-bit Thumb modes via `BX` instructions. The lowest bit of the target address determines the mode. Our disassembler tracks mode switches through the control flow graph and translates both ISAs.
-
-### Indirect Branches
-`BX Rm` where the register value isn't known statically. This is the classic static recompilation headache. Our approach:
-1. **Pattern matching** -- Detect common jump table idioms (`LDR PC, [PC, Rm, LSL #2]`)
-2. **Data flow tracking** -- Trace register values backward to bound the set of possible targets
-3. **Runtime fallback** -- For truly dynamic branches (rare on GBA), dispatch through a function pointer table populated at load time
-
-### Self-Modifying Code
-Some games copy routines to IWRAM and execute from there. We handle this with:
-1. **Static detection** -- Identify DMA/memcpy to IWRAM followed by execution
-2. **Pre-analysis** -- If the copied code is a known pattern, recompile it statically
-3. **Interpreter fallback** -- For dynamic IWRAM code, fall back to an ARM interpreter (from libmgba)
-
-### Timing Sensitivity
-GBA games depend on precise DMA/timer/PPU timing. Even though the CPU runs natively, the runtime must model cycle-accurate hardware behavior. The libmgba core handles this -- we synchronize recompiled code with the runtime's cycle counter.
-
-## GBA Hardware at a Glance
-
-| Component | What It Does | How We Handle It |
-|-----------|-------------|-----------------|
-| **ARM7TDMI CPU** | 16.78 MHz, ARM + Thumb ISAs | Statically recompiled to C |
-| **PPU** | 240x160, 4 BG layers, 128 sprites, 6 video modes | libmgba PPU core |
-| **APU** | 4 PSG channels + 2 PCM DMA channels | libmgba APU core |
-| **DMA** | 4 channels, VBlank/HBlank/FIFO triggers | libmgba DMA model |
-| **Timers** | 4x 16-bit with prescaler + cascade | libmgba timer model |
-| **Memory** | BIOS(16K), EWRAM(256K), IWRAM(32K), VRAM(96K), ROM(32M) | Runtime memory bus |
-| **Interrupts** | VBlank, HBlank, Timer, DMA, Keypad, etc. | Runtime IRQ dispatch |
-| **Saves** | SRAM, Flash, EEPROM (varies by game) | Runtime save abstraction |
-
-## Project Status
-
-| Component | Status |
-|-----------|--------|
-| ROM loader + header parsing | Not started |
-| ARM disassembler | Not started |
-| Thumb disassembler | Not started |
-| Control flow analysis | Not started |
-| Jump table detection | Not started |
-| ARM -> C translation | Not started |
-| Thumb -> C translation | Not started |
-| Memory bus runtime | Not started |
-| PPU runtime (libmgba) | Not started |
-| APU runtime (libmgba) | Not started |
-| DMA/Timer/IRQ runtime | Not started |
-| End-to-end pipeline | Not started |
-
-## First Target
-
-Our first recompilation target is **[Advance Wars](https://github.com/sp00nznet/advancewars)** -- a beloved GBA strategy game that deserves to live forever. But `gbarecomp` is designed to be game-agnostic. Once the toolchain is proven, any GBA ROM is fair game.
 
 ## Standing on the Shoulders of Giants
 
-This project wouldn't be possible without:
+### Static Recompilation Pioneers
+- **[N64Recomp](https://github.com/N64Recomp/N64Recomp)** -- The project that proved static recompilation of console games is practical. 9+ N64 games ported including Zelda: Majora's Mask, Banjo-Kazooie, Star Fox 64. The architectural blueprint for gbarecomp.
+- **[gb-recompiled](https://github.com/arcanite24/gb-recompiled)** -- Static recompiler for original Game Boy (Z80 -> C). ~98% of the GB library compiles. Showed this works for handhelds too.
 
-- **[N64Recomp](https://github.com/N64Recomp/N64Recomp)** -- Proved that static recompilation of console games is not only possible but practical. The architectural blueprint for this project.
-- **[gb-recompiled](https://github.com/arcanite24/gb-recompiled)** -- Showed that static recomp works for handheld games too. Their jump table analysis work is directly relevant.
-- **[mGBA](https://github.com/mgba-emu/mgba)** -- Endri Lakanovic and contributors built an incredible GBA emulator with a clean library interface. We're using `libmgba` as our hardware runtime.
-- **[GBATEK](https://problemkaputt.de/gbatek.htm)** -- Martin Korth's legendary GBA technical reference. The bible for anyone touching GBA hardware.
-- **[pret](https://github.com/pret)** -- The decompilation community that has reverse-engineered dozens of GBA games. Their work proves these games can be understood at the source level.
+### GBA Emulation
+- **[mGBA](https://github.com/mgba-emu/mgba)** -- The excellent GBA emulator whose `libmgba` core powers our hardware runtime. MPL-2.0 licensed with a clean `mCore` API. Without mGBA, this project wouldn't exist.
+
+### GBA Decompilation Community
+
+These incredible projects have manually reverse-engineered GBA games back to compilable C source. Their work proves the GBA library can be understood at the source level. If you're working on any of these, your decomp could be a starting point for a recomp too.
+
+| Game | Project | Status |
+|------|---------|--------|
+| **Zelda: The Minish Cap** | [zeldaret/tmc](https://github.com/zeldaret/tmc) | 100% complete |
+| **Metroid: Zero Mission** | [metroidret/mzm](https://github.com/metroidret/mzm) | ~99.89% |
+| **Pokemon Emerald** | [pret/pokeemerald](https://github.com/pret/pokeemerald) | Complete |
+| **Pokemon FireRed/LeafGreen** | [pret/pokefirered](https://github.com/pret/pokefirered) | Complete |
+| **Pokemon Ruby/Sapphire** | [pret/pokeruby](https://github.com/pret/pokeruby) | Complete |
+| **Fire Emblem: Sacred Stones** | [FireEmblemUniverse/fireemblem8u](https://github.com/FireEmblemUniverse/fireemblem8u) | ~89% |
+| **Fire Emblem: Binding Blade** | [StanHash/fe6](https://github.com/StanHash/fe6) | WIP |
+| **Sonic Advance 2** | [SAT-R/sa2](https://github.com/SAT-R/sa2) | ~67%, has PC port |
+| **Advance Wars** | [ketsuban/advancewars](https://github.com/ketsuban/advancewars) | Byte-matching |
+| **Advance Wars 2** | [Eebit/aw2bhr](https://github.com/Eebit/aw2bhr) | WIP |
+| **Kirby & The Amazing Mirror** | [jiangzhengwenjz/katam](https://github.com/jiangzhengwenjz/katam) | WIP |
+| **Super Mario Advance 2** | [atasro2/sma2](https://github.com/atasro2/sma2) | WIP |
+
+Track progress at [decomp.dev](https://decomp.dev/projects).
+
+### References
+- **[GBATEK](https://problemkaputt.de/gbatek.htm)** -- Martin Korth's legendary GBA technical reference
+- **[pret](https://pret.github.io/)** -- The decompilation community hub
+- **[decomp.me](https://decomp.me/)** -- Collaborative decompilation platform
+- **[RetroReversing GBA](https://www.retroreversing.com/gba/)** -- GBA reverse engineering resources
+- **[agbcc](https://github.com/pret/agbcc)** -- Reconstructed GBA C compiler for matching decomps
 
 ## Want to Recomp Your Favorite GBA Game?
 
-That's the dream. Once `gbarecomp` is mature enough, the workflow will be:
+That's the dream. The GBA library has over 1,500 games. Any of them could be recompiled:
 
 ```bash
-# Analyze the ROM
-gbarecomp analyze my_game.gba
-
-# Generate C source
-gbarecomp translate my_game.gba -o my_game_src/
-
-# Build it
-cd my_game_src/
-cmake -B build
-cmake --build build
-
-# Play it
-./build/my_game
+gbarecomp translate my_game.gba -o my_game_src/ --multi
+cd my_game_src/ && cmake -B build && cmake --build build
+./build/my_game my_game.gba
 ```
 
-We want to make this accessible enough that anyone with a GBA ROM and a C compiler can produce a native build. If you've got a favorite GBA game you want to see recompiled, come help us build the tools to make it happen.
+Games with existing decompilations would be the easiest targets since their code is already well-understood. But gbarecomp is designed to work with any ROM -- no prior reverse engineering needed.
 
 ## Contributing
 
@@ -171,6 +147,7 @@ We need people who are excited about:
 - **Compiler internals** -- Code generation, optimization, correctness
 - **GBA internals** -- Hardware timing, PPU modes, audio mixing, DMA edge cases
 - **Testing** -- ROM analysis, regression testing, compatibility tracking
+- **Other games** -- Pick your favorite GBA game and try recompiling it!
 
 Open an issue, submit a PR, or just come hang out. Every GBA game that gets recompiled is a win for preservation.
 
@@ -181,3 +158,5 @@ Open an issue, submit a PR, or just come hang out. Every GBA game that gets reco
 ---
 
 *"The GBA library is too good to be locked behind aging hardware. Let's set it free."*
+
+*Built with Claude Code in 48 hours. From zero to rendering in 28 commits.*
