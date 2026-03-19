@@ -127,13 +127,17 @@ static void advance_hardware(int cycles) {
 
         /* Debug: periodic status */
         if (frame_count <= 5 || frame_count % 60 == 0) {
-            u16 dispcnt = gba->memory.io[0]; /* DISPCNT at IO offset 0 */
-            fprintf(stderr, "[frame %u] DISPCNT=0x%04X bus_accesses=%u\n",
-                    frame_count, dispcnt, bus_access_count);
+            u16 dispcnt = gba->memory.io[0];
+            /* Check if videoBuf has any non-black pixels */
+            int nonblack = 0;
+            for (int i = 0; i < 240 * 160 && nonblack < 10; i++) {
+                if (videoBuf[i] != 0 && videoBuf[i] != 0xFF000000) nonblack++;
+            }
+            fprintf(stderr, "[frame %u] DISPCNT=0x%04X bus=%u vidpix=%d sample=0x%08X,0x%08X,0x%08X\n",
+                    frame_count, dispcnt, bus_access_count, nonblack,
+                    videoBuf[0], videoBuf[120*240+120], videoBuf[80*240+120]);
             fflush(stderr);
         }
-        static u32 prev_bus = 0;
-        if (frame_count == 2) prev_bus = bus_access_count;
 
         display_render_frame();
     }
@@ -146,13 +150,12 @@ static void advance_hardware(int cycles) {
             exit(0);
         }
 
-        /* Force-render a frame by ticking mGBA's timing system.
-         * This ensures frames are produced even if the game is stuck. */
+        /* Advance mGBA timing for one frame and render */
         {
+            /* Tick hardware enough for one frame */
             u32 start_fc = gba->video.frameCounter;
             int ticks = 0;
             while (gba->video.frameCounter == start_fc && ticks < 300000) {
-                /* Tick mGBA's timing by 4 cycles at a time */
                 arm_cpu->cycles += 4;
                 while (arm_cpu->cycles >= arm_cpu->nextEvent) {
                     gba->cpu->irqh.processEvents(arm_cpu);
@@ -365,7 +368,12 @@ int display_init(void) {
 void display_render_frame(void) {
     if (!texture) return;
 
-    /* mGBA has rendered into videoBuf - just upload to SDL */
+    /* Force alpha to 0xFF on all pixels (mGBA outputs with alpha=0) */
+    for (int i = 0; i < GBA_WIDTH * GBA_HEIGHT; i++) {
+        videoBuf[i] |= 0xFF000000;
+    }
+
+    /* mGBA has rendered into videoBuf - upload to SDL */
     SDL_UpdateTexture(texture, NULL, videoBuf, GBA_WIDTH * sizeof(color_t));
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, NULL, NULL);
@@ -470,6 +478,12 @@ void cpu_undefined(u32 insn) {
 /* ---- Init / Shutdown ---- */
 
 void gba_init(const char* rom_path) {
+    /* Initialize SDL display first so we can show init progress */
+    if (display_init() != 0) {
+        fprintf(stderr, "[runtime] Display init failed\n");
+        exit(1);
+    }
+
     fprintf(stderr, "[init] Starting mGBA init...\n"); fflush(stderr);
 
     /* Initialize mGBA logging with a real callback */
@@ -580,17 +594,24 @@ void gba_init(const char* rom_path) {
     CPU_C = arm_cpu->cpsr.c;
     CPU_V = arm_cpu->cpsr.v;
 
+    /* Render the init frame immediately */
+    {
+        int nonblack = 0;
+        for (int i = 0; i < 240*160; i++) {
+            if (videoBuf[i] != 0) nonblack++;
+        }
+        fprintf(stderr, "[init] videoBuf has %d non-zero pixels after init\n", nonblack);
+        fflush(stderr);
+    }
+
     printf("[runtime] mGBA init complete, handing off to recompiled code\n");
     printf("[runtime] SP=0x%08X PC=0x%08X DISPCNT=0x%04X\n",
            r[13], r[15], gba->memory.io[0]);
     fflush(stdout);
 
-    /* Initialize SDL display */
-    if (display_init() != 0) {
-        fprintf(stderr, "[runtime] Display init failed\n");
-        exit(1);
-    }
-    printf("[runtime] Display ready (SDL2 + mGBA renderer)\n");
+    /* Render the init frame immediately - this shows the title screen! */
+    display_render_frame();
+    printf("[runtime] Title screen rendered!\n");
     fflush(stdout);
 }
 
