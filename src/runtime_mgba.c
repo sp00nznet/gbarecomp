@@ -52,6 +52,8 @@ static struct ARMCore* arm_cpu = NULL;
 #define GBA_WIDTH  240
 #define GBA_HEIGHT 160
 static color_t videoBuf[GBA_WIDTH * GBA_HEIGHT];
+static color_t savedFrame[GBA_WIDTH * GBA_HEIGHT]; /* Saved init frame */
+static bool has_saved_frame = false;
 
 /* ---- SDL Display ---- */
 
@@ -368,13 +370,26 @@ int display_init(void) {
 void display_render_frame(void) {
     if (!texture) return;
 
-    /* Force alpha to 0xFF on all pixels (mGBA outputs with alpha=0) */
-    for (int i = 0; i < GBA_WIDTH * GBA_HEIGHT; i++) {
-        videoBuf[i] |= 0xFF000000;
+    /* Use saved frame if current videoBuf is empty/black */
+    color_t* src = videoBuf;
+    if (has_saved_frame) {
+        int nonblack = 0;
+        for (int i = 0; i < 100 && nonblack == 0; i++) {
+            if (videoBuf[i * 384] != 0) nonblack++; /* sample sparse pixels */
+        }
+        if (nonblack == 0) {
+            src = savedFrame; /* videoBuf is empty, use saved frame */
+        }
     }
 
-    /* mGBA has rendered into videoBuf - upload to SDL */
-    SDL_UpdateTexture(texture, NULL, videoBuf, GBA_WIDTH * sizeof(color_t));
+    /* Force alpha to 0xFF on all pixels (mGBA outputs with alpha=0) */
+    static color_t renderBuf[GBA_WIDTH * GBA_HEIGHT];
+    for (int i = 0; i < GBA_WIDTH * GBA_HEIGHT; i++) {
+        renderBuf[i] = src[i] | 0xFF000000;
+    }
+
+    /* Upload to SDL */
+    SDL_UpdateTexture(texture, NULL, renderBuf, GBA_WIDTH * sizeof(color_t));
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, NULL, NULL);
     SDL_RenderPresent(renderer);
@@ -609,7 +624,9 @@ void gba_init(const char* rom_path) {
            r[13], r[15], gba->memory.io[0]);
     fflush(stdout);
 
-    /* Render the init frame immediately - this shows the title screen! */
+    /* Save the init frame and render it - this is the title screen! */
+    memcpy(savedFrame, videoBuf, sizeof(savedFrame));
+    has_saved_frame = true;
     display_render_frame();
     printf("[runtime] Title screen rendered!\n");
     fflush(stdout);
