@@ -219,31 +219,11 @@ u16 bus_read16(u32 addr) {
     advance_hardware(2);
     u16 val = (u16)core->busRead16(core, addr);
 
-    /* DISPSTAT fast-forward: when recompiled code polls for VBlank in
-     * a tight loop, skip ahead to the next VBlank instead of spinning */
+    /* When recompiled code polls DISPSTAT, advance extra cycles per read
+     * to speed things up without skipping scanline rendering. */
     if (recomp_mode && addr == 0x04000004) {
-        if (!(val & 1)) { /* VBlank bit not set */
-            dispstat_poll_count++;
-            if (dispstat_poll_count > 4) {
-                /* Fast-forward to next VBlank */
-                u32 start_fc = gba->video.frameCounter;
-                while (gba->video.frameCounter == start_fc) {
-                    arm_cpu->cycles += 64;
-                    while (arm_cpu->cycles >= arm_cpu->nextEvent) {
-                        gba->cpu->irqh.processEvents(arm_cpu);
-                    }
-                }
-                val = (u16)core->busRead16(core, addr);
-                dispstat_poll_count = 0;
-
-                /* Render frame + poll events */
-                frame_count++;
-                display_render_frame();
-                if (display_poll_events()) { gba_shutdown(); exit(0); }
-            }
-        } else {
-            dispstat_poll_count = 0;
-        }
+        /* Advance 16 extra cycles per DISPSTAT read to speed up polling */
+        advance_hardware(16);
     }
 
     return val;
