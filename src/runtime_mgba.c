@@ -370,10 +370,14 @@ int display_init(void) {
 void display_render_frame(void) {
     if (!texture) return;
 
-    /* Force alpha to 0xFF on all pixels (mGBA outputs with alpha=0x28) */
+    /* Fix color channels: mGBA outputs 0xXXBBGGRR, SDL wants 0xFFRRGGBB */
     static color_t renderBuf[GBA_WIDTH * GBA_HEIGHT];
     for (int i = 0; i < GBA_WIDTH * GBA_HEIGHT; i++) {
-        renderBuf[i] = (videoBuf[i] & 0x00FFFFFF) | 0xFF000000;
+        u32 p = videoBuf[i];
+        u32 r = (p >> 0) & 0xFF;
+        u32 g = (p >> 8) & 0xFF;
+        u32 b = (p >> 16) & 0xFF;
+        renderBuf[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
     }
 
     /* Upload to SDL */
