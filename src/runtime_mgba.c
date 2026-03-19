@@ -609,6 +609,9 @@ static void deliver_vblank_irq(void) {
     core->busWrite16(core, 0x04000202,
         core->busRead16(core, 0x04000202) & ~1);
 
+    /* Re-enable IME (BIOS normally restores this on IRQ return) */
+    core->busWrite16(core, 0x04000208, 1);
+
     in_irq = false;
 }
 
