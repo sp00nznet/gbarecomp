@@ -586,10 +586,20 @@ void gba_init(const char* rom_path) {
                 fflush(stderr);
             }
 
-            /* Stop when forced blank is cleared (game finished init) */
-            if (dispcnt != 0x0080 && dispcnt != 0x0000 && init_frames > 2) {
-                fprintf(stderr, "[init] Display active at frame %d! DISPCNT=0x%04X\n",
-                        init_frames, dispcnt);
+            /* Check if video buffer has real graphics (multiple colors) */
+            int unique = 0;
+            color_t seen[8] = {0};
+            for (int i = 0; i < 240*160 && unique < 8; i++) {
+                color_t p = videoBuf[i];
+                bool found2 = false;
+                for (int j = 0; j < unique; j++) if (seen[j] == p) { found2 = true; break; }
+                if (!found2) seen[unique++] = p;
+            }
+
+            /* Stop when we see real varied graphics (not just solid backdrop) */
+            if (unique >= 6 && init_frames > 10) {
+                fprintf(stderr, "[init] Real graphics at frame %d! DISPCNT=0x%04X, %d colors\n",
+                        init_frames, dispcnt, unique);
                 fflush(stderr);
                 break;
             }
@@ -624,9 +634,27 @@ void gba_init(const char* rom_path) {
            r[13], r[15], gba->memory.io[0]);
     fflush(stdout);
 
-    /* Save the init frame and render it - this is the title screen! */
+    /* Save the init frame and render it */
     memcpy(savedFrame, videoBuf, sizeof(savedFrame));
     has_saved_frame = true;
+
+    /* Debug: dump pixel variety */
+    {
+        u32 unique[16] = {0};
+        int nunique = 0;
+        for (int i = 0; i < 240*160 && nunique < 16; i++) {
+            u32 p = videoBuf[i];
+            bool found = false;
+            for (int j = 0; j < nunique; j++) {
+                if (unique[j] == p) { found = true; break; }
+            }
+            if (!found) unique[nunique++] = p;
+        }
+        fprintf(stderr, "[init] %d unique colors: ", nunique);
+        for (int i = 0; i < nunique; i++) fprintf(stderr, "0x%08X ", unique[i]);
+        fprintf(stderr, "\n"); fflush(stderr);
+    }
+
     display_render_frame();
     printf("[runtime] Title screen rendered!\n");
     fflush(stdout);
