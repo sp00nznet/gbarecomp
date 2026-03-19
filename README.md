@@ -17,9 +17,9 @@
 
 The first successfully statically recompiled GBA game -- **Advance Wars** -- running natively on Windows x64:
 
-![Advance Wars Recompiled - Andy Character Intro](https://raw.githubusercontent.com/sp00nznet/advancewars/master/andy.png)
+![Advance Wars Recompiled - Title Screen](https://raw.githubusercontent.com/sp00nznet/advancewars/master/title2.png)
 
-*Advance Wars CO introduction sequence -- Andy with full character art, blue energy background, and scrolling name text. The game plays through the entire intro: logo animation, world map fade-in, and CO character cycling. All rendered pixel-perfect by mGBA's PPU, with ARM7TDMI machine code statically recompiled to native x64.*
+*Advance Wars title screen running natively on Windows x64. Full intro sequence plays, menus are navigable, and training missions are playable. Pixel-perfect rendering by mGBA's PPU with correct colors, 60fps, keyboard input.*
 
 ## The Pitch
 
