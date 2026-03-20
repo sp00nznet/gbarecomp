@@ -1470,6 +1470,25 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    if (++_bxmiss <= 20) fprintf(stderr, \"[bx] No function for 0x%%08X\\n\", target);\n");
         fprintf(f, "}\n\n");
 
+        /* Interception setup - populates the function table for interception.c */
+        fprintf(f, "\n/* Set up function interception table from BX dispatch entries */\n");
+        fprintf(f, "typedef struct { unsigned int addr; void (*func)(void); } FuncEntry;\n");
+        fprintf(f, "extern void interception_init(FuncEntry* table, int size);\n\n");
+        fprintf(f, "void interception_setup_from_bx_table(void) {\n");
+        fprintf(f, "    /* Reuse the BX table for interception - only ROM functions */\n");
+        fprintf(f, "    static FuncEntry intercept_table[] = {\n");
+        for (int i = 0; i < analysis->num_functions; i++) {
+            u32 entry = analysis->functions[i].entry;
+            /* Only intercept ROM functions (not IWRAM) */
+            if ((entry >> 24) == 0x08) {
+                fprintf(f, "        { 0x%08Xu, func_%08X },\n", entry, entry);
+            }
+        }
+        fprintf(f, "    };\n");
+        fprintf(f, "    interception_init(intercept_table, %d);\n",
+                analysis->num_functions); /* approximate - some are IWRAM */
+        fprintf(f, "}\n\n");
+
         /* Add main() - after mGBA init, call the main game function directly */
         fprintf(f, "int main(int argc, char* argv[]) {\n");
         fprintf(f, "    const char* rom_path = argc > 1 ? argv[1] : \"game.gba\";\n");
@@ -1531,6 +1550,7 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    runtime.c\n");
         fprintf(f, "    display.c\n");
         fprintf(f, "    menu.cpp\n");
+        fprintf(f, "    interception.c\n");
         {
             int stubs_per_file = 200;
             int nsf = (num_stubs + stubs_per_file - 1) / stubs_per_file;

@@ -22,6 +22,7 @@
 
 #include <SDL2/SDL.h>
 #include "gba/menu.h"
+#include "gba/interception.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -709,6 +710,12 @@ static void cb_set_scale(int scale) {
     fprintf(stderr, "[gfx] Scale set to %dx\n", scale);
 }
 
+/* ---- mGBA Accessors (for interception.c) ---- */
+
+struct mCore* get_mgba_core(void) { return core; }
+struct GBA* get_mgba_gba(void) { return gba; }
+struct ARMCore* get_mgba_arm(void) { return arm_cpu; }
+
 /* ---- Init / Shutdown ---- */
 
 void gba_init(const char* rom_path) {
@@ -820,8 +827,8 @@ void gba_init(const char* rom_path) {
     {
         int init_frames = 0;
         uint16_t prev_dispcnt = 0x0080;
-        while (1) { /* Run mGBA's CPU for the game */
-            core->runFrame(core);
+        while (1) { /* Run mGBA's CPU for the game, with function interception */
+            interception_run_frame(core);
             init_frames++;
 
             uint16_t dispcnt = gba->memory.io[0];
@@ -899,9 +906,13 @@ void gba_init(const char* rom_path) {
     /* Render the last init frame */
     display_render_frame();
 
+    /* Initialize function interception */
+    extern void interception_setup_from_bx_table(void);
+    interception_setup_from_bx_table();
+
     /* Enable recompiled code mode */
     recomp_mode = true;
-    printf("[runtime] Init complete - switching to recompiled code\n");
+    printf("[runtime] Init complete - function interception active\n");
     printf("[runtime] SP=0x%08X PC=0x%08X DISPCNT=0x%04X\n",
            r[13], r[15], gba->memory.io[0]);
     fflush(stdout);
