@@ -21,6 +21,9 @@
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/arm/arm.h>
 
+/* From arm.c - injects instruction into pipeline */
+extern void ARMRunFake(struct ARMCore* cpu, uint32_t opcode);
+
 #include <stdio.h>
 #include <string.h>
 
@@ -153,12 +156,29 @@ void interception_handle_swi(struct ARMCore* cpu, int immediate) {
         /* Sync back */
         sync_to_mgba(cpu);
 
-        /* Set execution mode from return PC */
+        /* Fix PC and flush pipeline after interception.
+         * The recompiled function set r[15] to return address.
+         * We must flush mGBA's instruction prefetch to refetch from new PC. */
         u32 ret_pc = cpu->gprs[15];
-        if (ret_pc & 1) {
+        bool ret_thumb = (ret_pc & 1) || cpu->cpsr.t;
+        cpu->gprs[15] = ret_pc & ~1u;
+
+        if (ret_thumb) {
             cpu->cpsr.t = 1;
             cpu->executionMode = MODE_THUMB;
-            cpu->gprs[15] &= ~1u;
+        } else {
+            cpu->cpsr.t = 0;
+            cpu->executionMode = MODE_ARM;
+        }
+
+        /* Use ARMRunFake to inject a pipeline-flushing instruction.
+         * This makes mGBA refetch from the new PC on next step. */
+        if (ret_thumb) {
+            /* Thumb NOP = MOV R8,R8 (0x46C0) */
+            ARMRunFake(cpu, 0x46C0);
+        } else {
+            /* ARM NOP = MOV R0,R0 (0xE1A00000) */
+            ARMRunFake(cpu, 0xE1A00000);
         }
     }
 }
@@ -191,9 +211,10 @@ void interception_init(FuncEntry* table, int size) {
         original_insns = (u16*)malloc(size * sizeof(u16));
         int patched = 0;
 
+        /* For testing: only patch a few small functions to validate the approach */
         for (int i = 0; i < size; i++) {
             u32 addr = table[i].addr;
-            if ((addr >> 24) != 0x08) continue; /* Only patch ROM */
+            if ((addr >> 24) != 0x08) continue;
 
             u32 rom_offset = addr - 0x08000000;
             if (rom_offset + 2 > gba->memory.romSize) continue;
@@ -204,8 +225,11 @@ void interception_init(FuncEntry* table, int size) {
             /* Patch with BKPT 0xFE (Thumb: 0xBEFE) */
             *(u16*)((u8*)gba->memory.rom + rom_offset) = 0xBEFE;
             patched++;
+
+            /* Limit to first 100 functions for testing */
+            if (patched >= 100) break;
         }
-        fprintf(stderr, "[intercept] Patched %d ROM functions with SWI traps\n", patched);
+        fprintf(stderr, "[intercept] Patched %d ROM functions (limited for testing)\n", patched);
         fflush(stderr);
     }
 }
