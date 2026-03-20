@@ -140,8 +140,8 @@ void interception_handle_swi(struct ARMCore* cpu, int immediate) {
     }
 
     if (func) {
-        if (intercept_count < 10) {
-            fprintf(stderr, "[intercept!] PC=0x%08X -> recompiled (#%d)\n",
+        if (intercept_count < 50) {
+            fprintf(stderr, "[intercept!] PC=0x%08X -> native C (#%d)\n",
                     func_addr, intercept_count + 1);
             fflush(stderr);
         }
@@ -257,8 +257,9 @@ void interception_run_frame(struct mCore* core) {
     core->runFrame(core);
 
     static int frame_log = 0;
-    if (++frame_log <= 5 || frame_log % 60 == 0) {
-        fprintf(stderr, "[intercept frame %d] total=%d\n", frame_log, intercept_count);
+    frame_log++;
+    if (frame_log <= 5 || frame_log % 120 == 0) {
+        fprintf(stderr, "[intercept] frame %d: %d total interceptions\n", frame_log, intercept_count);
         fflush(stderr);
     }
 }
