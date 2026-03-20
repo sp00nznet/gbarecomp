@@ -822,13 +822,21 @@ void gba_init(const char* rom_path) {
      * The game copies init code to IWRAM and executes it there,
      * using BIOS decompression routines (LZ77, RLE) to unpack
      * graphics into VRAM. This can't be done by recompiled code. */
-    printf("[runtime] Running init with mGBA CPU...\n");
+    printf("[runtime] Running game...\n");
     fflush(stdout);
     {
         int init_frames = 0;
         uint16_t prev_dispcnt = 0x0080;
-        while (1) { /* Run mGBA's CPU for the game, with function interception */
-            interception_run_frame(core);
+        bool interception_active = false;
+
+        while (1) {
+            /* Use normal runFrame during init, interception after */
+            if (interception_active) {
+                interception_run_frame(core);
+            } else {
+                core->runFrame(core);
+            }
+
             init_frames++;
 
             uint16_t dispcnt = gba->memory.io[0];
@@ -868,10 +876,15 @@ void gba_init(const char* rom_path) {
                 }
             }
 
-            /* mGBA CPU runs the game indefinitely.
-             * The recompiled C code is compiled and linked but the main loop
-             * requires IWRAM task dispatcher + VBlank polling that needs the
-             * real ARM CPU. Individual ROM functions can be intercepted in future. */
+            /* Activate interception after init completes */
+            if (!interception_active && unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
+                extern void interception_setup_from_bx_table(void);
+                interception_setup_from_bx_table();
+                interception_active = true;
+                recomp_mode = true;
+                fprintf(stderr, "[runtime] Function interception activated at frame %d\n", init_frames);
+                fflush(stderr);
+            }
             prev_dispcnt = dispcnt;
         }
         fprintf(stderr, "[init] mGBA CPU ran %d frames\n", init_frames);

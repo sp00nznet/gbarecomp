@@ -24,6 +24,10 @@
 #include <stdio.h>
 #include <string.h>
 
+/* ---- Forward declarations ---- */
+static void hooked_swi16(struct ARMCore* cpu, int immediate);
+void interception_handle_swi(struct ARMCore* cpu, int immediate);
+
 /* ---- Function Table ---- */
 
 typedef void (*RecompFunc)(void);
@@ -86,13 +90,108 @@ static RecompFunc lookup_function(u32 addr) {
 
 /* ---- Public API ---- */
 
+/* ---- SWI Hook ---- */
+
+static void (*original_swi16)(struct ARMCore*, int) = NULL;
+
+static void hooked_swi16(struct ARMCore* cpu, int immediate) {
+    if (immediate == 0xFE && interception_enabled) {
+        interception_handle_swi(cpu, immediate);
+        return;
+    }
+    /* Chain to original handler for real SWIs */
+    if (original_swi16) {
+        original_swi16(cpu, immediate);
+    }
+}
+
+/* ---- ROM Patching ---- */
+
+/* We patch the first Thumb instruction of each function with SWI 0xFE (0xDFFE).
+ * When mGBA's CPU hits this SWI, our handler looks up the function by (PC-2)
+ * and calls the recompiled C version. The original instruction is saved. */
+
+static u16* original_insns = NULL; /* Saved original first instructions */
+static struct mCore* s_core = NULL;
+
+/* SWI hook - called by mGBA when SWI 0xFE is executed */
+void interception_handle_swi(struct ARMCore* cpu, int immediate) {
+    if (immediate != 0xFE || !interception_enabled) return;
+
+    /* PC points past the SWI. In Thumb: PC = SWI_addr + 4 (pipeline).
+     * The function entry was at PC - 4 (Thumb SWI is 2 bytes, pipeline adds 2). */
+    u32 func_addr = cpu->gprs[15] - 2; /* Approximate */
+
+    RecompFunc func = lookup_function(func_addr);
+    if (!func) {
+        /* Try nearby addresses */
+        func = lookup_function(func_addr - 2);
+        if (!func) func = lookup_function(func_addr - 4);
+    }
+
+    if (func) {
+        /* Sync mGBA -> recompiled */
+        sync_from_mgba(cpu);
+
+        /* Call recompiled function */
+        func();
+        intercept_count++;
+
+        /* Sync back */
+        sync_to_mgba(cpu);
+
+        /* Set execution mode from return PC */
+        u32 ret_pc = cpu->gprs[15];
+        if (ret_pc & 1) {
+            cpu->cpsr.t = 1;
+            cpu->executionMode = MODE_THUMB;
+            cpu->gprs[15] &= ~1u;
+        }
+    }
+}
+
 void interception_init(FuncEntry* table, int size) {
     func_table = table;
     func_table_size = size;
     interception_enabled = true;
     intercept_count = 0;
-    fprintf(stderr, "[intercept] Initialized with %d functions\n", size);
+
+    fprintf(stderr, "[intercept] Initialized with %d ROM functions\n", size);
     fflush(stderr);
+
+    /* Hook mGBA's SWI handler to intercept our custom SWI 0xFE.
+     * Save the original handler and chain to it for real SWIs. */
+    s_core = get_mgba_core();
+    if (s_core) {
+        struct ARMCore* arm = get_mgba_arm();
+        original_swi16 = arm->irqh.swi16;
+        arm->irqh.swi16 = hooked_swi16;
+        fprintf(stderr, "[intercept] SWI handler hooked\n");
+        fflush(stderr);
+
+        /* Patch ROM: replace first instruction of each function with SWI 0xFE.
+         * Thumb SWI 0xFE = opcode 0xDFFE */
+        struct GBA* gba = get_mgba_gba();
+        original_insns = (u16*)malloc(size * sizeof(u16));
+        int patched = 0;
+
+        for (int i = 0; i < size; i++) {
+            u32 addr = table[i].addr;
+            if ((addr >> 24) != 0x08) continue; /* Only patch ROM */
+
+            u32 rom_offset = addr - 0x08000000;
+            if (rom_offset + 2 > gba->memory.romSize) continue;
+
+            /* Save original instruction */
+            original_insns[i] = *(u16*)((u8*)gba->memory.rom + rom_offset);
+
+            /* Patch with SWI 0xFE (Thumb: 0xDFFE) */
+            *(u16*)((u8*)gba->memory.rom + rom_offset) = 0xDFFE;
+            patched++;
+        }
+        fprintf(stderr, "[intercept] Patched %d ROM functions with SWI traps\n", patched);
+        fflush(stderr);
+    }
 }
 
 void interception_shutdown(void) {
@@ -113,48 +212,14 @@ void interception_run_frame(struct mCore* core) {
         return;
     }
 
-    u32 start_frame = gba->video.frameCounter;
+    /* Run a full frame via mGBA's fast interpreter.
+     * Function interception happens via SWI traps patched into ROM. */
+    core->runFrame(core);
 
-    while (gba->video.frameCounter == start_frame) {
-        /* Check PC before stepping */
-        u32 pc = cpu->gprs[15];
-
-        /* Only intercept ROM addresses */
-        if ((pc >> 24) == 0x08) {
-            RecompFunc func = lookup_function(pc);
-            if (func) {
-                /* Sync mGBA -> recompiled */
-                sync_from_mgba(cpu);
-
-                /* Call the recompiled function.
-                 * The function reads/writes memory via mGBA bus.
-                 * POP {PC} does r[15] = bus_read32(r[13]) which sets the return address.
-                 * BX LR does return; which exits the C function. */
-                func();
-                intercept_count++;
-
-                /* Sync recompiled state -> mGBA */
-                sync_to_mgba(cpu);
-
-                /* Set mGBA's execution mode based on return PC (Thumb bit) */
-                u32 return_pc = cpu->gprs[15];
-                if (return_pc & 1) {
-                    cpu->cpsr.t = 1;
-                    cpu->executionMode = MODE_THUMB;
-                    cpu->gprs[15] &= ~1u;
-                } else {
-                    cpu->cpsr.t = 0;
-                    cpu->executionMode = MODE_ARM;
-                }
-
-                /* mGBA needs to refetch the pipeline at the new PC.
-                 * Simplest way: let it step once from the new PC. */
-                continue;
-            }
-        }
-
-        /* Normal mGBA step */
-        core->step(core);
+    static int frame_log = 0;
+    if (++frame_log <= 5 || frame_log % 60 == 0) {
+        fprintf(stderr, "[intercept frame %d] total=%d\n", frame_log, intercept_count);
+        fflush(stderr);
     }
 }
 
