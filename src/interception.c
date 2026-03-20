@@ -93,16 +93,22 @@ static RecompFunc lookup_function(u32 addr) {
 /* ---- SWI Hook ---- */
 
 static void (*original_swi16)(struct ARMCore*, int) = NULL;
+static void (*original_bkpt16)(struct ARMCore*, int) = NULL;
 
 static void hooked_swi16(struct ARMCore* cpu, int immediate) {
     if (immediate == 0xFE && interception_enabled) {
         interception_handle_swi(cpu, immediate);
         return;
     }
-    /* Chain to original handler for real SWIs */
-    if (original_swi16) {
-        original_swi16(cpu, immediate);
+    if (original_swi16) original_swi16(cpu, immediate);
+}
+
+static void hooked_bkpt16(struct ARMCore* cpu, int immediate) {
+    if (immediate == 0xFE && interception_enabled) {
+        interception_handle_swi(cpu, immediate);
+        return;
     }
+    if (original_bkpt16) original_bkpt16(cpu, immediate);
 }
 
 /* ---- ROM Patching ---- */
@@ -118,9 +124,10 @@ static struct mCore* s_core = NULL;
 void interception_handle_swi(struct ARMCore* cpu, int immediate) {
     if (immediate != 0xFE || !interception_enabled) return;
 
-    /* PC points past the SWI. In Thumb: PC = SWI_addr + 4 (pipeline).
-     * The function entry was at PC - 4 (Thumb SWI is 2 bytes, pipeline adds 2). */
-    u32 func_addr = cpu->gprs[15] - 2; /* Approximate */
+    /* PC points past the BKPT. In Thumb: PC = BKPT_addr + 2 (no pipeline advance for BKPT).
+     * Actually mGBA's BKPT handler: PC = instruction_addr + WORD_SIZE_THUMB
+     * The function entry is at the BKPT instruction address. */
+    u32 func_addr = cpu->gprs[15] - 4; /* PC is 2 ahead + Thumb pipeline */
 
     RecompFunc func = lookup_function(func_addr);
     if (!func) {
@@ -130,6 +137,12 @@ void interception_handle_swi(struct ARMCore* cpu, int immediate) {
     }
 
     if (func) {
+        if (intercept_count < 10) {
+            fprintf(stderr, "[intercept!] PC=0x%08X -> recompiled (#%d)\n",
+                    func_addr, intercept_count + 1);
+            fflush(stderr);
+        }
+
         /* Sync mGBA -> recompiled */
         sync_from_mgba(cpu);
 
@@ -166,11 +179,14 @@ void interception_init(FuncEntry* table, int size) {
         struct ARMCore* arm = get_mgba_arm();
         original_swi16 = arm->irqh.swi16;
         arm->irqh.swi16 = hooked_swi16;
-        fprintf(stderr, "[intercept] SWI handler hooked\n");
+        original_bkpt16 = arm->irqh.bkpt16;
+        arm->irqh.bkpt16 = hooked_bkpt16;
+        fprintf(stderr, "[intercept] SWI+BKPT handlers hooked\n");
         fflush(stderr);
 
-        /* Patch ROM: replace first instruction of each function with SWI 0xFE.
-         * Thumb SWI 0xFE = opcode 0xDFFE */
+        /* Patch ROM: replace first instruction of each function with BKPT 0xFE.
+         * Thumb BKPT 0xFE = opcode 0xBEFE
+         * BKPT doesn't change CPU mode (unlike SWI), making it cleaner. */
         struct GBA* gba = get_mgba_gba();
         original_insns = (u16*)malloc(size * sizeof(u16));
         int patched = 0;
@@ -185,8 +201,8 @@ void interception_init(FuncEntry* table, int size) {
             /* Save original instruction */
             original_insns[i] = *(u16*)((u8*)gba->memory.rom + rom_offset);
 
-            /* Patch with SWI 0xFE (Thumb: 0xDFFE) */
-            *(u16*)((u8*)gba->memory.rom + rom_offset) = 0xDFFE;
+            /* Patch with BKPT 0xFE (Thumb: 0xBEFE) */
+            *(u16*)((u8*)gba->memory.rom + rom_offset) = 0xBEFE;
             patched++;
         }
         fprintf(stderr, "[intercept] Patched %d ROM functions with SWI traps\n", patched);
