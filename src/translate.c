@@ -1591,6 +1591,7 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    display.c\n");
         fprintf(f, "    menu.cpp\n");
         fprintf(f, "    interception.c\n");
+        fprintf(f, "    verify.c\n");
         {
             int stubs_per_file = 200;
             int nsf = (num_stubs + stubs_per_file - 1) / stubs_per_file;

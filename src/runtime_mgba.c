@@ -985,18 +985,16 @@ void gba_init(const char* rom_path) {
             }
 
             /* Activate interception after init completes */
-            /* Interception hook available but disabled until function
-             * correctness issues are resolved. The mGBA ARMRunLoop hook
-             * works perfectly (zero timing disruption) but recompiled
-             * functions produce wrong results causing display freezes.
-             *
-             * To enable: uncomment below. Need to fix individual function
-             * translation bugs first.
-             *
-             * extern void interception_setup_from_bx_table(void);
-             * interception_setup_from_bx_table();
-             * interception_active = true;
-             */
+            /* Verification mode: hook fires but mGBA always interprets.
+             * The hook compares recompiled output against mGBA output
+             * to find translator bugs. */
+            if (!interception_active && unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
+                extern void interception_setup_from_bx_table(void);
+                interception_setup_from_bx_table();
+                interception_active = true;
+                fprintf(stderr, "[runtime] Verification mode activated at frame %d\n", init_frames);
+                fflush(stderr);
+            }
             prev_dispcnt = dispcnt;
         }
         fprintf(stderr, "[init] mGBA CPU ran %d frames\n", init_frames);
@@ -1042,6 +1040,9 @@ void gba_init(const char* rom_path) {
 }
 
 void gba_shutdown(void) {
+    extern void verify_print_summary(void);
+    verify_print_summary();
+
     if (audio_device > 0) {
         SDL_CloseAudioDevice(audio_device);
         audio_device = 0;
