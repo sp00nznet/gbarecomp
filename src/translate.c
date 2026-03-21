@@ -101,44 +101,59 @@ static const char* reg_c(u8 reg) {
     return names[reg];
 }
 
+/* Safe shift helpers - avoid C undefined behavior for shift >= 32.
+ * ARM defines: LSL >= 32 = 0, LSR >= 32 = 0, ASR >= 32 = sign-fill.
+ * These are emitted as inline helpers in the runtime header. */
+
 /* Emit operand2 as C expression (written to a buffer) */
 static void operand2_to_c(const ArmInsn* insn, char* buf, size_t size) {
     if (insn->i) {
         snprintf(buf, size, "0x%Xu", insn->imm);
     } else {
         if (insn->shift_reg) {
-            const char* shift_op;
+            /* Register-specified shift amount - can be 0-255 */
             switch (insn->shift_type) {
-                case SHIFT_LSL: shift_op = "<<"; break;
-                case SHIFT_LSR: shift_op = ">>"; break;
-                case SHIFT_ASR: shift_op = ">>"; break; /* needs cast for arithmetic */
-                case SHIFT_ROR: shift_op = "ROR"; break;
-                default: shift_op = "<<"; break;
-            }
-            if (insn->shift_type == SHIFT_ROR) {
-                snprintf(buf, size, "ROR32(%s, %s & 0xFF)",
-                         reg_c(insn->rm), reg_c(insn->rs));
-            } else if (insn->shift_type == SHIFT_ASR) {
-                snprintf(buf, size, "(u32)((s32)%s >> (%s & 0xFF))",
-                         reg_c(insn->rm), reg_c(insn->rs));
-            } else {
-                snprintf(buf, size, "(%s %s (%s & 0xFF))",
-                         reg_c(insn->rm), shift_op, reg_c(insn->rs));
+                case SHIFT_LSL:
+                    snprintf(buf, size, "arm_lsl(%s, %s & 0xFF)",
+                             reg_c(insn->rm), reg_c(insn->rs));
+                    break;
+                case SHIFT_LSR:
+                    snprintf(buf, size, "arm_lsr(%s, %s & 0xFF)",
+                             reg_c(insn->rm), reg_c(insn->rs));
+                    break;
+                case SHIFT_ASR:
+                    snprintf(buf, size, "arm_asr(%s, %s & 0xFF)",
+                             reg_c(insn->rm), reg_c(insn->rs));
+                    break;
+                case SHIFT_ROR:
+                    snprintf(buf, size, "ROR32(%s, %s & 0xFF)",
+                             reg_c(insn->rm), reg_c(insn->rs));
+                    break;
             }
         } else if (insn->shift_amount == 0 && insn->shift_type == SHIFT_LSL) {
+            /* LSL #0 = no shift */
             snprintf(buf, size, "%s", reg_c(insn->rm));
         } else {
+            /* Immediate shift amount */
             switch (insn->shift_type) {
                 case SHIFT_LSL:
                     snprintf(buf, size, "(%s << %u)", reg_c(insn->rm), insn->shift_amount);
                     break;
                 case SHIFT_LSR:
-                    snprintf(buf, size, "(%s >> %u)", reg_c(insn->rm),
-                             insn->shift_amount == 0 ? 32 : insn->shift_amount);
+                    /* LSR #0 encodes as LSR #32 in ARM */
+                    if (insn->shift_amount == 0) {
+                        snprintf(buf, size, "0u"); /* LSR #32 = 0 */
+                    } else {
+                        snprintf(buf, size, "(%s >> %u)", reg_c(insn->rm), insn->shift_amount);
+                    }
                     break;
                 case SHIFT_ASR:
-                    snprintf(buf, size, "(u32)((s32)%s >> %u)", reg_c(insn->rm),
-                             insn->shift_amount == 0 ? 32 : insn->shift_amount);
+                    /* ASR #0 encodes as ASR #32 in ARM */
+                    if (insn->shift_amount == 0) {
+                        snprintf(buf, size, "((s32)%s >> 31)", reg_c(insn->rm)); /* sign fill */
+                    } else {
+                        snprintf(buf, size, "(u32)((s32)%s >> %u)", reg_c(insn->rm), insn->shift_amount);
+                    }
                     break;
                 case SHIFT_ROR:
                     if (insn->shift_amount == 0) {
@@ -263,9 +278,9 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
     case ARM_ADC:
         begin_cond(ctx, insn->cond);
         operand2_to_c(insn, op2, sizeof(op2));
-        emit(ctx, "%s = %s + %s + CPU_C;", reg_c(insn->rd), reg_c(insn->rn), op2);
-        if (insn->s) emit(ctx, "cpu_update_flags_adc(%s, %s, %s);",
-                          reg_c(insn->rd), reg_c(insn->rn), op2);
+        emit(ctx, "cpu_adc(&%s, %s, %s, %s);",
+             reg_c(insn->rd), reg_c(insn->rn), op2,
+             insn->s ? "true" : "false");
         end_cond(ctx, insn->cond);
         break;
 
@@ -284,25 +299,30 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
     case ARM_RSB:
         begin_cond(ctx, insn->cond);
         operand2_to_c(insn, op2, sizeof(op2));
-        emit(ctx, "%s = %s - %s;", reg_c(insn->rd), op2, reg_c(insn->rn));
-        if (insn->s) emit(ctx, "cpu_update_flags_sub(%s, %s, %s);",
-                          reg_c(insn->rd), op2, reg_c(insn->rn));
+        if (insn->s && insn->rd != REG_PC) {
+            emit(ctx, "cpu_sub(&%s, %s, %s, true);",
+                 reg_c(insn->rd), op2, reg_c(insn->rn));
+        } else {
+            emit(ctx, "%s = %s - %s;", reg_c(insn->rd), op2, reg_c(insn->rn));
+        }
         end_cond(ctx, insn->cond);
         break;
 
     case ARM_SBC:
         begin_cond(ctx, insn->cond);
         operand2_to_c(insn, op2, sizeof(op2));
-        emit(ctx, "%s = %s - %s - !CPU_C;", reg_c(insn->rd), reg_c(insn->rn), op2);
-        if (insn->s) emit(ctx, "/* TODO: SBC flags */");
+        emit(ctx, "cpu_sbc(&%s, %s, %s, %s);",
+             reg_c(insn->rd), reg_c(insn->rn), op2,
+             insn->s ? "true" : "false");
         end_cond(ctx, insn->cond);
         break;
 
     case ARM_RSC:
         begin_cond(ctx, insn->cond);
         operand2_to_c(insn, op2, sizeof(op2));
-        emit(ctx, "%s = %s - %s - !CPU_C;", reg_c(insn->rd), op2, reg_c(insn->rn));
-        if (insn->s) emit(ctx, "/* TODO: RSC flags */");
+        emit(ctx, "cpu_sbc(&%s, %s, %s, %s);",
+             reg_c(insn->rd), op2, reg_c(insn->rn),
+             insn->s ? "true" : "false");
         end_cond(ctx, insn->cond);
         break;
 
@@ -681,18 +701,28 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
     case THUMB_MOVE_SHIFTED:
         switch (insn->shift_type) {
             case SHIFT_LSL:
-                emit(ctx, "%s = %s << %u;", reg_c((u8)insn->rd), reg_c((u8)insn->rs), insn->shift_amount);
+                if (insn->shift_amount == 0) {
+                    emit(ctx, "%s = %s;", reg_c((u8)insn->rd), reg_c((u8)insn->rs));
+                } else {
+                    emit(ctx, "%s = %s << %u;", reg_c((u8)insn->rd), reg_c((u8)insn->rs), insn->shift_amount);
+                }
                 break;
             case SHIFT_LSR:
-                emit(ctx, "%s = %s >> %u;", reg_c((u8)insn->rd), reg_c((u8)insn->rs),
-                     insn->shift_amount == 0 ? 32 : (u32)insn->shift_amount);
+                if (insn->shift_amount == 0) {
+                    emit(ctx, "%s = 0;", reg_c((u8)insn->rd)); /* LSR #0 = LSR #32 = 0 */
+                } else {
+                    emit(ctx, "%s = %s >> %u;", reg_c((u8)insn->rd), reg_c((u8)insn->rs), insn->shift_amount);
+                }
                 break;
             case SHIFT_ASR:
-                emit(ctx, "%s = (u32)((s32)%s >> %u);", reg_c((u8)insn->rd), reg_c((u8)insn->rs),
-                     insn->shift_amount == 0 ? 32 : (u32)insn->shift_amount);
+                if (insn->shift_amount == 0) {
+                    emit(ctx, "%s = (u32)((s32)%s >> 31);", reg_c((u8)insn->rd), reg_c((u8)insn->rs)); /* ASR #32 = sign fill */
+                } else {
+                    emit(ctx, "%s = (u32)((s32)%s >> %u);", reg_c((u8)insn->rd), reg_c((u8)insn->rs), insn->shift_amount);
+                }
                 break;
             default:
-                emit(ctx, "%s = %s; /* unexpected shift */", reg_c((u8)insn->rd), reg_c((u8)insn->rs));
+                emit(ctx, "%s = %s;", reg_c((u8)insn->rd), reg_c((u8)insn->rs));
                 break;
         }
         emit(ctx, "cpu_update_nz(%s);", reg_c((u8)insn->rd));
@@ -771,15 +801,17 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
                      reg_c((u8)insn->rd), reg_c((u8)insn->rs));
                 break;
             case THUMB_ALU_LSL:
-                emit(ctx, "%s <<= (%s & 0xFF); cpu_update_nz(%s);",
-                     reg_c((u8)insn->rd), reg_c((u8)insn->rs), reg_c((u8)insn->rd));
+                emit(ctx, "%s = arm_lsl(%s, %s & 0xFF); cpu_update_nz(%s);",
+                     reg_c((u8)insn->rd), reg_c((u8)insn->rd),
+                     reg_c((u8)insn->rs), reg_c((u8)insn->rd));
                 break;
             case THUMB_ALU_LSR:
-                emit(ctx, "%s >>= (%s & 0xFF); cpu_update_nz(%s);",
-                     reg_c((u8)insn->rd), reg_c((u8)insn->rs), reg_c((u8)insn->rd));
+                emit(ctx, "%s = arm_lsr(%s, %s & 0xFF); cpu_update_nz(%s);",
+                     reg_c((u8)insn->rd), reg_c((u8)insn->rd),
+                     reg_c((u8)insn->rs), reg_c((u8)insn->rd));
                 break;
             case THUMB_ALU_ASR:
-                emit(ctx, "%s = (u32)((s32)%s >> (%s & 0xFF)); cpu_update_nz(%s);",
+                emit(ctx, "%s = arm_asr(%s, %s & 0xFF); cpu_update_nz(%s);",
                      reg_c((u8)insn->rd), reg_c((u8)insn->rd),
                      reg_c((u8)insn->rs), reg_c((u8)insn->rd));
                 break;
@@ -789,11 +821,11 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
                      reg_c((u8)insn->rs), reg_c((u8)insn->rd));
                 break;
             case THUMB_ALU_ADC:
-                emit(ctx, "%s = %s + %s + CPU_C; /* TODO: ADC flags */",
+                emit(ctx, "cpu_adc(&%s, %s, %s, true);",
                      reg_c((u8)insn->rd), reg_c((u8)insn->rd), reg_c((u8)insn->rs));
                 break;
             case THUMB_ALU_SBC:
-                emit(ctx, "%s = %s - %s - !CPU_C; /* TODO: SBC flags */",
+                emit(ctx, "cpu_sbc(&%s, %s, %s, true);",
                      reg_c((u8)insn->rd), reg_c((u8)insn->rd), reg_c((u8)insn->rs));
                 break;
             case THUMB_ALU_MUL:

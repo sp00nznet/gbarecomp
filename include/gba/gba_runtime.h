@@ -46,6 +46,26 @@ static inline u32 RRX(u32 val) {
     return (CPU_C ? 0x80000000u : 0) | (val >> 1);
 }
 
+/* Safe shift operations matching ARM7TDMI behavior.
+ * C has undefined behavior for shift >= 32; ARM defines precise results. */
+static inline u32 arm_lsl(u32 val, u32 amount) {
+    if (amount == 0) return val;
+    if (amount >= 32) return 0;
+    return val << amount;
+}
+
+static inline u32 arm_lsr(u32 val, u32 amount) {
+    if (amount == 0) return val;
+    if (amount >= 32) return 0;
+    return val >> amount;
+}
+
+static inline u32 arm_asr(u32 val, u32 amount) {
+    if (amount == 0) return val;
+    if (amount >= 32) return ((s32)val < 0) ? 0xFFFFFFFF : 0;
+    return (u32)((s32)val >> amount);
+}
+
 /* ---- Flag updates ---- */
 
 static inline void cpu_update_nz(u32 result) {
@@ -78,18 +98,34 @@ static inline void cpu_sub(u32* dest, u32 a, u32 b, bool set_flags) {
     }
 }
 
-static inline void cpu_update_flags_adc(u32 result, u32 a, u32 b) {
-    CPU_N = (result >> 31) != 0;
-    CPU_Z = (result == 0);
-    /* Simplified - full ADC flag calc needs carry input */
+/* ADC with full flag computation */
+static inline void cpu_adc(u32* dest, u32 a, u32 b, bool set_flags) {
+    u32 carry = CPU_C ? 1 : 0;
+    u64 result64 = (u64)a + (u64)b + (u64)carry;
+    u32 result = (u32)result64;
+    if (dest) *dest = result;
+    if (set_flags) {
+        CPU_N = (result >> 31) != 0;
+        CPU_Z = (result == 0);
+        CPU_C = (result64 >> 32) != 0;
+        CPU_V = ((~(a ^ b) & (a ^ result)) >> 31) != 0;
+    }
 }
 
-static inline void cpu_update_flags_sub(u32 result, u32 a, u32 b) {
-    CPU_N = (result >> 31) != 0;
-    CPU_Z = (result == 0);
-    CPU_C = (a >= b);
-    CPU_V = (((a ^ b) & (a ^ result)) >> 31) != 0;
+/* SBC: a - b - !carry */
+static inline void cpu_sbc(u32* dest, u32 a, u32 b, bool set_flags) {
+    u32 borrow = CPU_C ? 0 : 1;
+    u32 result = a - b - borrow;
+    if (dest) *dest = result;
+    if (set_flags) {
+        CPU_N = (result >> 31) != 0;
+        CPU_Z = (result == 0);
+        CPU_C = (u64)a >= (u64)b + (u64)borrow;
+        CPU_V = (((a ^ b) & (a ^ result)) >> 31) != 0;
+    }
 }
+
+/* cpu_update_flags_sub removed - use cpu_sub instead */
 
 /* ---- CPSR/SPSR ---- */
 
