@@ -85,6 +85,15 @@ static bool recomp_hook(struct ARMCore* cpu) {
     if (!interception_enabled) return false;
 
     u32 pc = cpu->gprs[15];
+
+    /* Skip functions known to cause display freeze when intercepted.
+     * These produce subtly wrong results that stall the fade animation.
+     * TODO: debug individual function correctness. */
+    u32 pc_clean = pc & ~1u;
+    if (pc_clean == 0x080796C4 || pc_clean == 0x080796C0 ||
+        pc_clean == 0x080775C2 || pc_clean == 0x080775B0 ||
+        pc_clean == 0x08016F24 || pc_clean == 0x080796BC) return false;
+
     RecompFunc func = lookup_function(pc);
     if (!func) return false;
 
