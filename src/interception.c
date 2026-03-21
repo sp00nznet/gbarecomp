@@ -151,23 +151,17 @@ void interception_handle_swi(struct ARMCore* cpu, int immediate) {
         /* Sync mGBA -> recompiled register file */
         sync_from_mgba(cpu);
 
-        /* Disable interrupt delivery during interception to prevent recursion */
+        /* Disable interrupt delivery during interception */
         extern bool in_irq;
         bool saved_in_irq = in_irq;
         in_irq = true;
 
+        /* Save mGBA state for crash recovery */
+        u32 saved_gprs[16];
+        memcpy(saved_gprs, cpu->gprs, sizeof(saved_gprs));
+
         /* Call the recompiled C function */
-        if (intercept_count <= 5) {
-            fprintf(stderr, "[before] r0=0x%08X r1=0x%08X r2=0x%08X r13=0x%08X\n",
-                    r[0], r[1], r[2], r[13]);
-            fflush(stderr);
-        }
         func();
-        if (intercept_count <= 5) {
-            fprintf(stderr, "[after] r0=0x%08X r1=0x%08X r15=0x%08X\n",
-                    r[0], r[1], r[15]);
-            fflush(stderr);
-        }
 
         in_irq = saved_in_irq;
 
@@ -248,36 +242,34 @@ void interception_init(FuncEntry* table, int size) {
             u16 first_insn = *(u16*)((u8*)gba->memory.rom + rom_offset);
             original_insns[i] = first_insn;
 
-            /* Skip BX trampoline functions (single BX Rn instruction) */
-            bool is_bx = (first_insn & 0xFF87) == 0x4700; /* BX Rn */
+            /* Skip BX trampoline functions (BX Rn as first instruction) */
+            bool is_bx = (first_insn & 0xFF87) == 0x4700;
             if (is_bx) continue;
 
-            /* Skip ARM functions (we only handle Thumb interception) */
+            /* Skip ARM functions */
             if (addr < 0x080000C4) continue;
 
-            /* Only intercept functions that DON'T call other functions (true leaves).
-             * Scan the function body: if we find a BL instruction, skip it.
-             * This ensures no nested C-to-C calls from intercepted functions. */
+            /* Only intercept safe leaf functions:
+             * - No PUSH {LR} (don't manipulate stack for LR)
+             * - Must have BX LR within 20 bytes (simple return)
+             * - No BL calls (no nested function calls)
+             * - No SWI calls (avoid gba_swi complications during interception) */
             {
-                bool has_bl = false;
-                for (u32 off = rom_offset + 2; off < rom_offset + 200 && off + 4 <= gba->memory.romSize; off += 2) {
-                    u16 insn1 = *(u16*)((u8*)gba->memory.rom + off);
-                    if ((insn1 & 0xF800) == 0xF000) { /* BL prefix */
-                        u16 insn2 = *(u16*)((u8*)gba->memory.rom + off + 2);
-                        if ((insn2 & 0xF800) == 0xF800 || (insn2 & 0xF800) == 0xE800) {
-                            has_bl = true;
-                            break;
-                        }
-                    }
-                    /* Stop scanning at function end */
-                    if (insn1 == 0x4770) break; /* BX LR */
-                    if ((insn1 & 0xFF00) == 0xBD00) break; /* POP {PC} */
-                    if ((insn1 & 0xFF00) == 0xBC00) {
-                        u16 next = *(u16*)((u8*)gba->memory.rom + off + 2);
-                        if ((next & 0xFF87) == 0x4700) break; /* POP; BX */
-                    }
+                bool safe = false;
+                bool is_push = (first_insn & 0xFF00) == 0xB500;
+                if (is_push) continue; /* Skip PUSH functions */
+
+                /* Scan for BX LR and check for BL/SWI */
+                bool has_bx_lr = false;
+                bool has_bl_or_swi = false;
+                for (u32 off = rom_offset; off < rom_offset + 20 && off + 2 <= gba->memory.romSize; off += 2) {
+                    u16 insn = *(u16*)((u8*)gba->memory.rom + off);
+                    if (insn == 0x4770) { has_bx_lr = true; break; }
+                    if ((insn & 0xF800) == 0xF000) has_bl_or_swi = true; /* BL */
+                    if ((insn & 0xFF00) == 0xDF00) has_bl_or_swi = true; /* SWI */
                 }
-                if (has_bl) continue; /* Skip non-leaf functions */
+                safe = has_bx_lr && !has_bl_or_swi;
+                if (!safe) continue;
             }
 
             /* Patch with BKPT 0xFE (Thumb: 0xBEFE) */
