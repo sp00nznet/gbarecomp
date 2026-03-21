@@ -985,15 +985,18 @@ void gba_init(const char* rom_path) {
             }
 
             /* Activate interception after init completes */
-            /* Enable interception via mGBA run loop hook (no ROM patching!) */
-            if (!interception_active && unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
-                extern void interception_setup_from_bx_table(void);
-                interception_setup_from_bx_table();
-                interception_active = true;
-                recomp_mode = true;
-                fprintf(stderr, "[runtime] Recomp hook activated at frame %d\n", init_frames);
-                fflush(stderr);
-            }
+            /* Interception hook available but disabled until function
+             * correctness issues are resolved. The mGBA ARMRunLoop hook
+             * works perfectly (zero timing disruption) but recompiled
+             * functions produce wrong results causing display freezes.
+             *
+             * To enable: uncomment below. Need to fix individual function
+             * translation bugs first.
+             *
+             * extern void interception_setup_from_bx_table(void);
+             * interception_setup_from_bx_table();
+             * interception_active = true;
+             */
             prev_dispcnt = dispcnt;
         }
         fprintf(stderr, "[init] mGBA CPU ran %d frames\n", init_frames);
