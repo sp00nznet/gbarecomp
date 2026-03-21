@@ -248,27 +248,37 @@ void interception_init(FuncEntry* table, int size) {
             u16 first_insn = *(u16*)((u8*)gba->memory.rom + rom_offset);
             original_insns[i] = first_insn;
 
-            /* Only intercept LEAF functions that DON'T use PUSH {LR}.
-             * These return via BX LR (= return; in C) and don't touch the stack.
-             * Functions with PUSH {LR} use POP {PC} or POP/BX to return,
-             * which requires careful stack/register handling we haven't solved yet. */
-            bool is_push_lr = (first_insn & 0xFF00) == 0xB500;
-            if (is_push_lr) continue;
-
-            /* Also skip BX trampoline functions (single BX Rn instruction) */
+            /* Skip BX trampoline functions (single BX Rn instruction) */
             bool is_bx = (first_insn & 0xFF87) == 0x4700; /* BX Rn */
             if (is_bx) continue;
 
-            /* Only intercept small functions - check next few instructions for BX LR */
-            bool has_bx_lr = false;
-            for (u32 off = rom_offset; off < rom_offset + 20 && off + 2 <= gba->memory.romSize; off += 2) {
-                u16 insn = *(u16*)((u8*)gba->memory.rom + off);
-                if (insn == 0x4770) { has_bx_lr = true; break; } /* BX LR */
-                if ((insn & 0xFF00) == 0xBD00) break; /* POP {PC} - not simple */
-                if ((insn & 0xFF00) == 0xB500) break; /* PUSH - not simple */
-                if ((insn & 0xF800) == 0xF000) break; /* BL - calls another func */
+            /* Skip ARM functions (we only handle Thumb interception) */
+            if (addr < 0x080000C4) continue;
+
+            /* Only intercept functions that DON'T call other functions (true leaves).
+             * Scan the function body: if we find a BL instruction, skip it.
+             * This ensures no nested C-to-C calls from intercepted functions. */
+            {
+                bool has_bl = false;
+                for (u32 off = rom_offset + 2; off < rom_offset + 200 && off + 4 <= gba->memory.romSize; off += 2) {
+                    u16 insn1 = *(u16*)((u8*)gba->memory.rom + off);
+                    if ((insn1 & 0xF800) == 0xF000) { /* BL prefix */
+                        u16 insn2 = *(u16*)((u8*)gba->memory.rom + off + 2);
+                        if ((insn2 & 0xF800) == 0xF800 || (insn2 & 0xF800) == 0xE800) {
+                            has_bl = true;
+                            break;
+                        }
+                    }
+                    /* Stop scanning at function end */
+                    if (insn1 == 0x4770) break; /* BX LR */
+                    if ((insn1 & 0xFF00) == 0xBD00) break; /* POP {PC} */
+                    if ((insn1 & 0xFF00) == 0xBC00) {
+                        u16 next = *(u16*)((u8*)gba->memory.rom + off + 2);
+                        if ((next & 0xFF87) == 0x4700) break; /* POP; BX */
+                    }
+                }
+                if (has_bl) continue; /* Skip non-leaf functions */
             }
-            if (!has_bx_lr) continue; /* Only patch functions with nearby BX LR */
 
             /* Patch with BKPT 0xFE (Thumb: 0xBEFE) */
             *(u16*)((u8*)gba->memory.rom + rom_offset) = 0xBEFE;
