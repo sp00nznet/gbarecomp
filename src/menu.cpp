@@ -269,7 +269,7 @@ void menu_render(void) {
 
     /* Controller Config Window */
     if (show_controller_config) {
-        ImGui::SetNextWindowSize(ImVec2(300, 350), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(400, 380), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("Controller Configuration", &show_controller_config)) {
             ImGui::Text("Click a button to rebind, then press a key.");
             ImGui::Separator();

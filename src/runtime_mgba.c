@@ -17,6 +17,7 @@
 #include <mgba/gba/core.h>
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/video.h>
+#include <mgba-util/audio-buffer.h>
 #include <mgba/internal/arm/arm.h>
 #include <mgba-util/vfs.h>
 
@@ -63,6 +64,7 @@ static bool has_saved_frame = false;
 static SDL_Window* window = NULL;
 static SDL_Renderer* renderer = NULL;
 static SDL_Texture* texture = NULL;
+static SDL_AudioDeviceID audio_device = 0;
 static u16 key_state = 0x03FF; /* All released (active-low) */
 
 /* ---- Forward declarations ---- */
@@ -401,8 +403,31 @@ void gba_swi(u32 number) {
 
 /* ---- Display ---- */
 
+/* ---- Audio Callback ---- */
+
+static void audio_callback(void* userdata, Uint8* stream, int len) {
+    struct mCore* c = (struct mCore*)userdata;
+    if (!c) { memset(stream, 0, len); return; }
+
+    struct mAudioBuffer* buf = c->getAudioBuffer(c);
+    if (!buf) { memset(stream, 0, len); return; }
+
+    int samples_requested = len / (2 * sizeof(int16_t)); /* stereo 16-bit */
+    size_t available = mAudioBufferAvailable(buf);
+    int to_read = samples_requested < (int)available ? samples_requested : (int)available;
+
+    if (to_read > 0) {
+        mAudioBufferRead(buf, (int16_t*)stream, to_read);
+    }
+    /* Zero-fill remainder */
+    int filled = to_read * 2 * sizeof(int16_t);
+    if (filled < len) {
+        memset(stream + filled, 0, len - filled);
+    }
+}
+
 int display_init(void) {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "[display] SDL init failed: %s\n", SDL_GetError());
         return -1;
     }
@@ -675,32 +700,42 @@ static void cb_save_state(int slot) {
     if (!core) return;
     char path[512];
     snprintf(path, sizeof(path), "%s.ss%d", rom_base_path, slot);
-    struct VFile* vf = VFileOpen(path, O_CREAT | O_TRUNC | O_WRONLY);
-    if (vf && mCoreSaveStateNamed(core, vf, SAVESTATE_ALL)) {
+    fprintf(stderr, "[save] Saving to: %s\n", path); fflush(stderr);
+    struct VFile* vf = VFileOpen(path, O_CREAT | O_TRUNC | O_RDWR);
+    if (!vf) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Failed to open save file: %s", path);
+        menu_add_debug_log(msg);
+        return;
+    }
+    if (mCoreSaveStateNamed(core, vf, SAVESTATE_SAVEDATA | SAVESTATE_RTC)) {
         char msg[64];
         snprintf(msg, sizeof(msg), "State saved to slot %d", slot);
         menu_add_debug_log(msg);
-        fprintf(stderr, "[save] Slot %d -> %s\n", slot, path);
     } else {
-        menu_add_debug_log("Save state failed!");
+        menu_add_debug_log("mCoreSaveStateNamed failed!");
     }
-    if (vf) vf->close(vf);
+    vf->close(vf);
 }
 
 static void cb_load_state(int slot) {
     if (!core) return;
     char path[512];
     snprintf(path, sizeof(path), "%s.ss%d", rom_base_path, slot);
+    fprintf(stderr, "[load] Loading from: %s\n", path); fflush(stderr);
     struct VFile* vf = VFileOpen(path, O_RDONLY);
-    if (vf && mCoreLoadStateNamed(core, vf, SAVESTATE_ALL)) {
+    if (!vf) {
+        menu_add_debug_log("No save state in this slot");
+        return;
+    }
+    if (mCoreLoadStateNamed(core, vf, SAVESTATE_SAVEDATA | SAVESTATE_RTC)) {
         char msg[64];
         snprintf(msg, sizeof(msg), "State loaded from slot %d", slot);
         menu_add_debug_log(msg);
-        fprintf(stderr, "[load] Slot %d <- %s\n", slot, path);
     } else {
-        menu_add_debug_log("Load state failed (no save in slot?)");
+        menu_add_debug_log("Load state failed!");
     }
-    if (vf) vf->close(vf);
+    vf->close(vf);
 }
 
 static void cb_set_scale(int scale) {
@@ -708,6 +743,16 @@ static void cb_set_scale(int scale) {
     SDL_SetWindowSize(window, GBA_WIDTH * scale, GBA_HEIGHT * scale + menu_get_bar_height());
     SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     fprintf(stderr, "[gfx] Scale set to %dx\n", scale);
+}
+
+static void cb_set_filter(int filter) {
+    if (!renderer) return;
+    /* Recreate texture with new filter mode */
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, filter ? "1" : "0");
+    if (texture) SDL_DestroyTexture(texture);
+    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+        SDL_TEXTUREACCESS_STREAMING, GBA_WIDTH, GBA_HEIGHT);
+    fprintf(stderr, "[gfx] Filter set to %s\n", filter ? "linear" : "nearest");
 }
 
 /* ---- mGBA Accessors (for interception.c) ---- */
@@ -727,7 +772,7 @@ void gba_init(const char* rom_path) {
     menu_init(window, renderer);
 
     /* Set up menu callbacks */
-    menu_set_callbacks(cb_save_state, cb_load_state, cb_set_scale, NULL, NULL);
+    menu_set_callbacks(cb_save_state, cb_load_state, cb_set_scale, cb_set_filter, NULL);
 
     /* Store base path for save states */
     strncpy(rom_base_path, rom_path, sizeof(rom_base_path) - 1);
@@ -805,6 +850,29 @@ void gba_init(const char* rom_path) {
 
     core->reset(core);
     fprintf(stderr, "[init] Core reset complete\n"); fflush(stderr);
+
+    /* Set up audio */
+    core->setAudioBufferSize(core, 1024);
+    {
+        SDL_AudioSpec want, have;
+        memset(&want, 0, sizeof(want));
+        want.freq = 32768; /* GBA sample rate */
+        want.format = AUDIO_S16SYS;
+        want.channels = 2;
+        want.samples = 1024;
+        want.callback = audio_callback;
+        want.userdata = core;
+
+        audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (audio_device > 0) {
+            SDL_PauseAudioDevice(audio_device, 0); /* Start playback */
+            fprintf(stderr, "[init] Audio: %dHz %dch %d samples\n",
+                    have.freq, have.channels, have.samples);
+        } else {
+            fprintf(stderr, "[init] Audio failed: %s\n", SDL_GetError());
+        }
+        fflush(stderr);
+    }
 
     /* Cache internal pointers */
     gba = core->board;
@@ -936,6 +1004,10 @@ void gba_init(const char* rom_path) {
 }
 
 void gba_shutdown(void) {
+    if (audio_device > 0) {
+        SDL_CloseAudioDevice(audio_device);
+        audio_device = 0;
+    }
     menu_shutdown();
     display_shutdown();
     if (core) {
