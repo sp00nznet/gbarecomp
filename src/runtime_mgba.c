@@ -18,6 +18,7 @@
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/video.h>
 #include <mgba-util/audio-buffer.h>
+#include <mgba-util/audio-resampler.h>
 #include <mgba/internal/arm/arm.h>
 #include <mgba-util/vfs.h>
 
@@ -65,6 +66,9 @@ static SDL_Window* window = NULL;
 static SDL_Renderer* renderer = NULL;
 static SDL_Texture* texture = NULL;
 static SDL_AudioDeviceID audio_device = 0;
+static struct mAudioResampler audio_resampler;
+static struct mAudioBuffer audio_output_buf;
+static bool audio_resampler_init = false;
 static u16 key_state = 0x03FF; /* All released (active-low) */
 
 /* ---- Forward declarations ---- */
@@ -405,25 +409,45 @@ void gba_swi(u32 number) {
 
 /* ---- Audio Callback ---- */
 
+static int audio_cb_count = 0;
 static void audio_callback(void* userdata, Uint8* stream, int len) {
-    struct mCore* c = (struct mCore*)userdata;
-    if (!c) { memset(stream, 0, len); return; }
+    (void)userdata;
+    if (!audio_resampler_init || !core) { memset(stream, 0, len); return; }
 
-    struct mAudioBuffer* buf = c->getAudioBuffer(c);
-    if (!buf) { memset(stream, 0, len); return; }
+    /* Read directly from mGBA's audio buffer (skip resampler for now) */
+    struct mAudioBuffer* src = core->getAudioBuffer(core);
 
-    int samples_requested = len / (2 * sizeof(int16_t)); /* stereo 16-bit */
-    size_t available = mAudioBufferAvailable(buf);
+    int samples_requested = len / (2 * sizeof(int16_t));
+    size_t available = mAudioBufferAvailable(src);
     int to_read = samples_requested < (int)available ? samples_requested : (int)available;
 
+    audio_cb_count++;
+
     if (to_read > 0) {
-        mAudioBufferRead(buf, (int16_t*)stream, to_read);
+        mAudioBufferRead(src, (int16_t*)stream, to_read);
+
+        if (audio_cb_count <= 5 || audio_cb_count % 500 == 0) {
+            int16_t* s = (int16_t*)stream;
+            int16_t maxval = 0;
+            for (int j = 0; j < to_read * 2; j++) {
+                int16_t v = s[j] < 0 ? -s[j] : s[j];
+                if (v > maxval) maxval = v;
+            }
+            /* Also check raw buffer bytes for any non-zero */
+            int rawnonzero = 0;
+            u8* rawdata = (u8*)src->data.data;
+            if (rawdata) {
+                for (int j = 0; j < 256; j++) {
+                    if (rawdata[j]) rawnonzero++;
+                }
+            }
+            fprintf(stderr, "[audio #%d] read=%d peak=%d rawNZ=%d\n",
+                    audio_cb_count, to_read, maxval, rawnonzero);
+            fflush(stderr);
+        }
     }
-    /* Zero-fill remainder */
     int filled = to_read * 2 * sizeof(int16_t);
-    if (filled < len) {
-        memset(stream + filled, 0, len - filled);
-    }
+    if (filled < len) memset(stream + filled, 0, len - filled);
 }
 
 int display_init(void) {
@@ -825,6 +849,7 @@ void gba_init(const char* rom_path) {
     mCoreConfigInit(&core->config, "gbarecomp");
     mCoreConfigSetDefaultIntValue(&core->config, "skipBios", 1);
     mCoreConfigSetDefaultIntValue(&core->config, "useBios", 0);
+    mCoreConfigSetDefaultIntValue(&core->config, "sampleRate", 48000);
     core->loadConfig(core, &core->config);
     fprintf(stderr, "[init] Config loaded\n"); fflush(stderr);
 
@@ -852,22 +877,36 @@ void gba_init(const char* rom_path) {
     fprintf(stderr, "[init] Core reset complete\n"); fflush(stderr);
 
     /* Set up audio */
-    core->setAudioBufferSize(core, 1024);
     {
+        unsigned mgba_rate = core->audioSampleRate(core);
+        fprintf(stderr, "[init] mGBA native sample rate: %u\n", mgba_rate);
+
+        core->setAudioBufferSize(core, 2048);
+
+        /* Set up audio resampler: mGBA internal buffer -> our output buffer */
+        struct mAudioBuffer* src_buf = core->getAudioBuffer(core);
+        mAudioBufferInit(&audio_output_buf, 4096, 2);
+        mAudioResamplerInit(&audio_resampler, mINTERPOLATOR_SINC);
+        mAudioResamplerSetSource(&audio_resampler, src_buf, mgba_rate, true);
+        mAudioResamplerSetDestination(&audio_resampler, &audio_output_buf, 48000);
+        audio_resampler_init = true;
+        fprintf(stderr, "[init] Audio resampler: src=%p -> dst, %u -> 32768Hz\n",
+                (void*)src_buf, mgba_rate);
+
         SDL_AudioSpec want, have;
         memset(&want, 0, sizeof(want));
-        want.freq = 32768; /* GBA sample rate */
+        want.freq = 48000;
         want.format = AUDIO_S16SYS;
         want.channels = 2;
         want.samples = 1024;
         want.callback = audio_callback;
         want.userdata = core;
 
-        audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
         if (audio_device > 0) {
-            SDL_PauseAudioDevice(audio_device, 0); /* Start playback */
-            fprintf(stderr, "[init] Audio: %dHz %dch %d samples\n",
-                    have.freq, have.channels, have.samples);
+            SDL_PauseAudioDevice(audio_device, 0);
+            fprintf(stderr, "[init] Audio: %dHz %dch %d samples (device %d)\n",
+                    have.freq, have.channels, have.samples, audio_device);
         } else {
             fprintf(stderr, "[init] Audio failed: %s\n", SDL_GetError());
         }
