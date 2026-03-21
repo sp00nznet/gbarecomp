@@ -20,6 +20,7 @@
 #include <mgba-util/audio-buffer.h>
 #include <mgba-util/audio-resampler.h>
 #include <mgba/internal/arm/arm.h>
+#include <mgba/internal/gba/bios.h>
 #include <mgba-util/vfs.h>
 
 #include <SDL2/SDL.h>
@@ -319,90 +320,31 @@ void cpu_set_spsr(u32 value, u32 mask) {
 /* ---- Software Interrupts ---- */
 
 void gba_swi(u32 number) {
-    switch (number) {
-    case 0x02: /* Halt */
-        /* Advance to next interrupt */
-        arm_cpu->halted = 1;
-        while (arm_cpu->halted) {
-            advance_hardware(16);
-        }
-        break;
+    /* Delegate ALL SWIs to mGBA's BIOS HLE for exact register behavior.
+     * Sync our registers to mGBA, let mGBA handle the SWI, sync back. */
+    if (core && arm_cpu) {
+        /* Sync our registers to mGBA */
+        for (int i = 0; i < 16; i++) arm_cpu->gprs[i] = r[i];
+        arm_cpu->cpsr.n = CPU_N;
+        arm_cpu->cpsr.z = CPU_Z;
+        arm_cpu->cpsr.c = CPU_C;
+        arm_cpu->cpsr.v = CPU_V;
 
-    case 0x04: /* IntrWait */
-    case 0x05: /* VBlankIntrWait */
-        gba_frame();
-        break;
+        /* Call mGBA's BIOS HLE SWI handler directly */
+        GBASwi16(arm_cpu, number);
 
-    case 0x06: { /* Div */
-        s32 num = (s32)r[0];
-        s32 den = (s32)r[1];
-        if (den != 0) {
-            r[0] = (u32)(num / den);
-            r[1] = (u32)(num % den);
-            s32 abs_result = num / den;
-            r[3] = (u32)(abs_result < 0 ? -abs_result : abs_result);
-        }
-        break;
+        /* Sync mGBA's registers back to ours.
+         * The BIOS clobbers r0-r3 (caller-saved per ARM ABI). */
+        for (int i = 0; i < 16; i++) r[i] = arm_cpu->gprs[i];
+        CPU_N = arm_cpu->cpsr.n;
+        CPU_Z = arm_cpu->cpsr.z;
+        CPU_C = arm_cpu->cpsr.c;
+        CPU_V = arm_cpu->cpsr.v;
+        return;
     }
 
-    case 0x07: { /* DivArm */
-        s32 den = (s32)r[0];
-        s32 num = (s32)r[1];
-        if (den != 0) {
-            r[0] = (u32)(num / den);
-            r[1] = (u32)(num % den);
-            s32 abs_result = num / den;
-            r[3] = (u32)(abs_result < 0 ? -abs_result : abs_result);
-        }
-        break;
-    }
-
-    case 0x08: { /* Sqrt */
-        u32 val = r[0];
-        u32 result = 0, bit = 1u << 30;
-        while (bit > val) bit >>= 2;
-        while (bit != 0) {
-            if (val >= result + bit) {
-                val -= result + bit;
-                result = (result >> 1) + bit;
-            } else {
-                result >>= 1;
-            }
-            bit >>= 2;
-        }
-        r[0] = result;
-        break;
-    }
-
-    case 0x0B: /* CpuSet */
-    case 0x0C: { /* CpuFastSet */
-        u32 src = r[0], dst = r[1], cnt = r[2];
-        u32 count = cnt & 0x1FFFFF;
-        bool fill = (cnt >> 24) & 1;
-        bool word = (number == 0x0C) || ((cnt >> 26) & 1);
-        u32 size = word ? 4 : 2;
-
-        if (word) {
-            u32 fill_val = bus_read32(src);
-            for (u32 i = 0; i < count; i++) {
-                u32 val = fill ? fill_val : bus_read32(src + i * 4);
-                bus_write32(dst + i * 4, val);
-            }
-        } else {
-            u16 fill_val = bus_read16(src);
-            for (u32 i = 0; i < count; i++) {
-                u16 val = fill ? fill_val : bus_read16(src + i * 2);
-                bus_write16(dst + i * 2, val);
-            }
-        }
-        (void)size;
-        break;
-    }
-
-    default:
-        fprintf(stderr, "[swi] Unhandled SWI 0x%02X\n", number);
-        break;
-    }
+    /* Fallback if mGBA not available */
+    fprintf(stderr, "[swi] SWI 0x%02X (no mGBA)\n", number);
 }
 
 /* ---- Display ---- */
