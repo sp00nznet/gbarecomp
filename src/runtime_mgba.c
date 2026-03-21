@@ -986,10 +986,8 @@ void gba_init(const char* rom_path) {
 
             /* Activate interception after init completes */
             if (!interception_active && unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
-                /* Interception disabled - causes garbled graphics
-                 * extern void interception_setup_from_bx_table(void);
-                 * interception_setup_from_bx_table();
-                 */
+                extern void interception_setup_from_bx_table(void);
+                interception_setup_from_bx_table();
                 interception_active = true;
                 recomp_mode = true;
                 fprintf(stderr, "[runtime] Function interception activated at frame %d\n", init_frames);
@@ -1029,13 +1027,9 @@ void gba_init(const char* rom_path) {
     /* Render the last init frame */
     display_render_frame();
 
-    /* Initialize function interception */
-    extern void interception_setup_from_bx_table(void);
-    interception_setup_from_bx_table();
+    /* Interception is set up inside the init loop (after frame 51) */
 
-    /* Enable recompiled code mode */
-    recomp_mode = true;
-    printf("[runtime] Init complete - function interception active\n");
+    printf("[runtime] Init complete\n");
     printf("[runtime] SP=0x%08X PC=0x%08X DISPCNT=0x%04X\n",
            r[13], r[15], gba->memory.io[0]);
     fflush(stdout);

@@ -123,82 +123,143 @@ static void hooked_bkpt16(struct ARMCore* cpu, int immediate) {
 static u16* original_insns = NULL; /* Saved original first instructions */
 static struct mCore* s_core = NULL;
 
-/* SWI hook - called by mGBA when SWI 0xFE is executed */
+/* Stats */
+static int successful_interceptions = 0;
+static int failed_interceptions = 0;
+static int unpatched_count = 0;
+
+/* Find the table index for a function address */
+static int find_func_index(u32 addr) {
+    int lo = 0, hi = func_table_size - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (func_table[mid].addr == addr) return mid;
+        if (func_table[mid].addr < addr) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return -1;
+}
+
+/* Un-patch a function: restore original ROM instruction so mGBA handles it */
+static void unpatch_function(u32 func_addr) {
+    int idx = find_func_index(func_addr);
+    if (idx < 0) return;
+
+    struct GBA* g = get_mgba_gba();
+    u32 rom_offset = func_addr - 0x08000000;
+    if (rom_offset + 2 <= g->memory.romSize) {
+        *(u16*)((u8*)g->memory.rom + rom_offset) = original_insns[idx];
+        unpatched_count++;
+    }
+}
+
+/* BKPT hook - called by mGBA when BKPT 0xFE is hit */
 void interception_handle_swi(struct ARMCore* cpu, int immediate) {
     if (immediate != 0xFE || !interception_enabled) return;
 
-    /* PC points past the BKPT. In Thumb: PC = BKPT_addr + 2 (no pipeline advance for BKPT).
-     * Actually mGBA's BKPT handler: PC = instruction_addr + WORD_SIZE_THUMB
-     * The function entry is at the BKPT instruction address. */
-    u32 func_addr = cpu->gprs[15] - 4; /* PC is 2 ahead + Thumb pipeline */
+    u32 func_addr = cpu->gprs[15] - 4;
 
+    /* Look up the recompiled function */
     RecompFunc func = lookup_function(func_addr);
     if (!func) {
-        /* Try nearby addresses */
         func = lookup_function(func_addr - 2);
-        if (!func) func = lookup_function(func_addr - 4);
+        if (func) func_addr -= 2;
+        else {
+            func = lookup_function(func_addr - 4);
+            if (func) func_addr -= 4;
+        }
     }
 
-    if (func) {
-        intercept_count++;
+    if (!func) return;
 
-        if (intercept_count <= 50) {
-            fprintf(stderr, "[intercept!] PC=0x%08X -> native C (#%d)\n",
-                    func_addr, intercept_count);
+    intercept_count++;
+
+    /* Save FULL mGBA state for crash recovery */
+    u32 saved_gprs[16];
+    union PSR saved_cpsr;
+    memcpy(saved_gprs, cpu->gprs, sizeof(saved_gprs));
+    saved_cpsr = cpu->cpsr;
+
+    /* Sync mGBA -> recompiled register file */
+    sync_from_mgba(cpu);
+
+    /* Disable IRQ delivery during interception */
+    extern bool in_irq;
+    bool saved_in_irq = in_irq;
+    in_irq = true;
+
+    /* Try executing the recompiled function with crash recovery */
+    bool crashed = false;
+
+#ifdef _WIN32
+    __try {
+#endif
+        func();
+#ifdef _WIN32
+    } __except(1) {
+        crashed = true;
+    }
+#endif
+
+    in_irq = saved_in_irq;
+
+    if (crashed) {
+        /* CRASH: Restore mGBA state and un-patch this function */
+        failed_interceptions++;
+        memcpy(cpu->gprs, saved_gprs, sizeof(saved_gprs));
+        cpu->cpsr = saved_cpsr;
+
+        /* Restore original ROM instruction */
+        unpatch_function(func_addr);
+
+        /* Reset PC to re-execute the original instruction via mGBA */
+        cpu->gprs[15] = func_addr;
+        cpu->executionMode = cpu->cpsr.t ? MODE_THUMB : MODE_ARM;
+        if (cpu->executionMode == MODE_THUMB) {
+            ARMRunFake(cpu, original_insns[find_func_index(func_addr)]);
+        }
+
+        if (failed_interceptions <= 30 || failed_interceptions % 100 == 0) {
+            fprintf(stderr, "[intercept] CRASH at 0x%08X - un-patched (%d failed, %d ok)\n",
+                    func_addr, failed_interceptions, successful_interceptions);
             fflush(stderr);
         }
+        return;
+    }
 
-        /* Sync mGBA -> recompiled register file */
-        sync_from_mgba(cpu);
+    /* SUCCESS */
+    successful_interceptions++;
 
-        /* Disable interrupt delivery during interception */
-        extern bool in_irq;
-        bool saved_in_irq = in_irq;
-        in_irq = true;
+    /* Fix return PC: if r[15] unchanged, use LR */
+    if (r[15] == saved_gprs[15]) {
+        r[15] = r[14];
+    }
 
-        /* Save mGBA state for crash recovery */
-        u32 saved_gprs[16];
-        memcpy(saved_gprs, cpu->gprs, sizeof(saved_gprs));
+    /* Sync recompiled registers back to mGBA */
+    sync_to_mgba(cpu);
 
-        /* Call the recompiled C function */
-        func();
-
-        in_irq = saved_in_irq;
-
-        /* If the function returned via BX LR (return;), r[15] isn't updated.
-         * In that case, the return address is in r[14] (LR). */
-        if (r[15] == cpu->gprs[15]) {
-            /* r[15] unchanged - function returned via BX LR, use LR as return PC */
-            r[15] = r[14];
-        }
-
-        /* Sync recompiled registers back to mGBA */
-        sync_to_mgba(cpu);
-
-        /* Tell mGBA to resume from the return address. */
-        u32 ret_pc = cpu->gprs[15];
-        cpu->gprs[15] = ret_pc & ~1u;
-
-        /* Set Thumb/ARM mode from return address bit 0 */
-        if (ret_pc & 1) {
-            cpu->cpsr.t = 1;
-            cpu->executionMode = MODE_THUMB;
-        } else {
-            cpu->cpsr.t = 0;
-            cpu->executionMode = MODE_ARM;
-        }
-
-        /* Flush mGBA's pipeline to refetch from new PC */
-        if (cpu->executionMode == MODE_THUMB) {
-            ARMRunFake(cpu, 0x46C0); /* Thumb NOP */
-        } else {
-            ARMRunFake(cpu, 0xE1A00000); /* ARM NOP */
-        }
+    /* Set PC and execution mode from return address */
+    u32 ret_pc = cpu->gprs[15];
+    cpu->gprs[15] = ret_pc & ~1u;
+    if (ret_pc & 1) {
+        cpu->cpsr.t = 1;
+        cpu->executionMode = MODE_THUMB;
     } else {
-        /* No recompiled function found for this address.
-         * Restore the original instruction and let mGBA execute it. */
-        /* For now, just skip the BKPT by advancing PC */
-        /* (This shouldn't happen since we only patch known functions) */
+        cpu->cpsr.t = 0;
+        cpu->executionMode = MODE_ARM;
+    }
+
+    /* Flush pipeline */
+    if (cpu->executionMode == MODE_THUMB) {
+        ARMRunFake(cpu, 0x46C0);
+    } else {
+        ARMRunFake(cpu, 0xE1A00000);
+    }
+
+    if (intercept_count <= 20 || intercept_count % 1000 == 0) {
+        fprintf(stderr, "[intercept #%d] 0x%08X OK (%d native, %d mGBA fallback)\n",
+                intercept_count, func_addr, successful_interceptions, failed_interceptions);
+        fflush(stderr);
     }
 }
 
@@ -246,31 +307,10 @@ void interception_init(FuncEntry* table, int size) {
             bool is_bx = (first_insn & 0xFF87) == 0x4700;
             if (is_bx) continue;
 
-            /* Skip ARM functions */
+            /* Skip ARM functions (crt0 etc) */
             if (addr < 0x080000C4) continue;
 
-            /* Only intercept safe leaf functions:
-             * - No PUSH {LR} (don't manipulate stack for LR)
-             * - Must have BX LR within 20 bytes (simple return)
-             * - No BL calls (no nested function calls)
-             * - No SWI calls (avoid gba_swi complications during interception) */
-            {
-                bool safe = false;
-                bool is_push = (first_insn & 0xFF00) == 0xB500;
-                if (is_push) continue; /* Skip PUSH functions */
-
-                /* Scan for BX LR and check for BL/SWI */
-                bool has_bx_lr = false;
-                bool has_bl_or_swi = false;
-                for (u32 off = rom_offset; off < rom_offset + 20 && off + 2 <= gba->memory.romSize; off += 2) {
-                    u16 insn = *(u16*)((u8*)gba->memory.rom + off);
-                    if (insn == 0x4770) { has_bx_lr = true; break; }
-                    if ((insn & 0xF800) == 0xF000) has_bl_or_swi = true; /* BL */
-                    if ((insn & 0xFF00) == 0xDF00) has_bl_or_swi = true; /* SWI */
-                }
-                safe = has_bx_lr && !has_bl_or_swi;
-                if (!safe) continue;
-            }
+            /* Patch ALL other Thumb functions - crash recovery handles failures */
 
             /* Patch with BKPT 0xFE (Thumb: 0xBEFE) */
             *(u16*)((u8*)gba->memory.rom + rom_offset) = 0xBEFE;
@@ -294,12 +334,6 @@ void interception_run_frame(struct mCore* core) {
     struct GBA* gba = core->board;
     struct ARMCore* cpu = core->cpu;
 
-    /* Always use mGBA's runFrame for now - interception causes garbled graphics.
-     * The intercepted leaf functions corrupt display tile state.
-     * TODO: fix the intercepted functions or find which one causes corruption. */
-    core->runFrame(core);
-    return;
-
     if (!interception_enabled || !func_table) {
         core->runFrame(core);
         return;
@@ -311,8 +345,9 @@ void interception_run_frame(struct mCore* core) {
 
     static int frame_log = 0;
     frame_log++;
-    if (frame_log <= 5 || frame_log % 120 == 0) {
-        fprintf(stderr, "[intercept] frame %d: %d total interceptions\n", frame_log, intercept_count);
+    if (frame_log <= 5 || frame_log % 60 == 0) {
+        fprintf(stderr, "[intercept] frame %d: %d native / %d fallback / %d unpatched\n",
+                frame_log, successful_interceptions, failed_interceptions, unpatched_count);
         fflush(stderr);
     }
 }
