@@ -489,8 +489,9 @@ void display_render_frame(void) {
     SDL_UpdateTexture(texture, NULL, renderBuf, GBA_WIDTH * sizeof(color_t));
     SDL_RenderClear(renderer);
 
-    /* Offset game below menu bar */
-    int bar_h = menu_get_bar_height();
+    /* Offset game below menu bar - tight, no gap */
+    int bar_h = menu_get_bar_height() - 2; /* Remove padding gap */
+    if (bar_h < 0) bar_h = 0;
     int win_w, win_h;
     SDL_GetWindowSize(window, &win_w, &win_h);
     SDL_Rect dst = { 0, bar_h, win_w, win_h - bar_h };
