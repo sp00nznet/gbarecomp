@@ -985,15 +985,11 @@ void gba_init(const char* rom_path) {
             }
 
             /* Activate interception after init completes */
-            /* Enable interception after init - translator bugs fixed */
-            if (!interception_active && unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
-                extern void interception_setup_from_bx_table(void);
-                interception_setup_from_bx_table();
-                interception_active = true;
-                recomp_mode = true;
-                fprintf(stderr, "[runtime] Interception activated at frame %d\n", init_frames);
-                fflush(stderr);
-            }
+            /* Interception disabled - freezes game during fade-in.
+             * Translator fixes (shifts, ADC/SBC) are in place.
+             * The freeze is caused by the interception mechanism disrupting
+             * the game's VBlank-driven state machine, not instruction bugs.
+             * Need to solve the main loop flow issue before re-enabling. */
             prev_dispcnt = dispcnt;
         }
         fprintf(stderr, "[init] mGBA CPU ran %d frames\n", init_frames);
