@@ -333,8 +333,16 @@ void gba_swi(u32 number) {
         /* Call mGBA's BIOS HLE SWI handler directly */
         GBASwi16(arm_cpu, number);
 
-        /* Sync mGBA's registers back to ours.
-         * The BIOS clobbers r0-r3 (caller-saved per ARM ABI). */
+        /* The real GBA BIOS clobbers r0-r3 after SWI. mGBA's HLE doesn't
+         * always match. For CpuSet/CpuFastSet, the BIOS zeros r0-r3. */
+        if (number == 0x0B || number == 0x0C) {
+            arm_cpu->gprs[0] = 0;
+            arm_cpu->gprs[1] = 0;
+            arm_cpu->gprs[2] = 0;
+            arm_cpu->gprs[3] = 0;
+        }
+
+        /* Sync mGBA's registers back to ours */
         for (int i = 0; i < 16; i++) r[i] = arm_cpu->gprs[i];
         CPU_N = arm_cpu->cpsr.n;
         CPU_Z = arm_cpu->cpsr.z;
