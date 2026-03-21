@@ -294,6 +294,12 @@ void interception_run_frame(struct mCore* core) {
     struct GBA* gba = core->board;
     struct ARMCore* cpu = core->cpu;
 
+    /* Always use mGBA's runFrame for now - interception causes garbled graphics.
+     * The intercepted leaf functions corrupt display tile state.
+     * TODO: fix the intercepted functions or find which one causes corruption. */
+    core->runFrame(core);
+    return;
+
     if (!interception_enabled || !func_table) {
         core->runFrame(core);
         return;
