@@ -985,11 +985,15 @@ void gba_init(const char* rom_path) {
             }
 
             /* Activate interception after init completes */
-            /* Function interception disabled - needs translator correctness fixes.
-             * The architecture works (BKPT traps, crash recovery, register sync)
-             * but recompiled functions produce subtly wrong results causing freezes.
-             * Game runs perfectly via mGBA CPU.
-             * TODO: fix instruction translation bugs, then re-enable. */
+            /* Enable interception after init - translator bugs fixed */
+            if (!interception_active && unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
+                extern void interception_setup_from_bx_table(void);
+                interception_setup_from_bx_table();
+                interception_active = true;
+                recomp_mode = true;
+                fprintf(stderr, "[runtime] Interception activated at frame %d\n", init_frames);
+                fflush(stderr);
+            }
             prev_dispcnt = dispcnt;
         }
         fprintf(stderr, "[init] mGBA CPU ran %d frames\n", init_frames);
