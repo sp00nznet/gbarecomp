@@ -93,7 +93,10 @@ static bool recomp_hook(struct ARMCore* cpu) {
     u32 pc = cpu->gprs[15];
 
     /* O(1) direct table lookup */
-    u32 idx = ((pc & ~1u) - 0x08000000) >> 1;
+    if (!direct_table) return false;
+    u32 pc_clean = pc & ~1u;
+    if (pc_clean < 0x08000000) return false;
+    u32 idx = (pc_clean - 0x08000000) >> 1;
     if (idx >= DIRECT_TABLE_SIZE) return false;
     RecompFunc func = direct_table[idx];
     if (!func) return false;
@@ -146,8 +149,8 @@ static bool recomp_hook(struct ARMCore* cpu) {
     /* Sync back to mGBA */
     sync_to_mgba(cpu);
 
-    /* Add estimated cycles for the function execution */
-    cpu->cycles += 10; /* Approximate: small function ~10 cycles */
+    /* Add estimated cycles. Use bus_access_count delta as proxy. */
+    cpu->cycles += 50;
 
     successful++;
 
