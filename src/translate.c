@@ -1445,13 +1445,26 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "static const int bx_table_size = %d;\n\n", analysis->num_functions);
 
         /* Binary search BX dispatcher */
+        fprintf(f, "static int _bx_depth = 0;\n");
         fprintf(f, "void cpu_bx(u32 target) {\n");
+        fprintf(f, "    /* NULL targets */\n");
+        fprintf(f, "    if (target == 0 || target == 1) return;\n");
+        fprintf(f, "    /* Prevent infinite recursion: if already inside a recompiled function,\n");
+        fprintf(f, "     * just set r[15] and return (BX-as-return or indirect call). */\n");
+        fprintf(f, "    if (_bx_depth > 10) { r[15] = target; return; }\n");
+        fprintf(f, "    /* RAM targets: run via mGBA interpreter */\n");
+        fprintf(f, "    if ((target >> 24) == 0x02 || (target >> 24) == 0x03) {\n");
+        fprintf(f, "        run_iwram_function(target);\n");
+        fprintf(f, "        return;\n");
+        fprintf(f, "    }\n");
         fprintf(f, "    /* Binary search the dispatch table */\n");
         fprintf(f, "    int lo = 0, hi = bx_table_size - 1;\n");
         fprintf(f, "    while (lo <= hi) {\n");
         fprintf(f, "        int mid = (lo + hi) / 2;\n");
         fprintf(f, "        if (bx_table[mid].addr == target) {\n");
+        fprintf(f, "            _bx_depth++;\n");
         fprintf(f, "            bx_table[mid].func();\n");
+        fprintf(f, "            _bx_depth--;\n");
         fprintf(f, "            return;\n");
         fprintf(f, "        } else if (bx_table[mid].addr < target) {\n");
         fprintf(f, "            lo = mid + 1;\n");
@@ -1459,15 +1472,10 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "            hi = mid - 1;\n");
         fprintf(f, "        }\n");
         fprintf(f, "    }\n");
-        fprintf(f, "    /* NULL targets */\n");
-        fprintf(f, "    if (target == 0 || target == 1) return;\n");
-        fprintf(f, "    /* RAM targets: run via mGBA interpreter */\n");
-        fprintf(f, "    if ((target >> 24) == 0x02 || (target >> 24) == 0x03) {\n");
-        fprintf(f, "        run_iwram_function(target);\n");
-        fprintf(f, "        return;\n");
-        fprintf(f, "    }\n");
-        fprintf(f, "    static int _bxmiss = 0;\n");
-        fprintf(f, "    if (++_bxmiss <= 20) fprintf(stderr, \"[bx] No function for 0x%%08X\\n\", target);\n");
+        fprintf(f, "    /* Target not in function table - this is a BX-as-return.\n");
+        fprintf(f, "     * The target is a return address (pushed LR) not a function entry.\n");
+        fprintf(f, "     * Set r[15] so the caller knows where to resume. */\n");
+        fprintf(f, "    r[15] = target;\n");
         fprintf(f, "}\n\n");
 
         /* Interception setup - populates the function table for interception.c */

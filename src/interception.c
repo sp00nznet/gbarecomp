@@ -140,30 +140,53 @@ void interception_handle_swi(struct ARMCore* cpu, int immediate) {
     }
 
     if (func) {
-        if (intercept_count < 50) {
+        intercept_count++;
+
+        if (intercept_count <= 50) {
             fprintf(stderr, "[intercept!] PC=0x%08X -> native C (#%d)\n",
-                    func_addr, intercept_count + 1);
+                    func_addr, intercept_count);
             fflush(stderr);
         }
 
-        /* Sync mGBA -> recompiled */
+        /* Sync mGBA -> recompiled register file */
         sync_from_mgba(cpu);
 
-        /* Call recompiled function */
-        func();
-        intercept_count++;
+        /* Disable interrupt delivery during interception to prevent recursion */
+        extern bool in_irq;
+        bool saved_in_irq = in_irq;
+        in_irq = true;
 
-        /* Sync back */
+        /* Call the recompiled C function */
+        if (intercept_count <= 5) {
+            fprintf(stderr, "[before] r0=0x%08X r1=0x%08X r2=0x%08X r13=0x%08X\n",
+                    r[0], r[1], r[2], r[13]);
+            fflush(stderr);
+        }
+        func();
+        if (intercept_count <= 5) {
+            fprintf(stderr, "[after] r0=0x%08X r1=0x%08X r15=0x%08X\n",
+                    r[0], r[1], r[15]);
+            fflush(stderr);
+        }
+
+        in_irq = saved_in_irq;
+
+        /* If the function returned via BX LR (return;), r[15] isn't updated.
+         * In that case, the return address is in r[14] (LR). */
+        if (r[15] == cpu->gprs[15]) {
+            /* r[15] unchanged - function returned via BX LR, use LR as return PC */
+            r[15] = r[14];
+        }
+
+        /* Sync recompiled registers back to mGBA */
         sync_to_mgba(cpu);
 
-        /* Fix PC and flush pipeline after interception.
-         * The recompiled function set r[15] to return address.
-         * We must flush mGBA's instruction prefetch to refetch from new PC. */
+        /* Tell mGBA to resume from the return address. */
         u32 ret_pc = cpu->gprs[15];
-        bool ret_thumb = (ret_pc & 1) || cpu->cpsr.t;
         cpu->gprs[15] = ret_pc & ~1u;
 
-        if (ret_thumb) {
+        /* Set Thumb/ARM mode from return address bit 0 */
+        if (ret_pc & 1) {
             cpu->cpsr.t = 1;
             cpu->executionMode = MODE_THUMB;
         } else {
@@ -171,15 +194,17 @@ void interception_handle_swi(struct ARMCore* cpu, int immediate) {
             cpu->executionMode = MODE_ARM;
         }
 
-        /* Use ARMRunFake to inject a pipeline-flushing instruction.
-         * This makes mGBA refetch from the new PC on next step. */
-        if (ret_thumb) {
-            /* Thumb NOP = MOV R8,R8 (0x46C0) */
-            ARMRunFake(cpu, 0x46C0);
+        /* Flush mGBA's pipeline to refetch from new PC */
+        if (cpu->executionMode == MODE_THUMB) {
+            ARMRunFake(cpu, 0x46C0); /* Thumb NOP */
         } else {
-            /* ARM NOP = MOV R0,R0 (0xE1A00000) */
-            ARMRunFake(cpu, 0xE1A00000);
+            ARMRunFake(cpu, 0xE1A00000); /* ARM NOP */
         }
+    } else {
+        /* No recompiled function found for this address.
+         * Restore the original instruction and let mGBA execute it. */
+        /* For now, just skip the BKPT by advancing PC */
+        /* (This shouldn't happen since we only patch known functions) */
     }
 }
 
@@ -220,14 +245,34 @@ void interception_init(FuncEntry* table, int size) {
             if (rom_offset + 2 > gba->memory.romSize) continue;
 
             /* Save original instruction */
-            original_insns[i] = *(u16*)((u8*)gba->memory.rom + rom_offset);
+            u16 first_insn = *(u16*)((u8*)gba->memory.rom + rom_offset);
+            original_insns[i] = first_insn;
+
+            /* Only intercept LEAF functions that DON'T use PUSH {LR}.
+             * These return via BX LR (= return; in C) and don't touch the stack.
+             * Functions with PUSH {LR} use POP {PC} or POP/BX to return,
+             * which requires careful stack/register handling we haven't solved yet. */
+            bool is_push_lr = (first_insn & 0xFF00) == 0xB500;
+            if (is_push_lr) continue;
+
+            /* Also skip BX trampoline functions (single BX Rn instruction) */
+            bool is_bx = (first_insn & 0xFF87) == 0x4700; /* BX Rn */
+            if (is_bx) continue;
+
+            /* Only intercept small functions - check next few instructions for BX LR */
+            bool has_bx_lr = false;
+            for (u32 off = rom_offset; off < rom_offset + 20 && off + 2 <= gba->memory.romSize; off += 2) {
+                u16 insn = *(u16*)((u8*)gba->memory.rom + off);
+                if (insn == 0x4770) { has_bx_lr = true; break; } /* BX LR */
+                if ((insn & 0xFF00) == 0xBD00) break; /* POP {PC} - not simple */
+                if ((insn & 0xFF00) == 0xB500) break; /* PUSH - not simple */
+                if ((insn & 0xF800) == 0xF000) break; /* BL - calls another func */
+            }
+            if (!has_bx_lr) continue; /* Only patch functions with nearby BX LR */
 
             /* Patch with BKPT 0xFE (Thumb: 0xBEFE) */
             *(u16*)((u8*)gba->memory.rom + rom_offset) = 0xBEFE;
             patched++;
-
-            /* Limit to first 100 functions for testing */
-            if (patched >= 100) break;
         }
         fprintf(stderr, "[intercept] Patched %d ROM functions (limited for testing)\n", patched);
         fflush(stderr);

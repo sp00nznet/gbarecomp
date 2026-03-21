@@ -78,7 +78,7 @@ static u32 frame_count = 0;
 static u32 bus_access_count = 0;
 static bool recomp_mode = false; /* true when recompiled code is running */
 static u32 dispstat_poll_count = 0; /* consecutive DISPSTAT reads */
-static bool in_irq = false; /* Guard against re-entrant IRQ */
+bool in_irq = false; /* Guard against re-entrant IRQ (non-static for interception.c) */
 static int irq_deliver_count = 0;
 
 /* Advance mGBA hardware by a number of cycles */
