@@ -1082,13 +1082,28 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
     emit_raw(ctx, "void func_%08X(void) {\n", func->entry);
     ctx->indent = 1;
 
+    /* Sort blocks by address for correct emission order.
+     * Blocks must be emitted in address order so that fallthrough
+     * between blocks works correctly (BEQ skipping over code, etc). */
+    u32* sorted_blocks = (u32*)malloc(func->num_blocks * sizeof(u32));
+    memcpy(sorted_blocks, func->block_addrs, func->num_blocks * sizeof(u32));
+    for (int i = 0; i < func->num_blocks - 1; i++) {
+        for (int j = i + 1; j < func->num_blocks; j++) {
+            if (sorted_blocks[j] < sorted_blocks[i]) {
+                u32 tmp = sorted_blocks[i];
+                sorted_blocks[i] = sorted_blocks[j];
+                sorted_blocks[j] = tmp;
+            }
+        }
+    }
+
     /* Build local block address set for goto validation */
-    ctx->local_blocks = (u32*)func->block_addrs;
+    ctx->local_blocks = sorted_blocks;
     ctx->num_local_blocks = func->num_blocks;
 
-    /* Translate each block */
+    /* Translate each block (in address order) */
     for (int b = 0; b < func->num_blocks; b++) {
-        u32 block_addr = func->block_addrs[b];
+        u32 block_addr = sorted_blocks[b];
 
         /* Find the block */
         BasicBlock* block = NULL;
@@ -1142,6 +1157,7 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
     ctx->indent = 0;
     ctx->local_blocks = NULL;
     ctx->num_local_blocks = 0;
+    free(sorted_blocks);
     emit_raw(ctx, "}\n");
 }
 
