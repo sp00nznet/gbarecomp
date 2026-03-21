@@ -89,12 +89,7 @@ static bool recomp_hook(struct ARMCore* cpu) {
     RecompFunc func = lookup_function(pc);
     if (!func) return false;
 
-    /* VERIFY MODE: compare recompiled output against mGBA */
-    extern bool verify_hook(struct ARMCore* cpu, RecompFunc func, u32 func_addr);
-    verify_hook(cpu, func, pc & ~1u);
-    return false; /* Always let mGBA interpret - we're just comparing */
-
-    /* Normal interception (disabled during verification) */
+    /* Normal interception mode */
     intercept_count++;
 
     /* Sync mGBA -> recompiled */

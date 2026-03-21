@@ -927,14 +927,13 @@ void gba_init(const char* rom_path) {
             }
 
             /* Activate interception after init completes */
-            /* Verification mode: hook fires but mGBA always interprets.
-             * The hook compares recompiled output against mGBA output
-             * to find translator bugs. */
+            /* Enable native C interception after init */
             if (!interception_active && unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
                 extern void interception_setup_from_bx_table(void);
                 interception_setup_from_bx_table();
                 interception_active = true;
-                fprintf(stderr, "[runtime] Verification mode activated at frame %d\n", init_frames);
+                recomp_mode = true;
+                fprintf(stderr, "[runtime] Native C interception activated at frame %d\n", init_frames);
                 fflush(stderr);
             }
             prev_dispcnt = dispcnt;
