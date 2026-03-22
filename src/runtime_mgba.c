@@ -217,9 +217,11 @@ static void advance_hardware(int cycles) {
 /* ---- Memory Bus (delegates to mGBA) ---- */
 
 static u32 io_read32_count = 0;
+bool skip_advance = false; /* Set during interception to avoid timing disruption */
+
 u32 bus_read32(u32 addr) {
     bus_access_count++;
-    advance_hardware(4);
+    if (!skip_advance) advance_hardware(4);
 
     /* Log first reads in recomp mode (excluding IRQ handler) */
     if (recomp_mode && !in_irq && ++io_read32_count <= 20) {
@@ -232,7 +234,7 @@ u32 bus_read32(u32 addr) {
 
 u16 bus_read16(u32 addr) {
     bus_access_count++;
-    advance_hardware(2);
+    if (!skip_advance) advance_hardware(2);
     u16 val = (u16)core->busRead16(core, addr);
 
     /* When recompiled code polls DISPSTAT, advance extra cycles per read
@@ -258,20 +260,20 @@ u16 bus_read16(u32 addr) {
 
 u8 bus_read8(u32 addr) {
     bus_access_count++;
-    advance_hardware(2);
+    if (!skip_advance) advance_hardware(2);
     return (u8)core->busRead8(core, addr);
 }
 
 void bus_write32(u32 addr, u32 value) {
     bus_access_count++;
-    advance_hardware(4);
+    if (!skip_advance) advance_hardware(4);
     core->busWrite32(core, addr, value);
 }
 
 static int bldy_write_count = 0;
 void bus_write16(u32 addr, u16 value) {
     bus_access_count++;
-    advance_hardware(2);
+    if (!skip_advance) advance_hardware(2);
     core->busWrite16(core, addr, value);
 
     /* Track BLDY writes */
@@ -283,7 +285,7 @@ void bus_write16(u32 addr, u16 value) {
 
 void bus_write8(u32 addr, u8 value) {
     bus_access_count++;
-    advance_hardware(2);
+    if (!skip_advance) advance_hardware(2);
     core->busWrite8(core, addr, value);
 }
 
@@ -935,10 +937,15 @@ void gba_init(const char* rom_path) {
             }
 
             /* Activate interception after init completes */
-            /* Interception disabled until systematic memory-level verification
-             * is complete. The hook mechanism works but every intercepted function
-             * causes the display to freeze due to memory write differences.
-             * Game plays perfectly via mGBA CPU. */
+            /* Enable interception with timing-safe bus access */
+            if (!interception_active && unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
+                extern void interception_setup_from_bx_table(void);
+                interception_setup_from_bx_table();
+                interception_active = true;
+                recomp_mode = true;
+                fprintf(stderr, "[runtime] Interception active (timing-safe) at frame %d\n", init_frames);
+                fflush(stderr);
+            }
             prev_dispcnt = dispcnt;
         }
         fprintf(stderr, "[init] mGBA CPU ran %d frames\n", init_frames);

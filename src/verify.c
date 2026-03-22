@@ -119,6 +119,62 @@ static bool compare_states(const CpuState* expected, const CpuState* got,
     return match;
 }
 
+/* ---- Memory Snapshot ---- */
+
+/* Key memory regions to compare after function execution */
+#define IO_SNAPSHOT_SIZE   0x200  /* First 512 bytes of IO (display, sound, DMA) */
+#define PAL_SNAPSHOT_SIZE  0x400  /* Full palette (1KB) */
+
+typedef struct {
+    u8 io[IO_SNAPSHOT_SIZE];
+    u8 palette[PAL_SNAPSHOT_SIZE];
+} MemSnapshot;
+
+static void capture_mem_snapshot(MemSnapshot* snap) {
+    struct mCore* core = get_mgba_core();
+    /* Read IO registers directly from mGBA */
+    struct GBA* gba = get_mgba_gba();
+    memcpy(snap->io, gba->memory.io, IO_SNAPSHOT_SIZE);
+
+    /* Read palette from mGBA */
+    memcpy(snap->palette, gba->video.palette, PAL_SNAPSHOT_SIZE);
+}
+
+static bool compare_mem_snapshots(const MemSnapshot* expected, const MemSnapshot* got,
+                                  u32 func_addr) {
+    bool match = true;
+
+    /* Compare IO registers */
+    for (int i = 0; i < IO_SNAPSHOT_SIZE; i += 2) {
+        u16 exp_val = expected->io[i] | (expected->io[i+1] << 8);
+        u16 got_val = got->io[i] | (got->io[i+1] << 8);
+        if (exp_val != got_val) {
+            if (match) {
+                fprintf(stderr, "  [MEM] IO[0x%03X]: mGBA=0x%04X recomp=0x%04X\n",
+                        i, exp_val, got_val);
+                fflush(stderr);
+            }
+            match = false;
+        }
+    }
+
+    /* Compare palette */
+    for (int i = 0; i < PAL_SNAPSHOT_SIZE; i += 2) {
+        u16 exp_val = expected->palette[i] | (expected->palette[i+1] << 8);
+        u16 got_val = got->palette[i] | (got->palette[i+1] << 8);
+        if (exp_val != got_val) {
+            if (match) {
+                fprintf(stderr, "  [MEM] PAL[0x%03X]: mGBA=0x%04X recomp=0x%04X\n",
+                        i, exp_val, got_val);
+                fflush(stderr);
+            }
+            match = false;
+        }
+    }
+
+    return match;
+}
+
 /* ---- Verification Hook ---- */
 
 /* Max functions to track */
@@ -150,15 +206,16 @@ bool verify_hook(struct ARMCore* cpu, RecompFunc func, u32 func_addr) {
     /* Only verify occasionally to avoid massive slowdown */
     FuncVerifyResult* res = get_result(func_addr);
     if (!res) return false;
-    if (res->tests > 0 && res->fails == 0) return false; /* Already verified OK */
-    if (res->tests >= 5) return false; /* Tested enough */
+    if (res->tests >= 3) return false; /* Test each function up to 3 times */
 
     total_tests++;
     res->tests++;
 
-    /* 1. Capture input state */
+    /* 1. Capture input state (registers + memory) */
     CpuState input;
     capture_mgba_state(cpu, &input);
+    MemSnapshot mem_before;
+    capture_mem_snapshot(&mem_before);
 
     /* 2. Run recompiled C function */
     restore_recomp_state(&input);
@@ -176,9 +233,17 @@ bool verify_hook(struct ARMCore* cpu, RecompFunc func, u32 func_addr) {
 
     CpuState recomp_output;
     capture_recomp_state(&recomp_output);
+    MemSnapshot mem_after_recomp;
+    capture_mem_snapshot(&mem_after_recomp);
 
-    /* 3. Restore input and run mGBA interpreter */
+    /* 3. Restore input state AND memory, then run mGBA interpreter */
     restore_mgba_state(cpu, &input);
+    /* Restore memory to pre-function state */
+    {
+        struct GBA* gba = get_mgba_gba();
+        memcpy(gba->memory.io, mem_before.io, IO_SNAPSHOT_SIZE);
+        memcpy(gba->video.palette, mem_before.palette, PAL_SNAPSHOT_SIZE);
+    }
 
     /* Step mGBA until function returns (PC leaves this function) */
     int steps = 0;
@@ -199,9 +264,13 @@ bool verify_hook(struct ARMCore* cpu, RecompFunc func, u32 func_addr) {
 
     CpuState mgba_output;
     capture_mgba_state(cpu, &mgba_output);
+    MemSnapshot mem_after_mgba;
+    capture_mem_snapshot(&mem_after_mgba);
 
-    /* 4. Compare */
-    bool match = compare_states(&mgba_output, &recomp_output, func_addr, res);
+    /* 4. Compare registers AND memory */
+    bool reg_match = compare_states(&mgba_output, &recomp_output, func_addr, res);
+    bool mem_match = compare_mem_snapshots(&mem_after_mgba, &mem_after_recomp, func_addr);
+    bool match = reg_match && mem_match;
 
     if (match) {
         res->passes++;
@@ -211,7 +280,10 @@ bool verify_hook(struct ARMCore* cpu, RecompFunc func, u32 func_addr) {
         total_fails++;
 
         if (total_fails <= 20) {
-            fprintf(stderr, "\n[VERIFY FAIL] func_0x%08X (test #%d)\n", func_addr, res->tests);
+            fprintf(stderr, "\n[VERIFY FAIL] func_0x%08X (test #%d) %s%s\n",
+                    func_addr, res->tests,
+                    !reg_match ? "REGS " : "",
+                    !mem_match ? "MEMORY" : "");
             fprintf(stderr, "  Diverged at: %s\n",
                     res->first_fail_reg < 16 ?
                     (res->first_fail_reg == 13 ? "SP (r13)" :

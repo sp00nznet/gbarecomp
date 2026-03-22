@@ -102,9 +102,13 @@ static bool recomp_hook(struct ARMCore* cpu) {
     /* Sync mGBA -> recompiled */
     sync_from_mgba(cpu);
 
-    /* Disable IRQ delivery during interception */
+    /* Disable IRQ delivery and timing advance during interception.
+     * Timing must only advance via ThumbStep/ARMStep, not via our
+     * bus_read/write calls, or DISPSTAT gets corrupted. */
     bool saved_irq = in_irq;
     in_irq = true;
+    extern bool skip_advance;
+    skip_advance = true;
 
     /* Save state for crash recovery */
     u32 saved_gprs[16];
@@ -123,6 +127,7 @@ static bool recomp_hook(struct ARMCore* cpu) {
 #endif
 
     in_irq = saved_irq;
+    skip_advance = false;
 
     if (crashed) {
         /* Restore state and let mGBA interpret this function */
