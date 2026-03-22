@@ -1533,16 +1533,17 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "void interception_setup_from_bx_table(void) {\n");
         fprintf(f, "    /* Reuse the BX table for interception - only ROM functions */\n");
         fprintf(f, "    static FuncEntry intercept_table[] = {\n");
+        int rom_func_count = 0;
         for (int i = 0; i < analysis->num_functions; i++) {
             u32 entry = analysis->functions[i].entry;
             /* Only intercept ROM functions (not IWRAM) */
             if ((entry >> 24) == 0x08) {
                 fprintf(f, "        { 0x%08Xu, func_%08X },\n", entry, entry);
+                rom_func_count++;
             }
         }
         fprintf(f, "    };\n");
-        fprintf(f, "    interception_init(intercept_table, %d);\n",
-                analysis->num_functions); /* approximate - some are IWRAM */
+        fprintf(f, "    interception_init(intercept_table, %d);\n", rom_func_count);
         fprintf(f, "}\n\n");
 
         /* Add main() - after mGBA init, call the main game function directly */

@@ -217,11 +217,21 @@ static void advance_hardware(int cycles) {
 /* ---- Memory Bus (delegates to mGBA) ---- */
 
 static u32 io_read32_count = 0;
-bool skip_advance = false; /* Set during interception to avoid timing disruption */
+
+/* During interception, we must NOT call advance_hardware (which calls
+ * processEvents). processEvents can fire mGBA-internal IRQs that corrupt
+ * CPU state while our recompiled function is running. Instead, we
+ * accumulate cycles and apply them after the function returns. */
+bool intercepting = false; /* Set by interception.c during function execution */
+u32 intercepted_cycles = 0; /* Accumulated bus cycles during interception */
 
 u32 bus_read32(u32 addr) {
     bus_access_count++;
-    if (!skip_advance) advance_hardware(4);
+    if (intercepting) {
+        intercepted_cycles += 4;
+    } else {
+        advance_hardware(4);
+    }
 
     /* Log first reads in recomp mode (excluding IRQ handler) */
     if (recomp_mode && !in_irq && ++io_read32_count <= 20) {
@@ -234,12 +244,16 @@ u32 bus_read32(u32 addr) {
 
 u16 bus_read16(u32 addr) {
     bus_access_count++;
-    if (!skip_advance) advance_hardware(2);
+    if (intercepting) {
+        intercepted_cycles += 2;
+    } else {
+        advance_hardware(2);
+    }
     u16 val = (u16)core->busRead16(core, addr);
 
     /* When recompiled code polls DISPSTAT, advance extra cycles per read
      * to speed things up without skipping scanline rendering. */
-    if (recomp_mode && addr == 0x04000004) {
+    if (!intercepting && recomp_mode && addr == 0x04000004) {
         advance_hardware(16);
         val = (u16)core->busRead16(core, addr); /* Re-read after advance */
 
@@ -260,20 +274,32 @@ u16 bus_read16(u32 addr) {
 
 u8 bus_read8(u32 addr) {
     bus_access_count++;
-    if (!skip_advance) advance_hardware(2);
+    if (intercepting) {
+        intercepted_cycles += 2;
+    } else {
+        advance_hardware(2);
+    }
     return (u8)core->busRead8(core, addr);
 }
 
 void bus_write32(u32 addr, u32 value) {
     bus_access_count++;
-    if (!skip_advance) advance_hardware(4);
+    if (intercepting) {
+        intercepted_cycles += 4;
+    } else {
+        advance_hardware(4);
+    }
     core->busWrite32(core, addr, value);
 }
 
 static int bldy_write_count = 0;
 void bus_write16(u32 addr, u16 value) {
     bus_access_count++;
-    if (!skip_advance) advance_hardware(2);
+    if (intercepting) {
+        intercepted_cycles += 2;
+    } else {
+        advance_hardware(2);
+    }
     core->busWrite16(core, addr, value);
 
     /* Track BLDY writes */
@@ -285,7 +311,11 @@ void bus_write16(u32 addr, u16 value) {
 
 void bus_write8(u32 addr, u8 value) {
     bus_access_count++;
-    if (!skip_advance) advance_hardware(2);
+    if (intercepting) {
+        intercepted_cycles += 2;
+    } else {
+        advance_hardware(2);
+    }
     core->busWrite8(core, addr, value);
 }
 
@@ -936,15 +966,17 @@ void gba_init(const char* rom_path) {
                 }
             }
 
-            /* Activate interception after init completes */
-            /* Enable interception with timing-safe bus access */
+            /* Activate interception after init completes.
+             * Fixed bugs that prevented this from working:
+             * 1. PC pipeline offset: gprs[15] is +2 (Thumb) ahead of actual PC
+             * 2. Table size: was passing total func count instead of ROM-only count
+             * 3. Timing: skip_advance prevented all events; now bus ops advance normally
+             * 4. Cycle cost: was flat 50; now tracks actual bus cycles + small base */
             if (!interception_active && unique >= 6 && ie != 0 && ime != 0 && init_frames > 50) {
                 extern void interception_setup_from_bx_table(void);
                 interception_setup_from_bx_table();
                 interception_active = true;
                 recomp_mode = true;
-                fprintf(stderr, "[runtime] Interception active (timing-safe) at frame %d\n", init_frames);
-                fflush(stderr);
             }
             prev_dispcnt = dispcnt;
         }

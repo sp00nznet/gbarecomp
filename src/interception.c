@@ -86,14 +86,27 @@ static RecompFunc lookup_function(u32 addr) {
 /* ---- Recomp Hook (called from ARMRunLoop) ---- */
 
 /* This function is called before EVERY instruction when PC is in ROM.
- * It must be FAST for the common case (no match = return false). */
+ * It must be FAST for the common case (no match = return false).
+ *
+ * CRITICAL: At the hook point, gprs[15] is 2 ahead of the instruction
+ * about to execute (Thumb pipeline: prefetch[0] = instr at gprs[15]-2).
+ * We must subtract the pipeline offset before looking up the function. */
 static bool recomp_hook(struct ARMCore* cpu) {
     if (!interception_enabled) return false;
 
-    u32 pc = cpu->gprs[15];
+    /* Compute actual instruction address from pipeline PC.
+     * In Thumb mode: gprs[15] = instruction_addr + 2
+     * In ARM mode:   gprs[15] = instruction_addr + 4 */
+    u32 pipeline_pc = cpu->gprs[15];
+    u32 actual_pc;
+    if (cpu->executionMode == MODE_THUMB) {
+        actual_pc = pipeline_pc - WORD_SIZE_THUMB; /* -2 */
+    } else {
+        actual_pc = pipeline_pc - WORD_SIZE_ARM;   /* -4 */
+    }
 
-    /* Binary search lookup */
-    RecompFunc func = lookup_function(pc);
+    /* Binary search lookup using actual instruction address */
+    RecompFunc func = lookup_function(actual_pc);
     if (!func) return false;
 
     /* Normal interception mode */
@@ -102,17 +115,20 @@ static bool recomp_hook(struct ARMCore* cpu) {
     /* Sync mGBA -> recompiled */
     sync_from_mgba(cpu);
 
-    /* Disable IRQ delivery and timing advance during interception.
-     * Timing must only advance via ThumbStep/ARMStep, not via our
-     * bus_read/write calls, or DISPSTAT gets corrupted. */
+    /* Prevent IRQ delivery and timing events during interception.
+     * processEvents can fire mGBA-internal IRQs that corrupt CPU state.
+     * Bus operations accumulate cycles in intercepted_cycles instead. */
     bool saved_irq = in_irq;
     in_irq = true;
-    extern bool skip_advance;
-    skip_advance = true;
+    extern bool intercepting;
+    extern u32 intercepted_cycles;
+    intercepting = true;
+    intercepted_cycles = 0;
 
     /* Save state for crash recovery */
     u32 saved_gprs[16];
     memcpy(saved_gprs, cpu->gprs, sizeof(saved_gprs));
+    u32 saved_cycles = cpu->cycles;
 
     /* Execute the recompiled C function */
     bool crashed = false;
@@ -126,56 +142,70 @@ static bool recomp_hook(struct ARMCore* cpu) {
     }
 #endif
 
+    intercepting = false;
     in_irq = saved_irq;
-    skip_advance = false;
 
     if (crashed) {
         /* Restore state and let mGBA interpret this function */
         memcpy(cpu->gprs, saved_gprs, sizeof(saved_gprs));
+        cpu->cycles = saved_cycles;
         failed++;
         if (failed <= 20) {
             fprintf(stderr, "[recomp] CRASH at 0x%08X (%d ok, %d fail)\n",
-                    pc, successful, failed);
+                    actual_pc, successful, failed);
             fflush(stderr);
         }
         return false; /* Let mGBA interpret it */
     }
 
-    /* Fix return PC */
+    /* Fix return PC: if the function didn't explicitly set PC,
+     * it returned via BX LR so use LR as the return address. */
     if (r[15] == saved_gprs[15]) {
         r[15] = r[14]; /* BX LR return: use LR */
+    }
+
+    u32 ret_addr = r[15] & ~1u;
+
+    /* Validate return address before pipeline refill */
+    u32 region = ret_addr >> 24;
+    if (region != 0x08 && region != 0x03 && region != 0x02 && region != 0x00) {
+        /* Bad return address - fall back to interpreter */
+        memcpy(cpu->gprs, saved_gprs, sizeof(saved_gprs));
+        cpu->cycles = saved_cycles;
+        failed++;
+        if (failed <= 20) {
+            fprintf(stderr, "[recomp] BAD RETURN 0x%08X from 0x%08X (r14=0x%08X, r15=0x%08X) (%d ok, %d fail)\n",
+                    ret_addr, actual_pc, r[14], r[15], successful, failed);
+            fflush(stderr);
+        }
+        return false;
     }
 
     /* Sync back to mGBA */
     sync_to_mgba(cpu);
 
     /* Refill the instruction pipeline at the return address.
-     * Without this, mGBA reads stale prefetch data on the next ThumbStep. */
+     * ThumbWritePC sets: prefetch[0]=instr@PC, prefetch[1]=instr@PC+2,
+     * gprs[15]=PC+2. This matches how mGBA expects the pipeline. */
     {
-        u32 ret_pc = cpu->gprs[15] & ~1u;
-        cpu->gprs[15] = ret_pc;
-
-        /* Use ThumbStep to naturally advance from the return address.
-         * This properly fills the pipeline and advances cycles. */
-        /* Actually - just run ONE ThumbStep at the return address
-         * to refill the pipeline, then return false so the loop
-         * calls ThumbStep again normally. */
-
-        /* Set up the pipeline for the return address */
-        cpu->memory.setActiveRegion(cpu, ret_pc);
-        cpu->prefetch[0] = cpu->memory.load16(cpu, ret_pc, NULL);
-        cpu->prefetch[1] = cpu->memory.load16(cpu, ret_pc + 2, NULL);
-        cpu->gprs[15] = ret_pc + WORD_SIZE_THUMB;
+        cpu->gprs[15] = ret_addr;
+        cpu->memory.setActiveRegion(cpu, ret_addr);
+        cpu->prefetch[0] = cpu->memory.load16(cpu, ret_addr, NULL);
+        cpu->prefetch[1] = cpu->memory.load16(cpu, ret_addr + 2, NULL);
+        cpu->gprs[15] = ret_addr + WORD_SIZE_THUMB;
     }
 
-    /* Add cycles for the intercepted function */
-    cpu->cycles += 50;
+    /* Cycle accounting: bus operations accumulated cycles in intercepted_cycles
+     * (without calling processEvents). Add those plus a base cost for
+     * non-memory instructions (ALU ops, branches, etc). */
+    u32 total_cost = intercepted_cycles + 10; /* bus cycles + ALU base cost */
+    cpu->cycles += total_cost;
 
     successful++;
 
     if (intercept_count <= 20 || intercept_count % 5000 == 0) {
-        fprintf(stderr, "[recomp #%d] 0x%08X native (%d ok, %d fail)\n",
-                intercept_count, pc, successful, failed);
+        fprintf(stderr, "[recomp #%d] 0x%08X native (%d ok, %d fail) +%u cyc (bus=%u)\n",
+                intercept_count, actual_pc, successful, failed, total_cost, intercepted_cycles);
         fflush(stderr);
     }
 
