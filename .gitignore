@@ -33,3 +33,5 @@ desktop.ini
 # Dependencies
 deps/
 external/
+imgui.ini
+src/imgui.ini
