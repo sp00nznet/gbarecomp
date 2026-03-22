@@ -149,7 +149,26 @@ static bool recomp_hook(struct ARMCore* cpu) {
     /* Sync back to mGBA */
     sync_to_mgba(cpu);
 
-    /* Add estimated cycles. Use bus_access_count delta as proxy. */
+    /* Refill the instruction pipeline at the return address.
+     * Without this, mGBA reads stale prefetch data on the next ThumbStep. */
+    {
+        u32 ret_pc = cpu->gprs[15] & ~1u;
+        cpu->gprs[15] = ret_pc;
+
+        /* Use ThumbStep to naturally advance from the return address.
+         * This properly fills the pipeline and advances cycles. */
+        /* Actually - just run ONE ThumbStep at the return address
+         * to refill the pipeline, then return false so the loop
+         * calls ThumbStep again normally. */
+
+        /* Set up the pipeline for the return address */
+        cpu->memory.setActiveRegion(cpu, ret_pc);
+        cpu->prefetch[0] = cpu->memory.load16(cpu, ret_pc, NULL);
+        cpu->prefetch[1] = cpu->memory.load16(cpu, ret_pc + 2, NULL);
+        cpu->gprs[15] = ret_pc + WORD_SIZE_THUMB;
+    }
+
+    /* Add cycles for the intercepted function */
     cpu->cycles += 50;
 
     successful++;
