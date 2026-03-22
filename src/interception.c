@@ -92,13 +92,8 @@ static bool recomp_hook(struct ARMCore* cpu) {
 
     u32 pc = cpu->gprs[15];
 
-    /* O(1) direct table lookup */
-    if (!direct_table) return false;
-    u32 pc_clean = pc & ~1u;
-    if (pc_clean < 0x08000000) return false;
-    u32 idx = (pc_clean - 0x08000000) >> 1;
-    if (idx >= DIRECT_TABLE_SIZE) return false;
-    RecompFunc func = direct_table[idx];
+    /* Binary search lookup */
+    RecompFunc func = lookup_function(pc);
     if (!func) return false;
 
     /* Normal interception mode */
@@ -172,22 +167,6 @@ void interception_init(FuncEntry* table, int size) {
     intercept_count = 0;
     successful = 0;
     failed = 0;
-
-    /* Build direct lookup table for O(1) function lookup */
-    direct_table = (RecompFunc*)calloc(DIRECT_TABLE_SIZE, sizeof(RecompFunc));
-    if (direct_table) {
-        int mapped = 0;
-        for (int i = 0; i < size; i++) {
-            u32 addr = table[i].addr & ~1u;
-            if (addr >= 0x08000000 && addr < 0x08000000 + DIRECT_TABLE_SIZE * 2) {
-                u32 idx = (addr - 0x08000000) >> 1;
-                direct_table[idx] = table[i].func;
-                mapped++;
-            }
-        }
-        fprintf(stderr, "[recomp] Direct table: %d functions mapped (%zuMB)\n",
-                mapped, (DIRECT_TABLE_SIZE * sizeof(RecompFunc)) / (1024*1024));
-    }
 
     /* Install the hook into mGBA's ARMRunLoop */
     ARMSetRecompHook(recomp_hook);
