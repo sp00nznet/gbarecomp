@@ -1199,18 +1199,398 @@ void gba_swi(u32 number) {
 
 /* ---- IWRAM Code Execution ---- */
 
-/* For RAM-targeted BX calls where no recompiled function exists.
- * In a true static recomp, all known IWRAM functions are pre-compiled.
- * This stub handles the rare case of truly dynamic code. */
+/* Mini Thumb interpreter for RAM code execution.
+ * Games copy small routines to IWRAM/EWRAM (crt0 init, decompression,
+ * DMA helpers). Rather than requiring all RAM code to be pre-compiled,
+ * we interpret it on the fly. This covers the common case of init code
+ * that the recompiled ROM functions call via BX to RAM addresses. */
 void run_iwram_function(u32 target) {
-    static int warn_count = 0;
-    if (++warn_count <= 10) {
-        fprintf(stderr, "[runtime] IWRAM call 0x%08X not in function table (warn %d/10)\n",
-                target, warn_count);
+    static int call_count = 0;
+    call_count++;
+    if (call_count <= 20) {
+        /* Show first few bytes at target to verify code was copied */
+        u32 peek_addr = target & ~1u;
+        fprintf(stderr, "[interp] Running RAM code at 0x%08X (bytes: %02X %02X %02X %02X) LR=0x%08X\n",
+                target, bus_read8(peek_addr), bus_read8(peek_addr+1),
+                bus_read8(peek_addr+2), bus_read8(peek_addr+3), r[14]);
         fflush(stderr);
     }
-    /* Set r[15] so the caller knows we "returned" */
-    r[15] = r[14];
+
+    bool thumb = (target & 1) != 0;
+    u32 pc = target & ~1u;
+    u32 saved_lr = r[14];
+
+    /* Set LR to a sentinel so we know when to stop */
+    u32 return_sentinel = 0xDEAD0000;
+    r[14] = return_sentinel | 1; /* Thumb return address */
+
+    int steps = 0;
+    int max_steps = 500000;
+
+    while (steps < max_steps) {
+        steps++;
+
+        if (!thumb) {
+            /* ARM mode - not common for RAM code, but handle BX back */
+            u32 insn = bus_read32(pc);
+            pc += 4;
+
+            /* Only handle BX LR (return) for now */
+            if ((insn & 0x0FFFFFF0) == 0x012FFF10) {
+                u32 rm = insn & 0xF;
+                u32 addr = r[rm];
+                if ((addr & ~1u) == (return_sentinel & ~1u)) break;
+                thumb = (addr & 1) != 0;
+                pc = addr & ~1u;
+                continue;
+            }
+            /* Unknown ARM instruction in RAM - bail */
+            break;
+        }
+
+        /* Thumb mode interpreter */
+        u16 insn = bus_read16(pc);
+        pc += 2;
+
+        /* Format 1: Move shifted register - LSL/LSR/ASR Rd, Rs, #Offset5 */
+        if ((insn & 0xE000) == 0x0000) {
+            int op = (insn >> 11) & 3;
+            u32 offset = (insn >> 6) & 0x1F;
+            int rs = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 val = r[rs];
+            switch (op) {
+            case 0: /* LSL */
+                if (offset > 0) { CPU_C = (val >> (32 - offset)) & 1; val <<= offset; }
+                break;
+            case 1: /* LSR */
+                if (offset == 0) offset = 32;
+                CPU_C = (val >> (offset - 1)) & 1;
+                val = offset >= 32 ? 0 : val >> offset;
+                break;
+            case 2: /* ASR */
+                if (offset == 0) offset = 32;
+                CPU_C = ((s32)val >> (offset > 31 ? 31 : offset - 1)) & 1;
+                val = (u32)((s32)val >> (offset > 31 ? 31 : offset));
+                break;
+            }
+            r[rd] = val;
+            cpu_update_nz(val);
+            continue;
+        }
+
+        /* Format 2: Add/Sub */
+        if ((insn & 0xF800) == 0x1800) {
+            int i = (insn >> 10) & 1;
+            int op = (insn >> 9) & 1;
+            u32 rn_or_imm = (insn >> 6) & 7;
+            int rs = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 operand = i ? rn_or_imm : r[rn_or_imm];
+            if (op) cpu_sub(&r[rd], r[rs], operand, true);
+            else cpu_add(&r[rd], r[rs], operand, true);
+            continue;
+        }
+
+        /* Format 3: Mov/Cmp/Add/Sub immediate */
+        if ((insn & 0xE000) == 0x2000) {
+            int op = (insn >> 11) & 3;
+            int rd = (insn >> 8) & 7;
+            u32 imm = insn & 0xFF;
+            switch (op) {
+            case 0: r[rd] = imm; cpu_update_nz(imm); break;
+            case 1: cpu_sub(NULL, r[rd], imm, true); break;
+            case 2: cpu_add(&r[rd], r[rd], imm, true); break;
+            case 3: cpu_sub(&r[rd], r[rd], imm, true); break;
+            }
+            continue;
+        }
+
+        /* Format 4: ALU operations */
+        if ((insn & 0xFC00) == 0x4000) {
+            int op = (insn >> 6) & 0xF;
+            int rs = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 a = r[rd], b = r[rs], result;
+            switch (op) {
+            case 0x0: result = a & b; r[rd] = result; cpu_update_nz(result); break;
+            case 0x1: result = a ^ b; r[rd] = result; cpu_update_nz(result); break;
+            case 0x2: /* LSL */ {
+                u32 shift = b & 0xFF;
+                result = shift >= 32 ? 0 : a << shift;
+                if (shift > 0 && shift <= 32) CPU_C = (a >> (32 - shift)) & 1;
+                r[rd] = result; cpu_update_nz(result); break;
+            }
+            case 0x3: /* LSR */ {
+                u32 shift = b & 0xFF;
+                result = shift >= 32 ? 0 : a >> shift;
+                if (shift > 0 && shift <= 32) CPU_C = (a >> (shift - 1)) & 1;
+                r[rd] = result; cpu_update_nz(result); break;
+            }
+            case 0x4: /* ASR */ {
+                u32 shift = b & 0xFF;
+                result = shift >= 32 ? (u32)((s32)a >> 31) : (u32)((s32)a >> shift);
+                r[rd] = result; cpu_update_nz(result); break;
+            }
+            case 0x5: cpu_adc(&r[rd], a, b, true); break;
+            case 0x6: cpu_sbc(&r[rd], a, b, true); break;
+            case 0x7: /* ROR */ {
+                u32 shift = b & 0xFF;
+                if (shift == 0) { result = a; }
+                else { shift &= 31; result = shift ? (a >> shift) | (a << (32 - shift)) : a; CPU_C = (a >> 31) & 1; }
+                r[rd] = result; cpu_update_nz(result); break;
+            }
+            case 0x8: result = a & b; cpu_update_nz(result); break; /* TST */
+            case 0x9: cpu_sub(&r[rd], 0, b, true); break; /* NEG */
+            case 0xA: cpu_sub(NULL, a, b, true); break; /* CMP */
+            case 0xB: cpu_add(NULL, a, b, true); break; /* CMN */
+            case 0xC: result = a | b; r[rd] = result; cpu_update_nz(result); break;
+            case 0xD: result = (u32)((s32)a * (s32)b); r[rd] = result; cpu_update_nz(result); break;
+            case 0xE: result = a & ~b; r[rd] = result; cpu_update_nz(result); break;
+            case 0xF: result = ~b; r[rd] = result; cpu_update_nz(result); break;
+            }
+            continue;
+        }
+
+        /* Format 5: Hi register ops / BX */
+        if ((insn & 0xFC00) == 0x4400) {
+            int op = (insn >> 8) & 3;
+            int h1 = (insn >> 7) & 1;
+            int h2 = (insn >> 6) & 1;
+            int rs = ((insn >> 3) & 7) | (h2 << 3);
+            int rd = (insn & 7) | (h1 << 3);
+            u32 val = r[rs];
+            if (rs == 15) val = pc + 2;
+            switch (op) {
+            case 0: r[rd] = r[rd] + val; if (rd == 15) { pc = r[15] & ~1u; } break;
+            case 1: cpu_sub(NULL, r[rd], val, true); break;
+            case 2: r[rd] = val; if (rd == 15) { pc = r[15] & ~1u; } break;
+            case 3: /* BX */
+                if ((val & ~1u) == (return_sentinel & ~1u)) goto done;
+                /* Check if target is back in ROM - return to recompiled code */
+                if ((val >> 24) == 0x08) { r[15] = val; goto done; }
+                thumb = (val & 1) != 0;
+                pc = val & ~1u;
+                break;
+            }
+            continue;
+        }
+
+        /* Format 6: PC-relative load */
+        if ((insn & 0xF800) == 0x4800) {
+            int rd = (insn >> 8) & 7;
+            u32 offset = (insn & 0xFF) << 2;
+            u32 addr = ((pc + 2) & ~3u) + offset;
+            r[rd] = bus_read32(addr);
+            continue;
+        }
+
+        /* Format 7/8: Load/store register offset */
+        if ((insn & 0xF200) == 0x5000) {
+            int ro = (insn >> 6) & 7;
+            int rb = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 addr = r[rb] + r[ro];
+            int op = (insn >> 10) & 3;
+            switch (op) {
+            case 0: bus_write32(addr, r[rd]); break;        /* STR */
+            case 1: bus_write16(addr, (u16)r[rd]); break;   /* STRH */
+            case 2: r[rd] = bus_read32(addr); break;        /* LDR */
+            case 3: r[rd] = bus_read16(addr); break;        /* LDRH - zero extend */
+            }
+            continue;
+        }
+        if ((insn & 0xF200) == 0x5200) {
+            int ro = (insn >> 6) & 7;
+            int rb = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 addr = r[rb] + r[ro];
+            int op = (insn >> 10) & 3;
+            switch (op) {
+            case 0: bus_write8(addr, (u8)r[rd]); break;     /* STRB */
+            case 1: r[rd] = (u32)(s32)(s8)bus_read8(addr); break; /* LDSB */
+            case 2: r[rd] = bus_read8(addr); break;         /* LDRB */
+            case 3: r[rd] = (u32)(s32)(s16)bus_read16(addr); break; /* LDSH */
+            }
+            continue;
+        }
+
+        /* Format 9: Load/store immediate offset */
+        if ((insn & 0xE000) == 0x6000) {
+            int b = (insn >> 12) & 1;
+            int l = (insn >> 11) & 1;
+            u32 offset = (insn >> 6) & 0x1F;
+            int rb = (insn >> 3) & 7;
+            int rd = insn & 7;
+            if (b) { /* Byte */
+                u32 addr = r[rb] + offset;
+                if (l) r[rd] = bus_read8(addr);
+                else bus_write8(addr, (u8)r[rd]);
+            } else { /* Word */
+                u32 addr = r[rb] + (offset << 2);
+                if (l) r[rd] = bus_read32(addr);
+                else bus_write32(addr, r[rd]);
+            }
+            continue;
+        }
+
+        /* Format 10: Load/store halfword */
+        if ((insn & 0xF000) == 0x8000) {
+            int l = (insn >> 11) & 1;
+            u32 offset = ((insn >> 6) & 0x1F) << 1;
+            int rb = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 addr = r[rb] + offset;
+            if (l) r[rd] = bus_read16(addr);
+            else bus_write16(addr, (u16)r[rd]);
+            continue;
+        }
+
+        /* Format 11: SP-relative load/store */
+        if ((insn & 0xF000) == 0x9000) {
+            int l = (insn >> 11) & 1;
+            int rd = (insn >> 8) & 7;
+            u32 offset = (insn & 0xFF) << 2;
+            u32 addr = r[13] + offset;
+            if (l) r[rd] = bus_read32(addr);
+            else bus_write32(addr, r[rd]);
+            continue;
+        }
+
+        /* Format 12: Load address (ADD Rd, PC/SP, #imm) */
+        if ((insn & 0xF000) == 0xA000) {
+            int sp = (insn >> 11) & 1;
+            int rd = (insn >> 8) & 7;
+            u32 offset = (insn & 0xFF) << 2;
+            r[rd] = sp ? (r[13] + offset) : (((pc + 2) & ~3u) + offset);
+            continue;
+        }
+
+        /* Format 13: Add offset to SP */
+        if ((insn & 0xFF00) == 0xB000) {
+            u32 offset = (insn & 0x7F) << 2;
+            if (insn & 0x80) r[13] -= offset;
+            else r[13] += offset;
+            continue;
+        }
+
+        /* Format 14: Push/Pop */
+        if ((insn & 0xF600) == 0xB400) {
+            int l = (insn >> 11) & 1;
+            int pclr = (insn >> 8) & 1;
+            u8 rlist = insn & 0xFF;
+            if (l) { /* POP */
+                for (int i = 0; i < 8; i++) {
+                    if (rlist & (1 << i)) { r[i] = bus_read32(r[13]); r[13] += 4; }
+                }
+                if (pclr) {
+                    u32 val = bus_read32(r[13]); r[13] += 4;
+                    if ((val & ~1u) == (return_sentinel & ~1u)) goto done;
+                    if ((val >> 24) == 0x08) { r[15] = val; goto done; }
+                    thumb = (val & 1) != 0;
+                    pc = val & ~1u;
+                }
+            } else { /* PUSH */
+                if (pclr) { r[13] -= 4; bus_write32(r[13], r[14]); }
+                for (int i = 7; i >= 0; i--) {
+                    if (rlist & (1 << i)) { r[13] -= 4; bus_write32(r[13], r[i]); }
+                }
+            }
+            continue;
+        }
+
+        /* Format 15: Multiple load/store (LDMIA/STMIA) */
+        if ((insn & 0xF000) == 0xC000) {
+            int l = (insn >> 11) & 1;
+            int rb = (insn >> 8) & 7;
+            u8 rlist = insn & 0xFF;
+            u32 addr = r[rb];
+            for (int i = 0; i < 8; i++) {
+                if (rlist & (1 << i)) {
+                    if (l) r[i] = bus_read32(addr);
+                    else bus_write32(addr, r[i]);
+                    addr += 4;
+                }
+            }
+            r[rb] = addr;
+            continue;
+        }
+
+        /* Format 16: Conditional branch */
+        if ((insn & 0xF000) == 0xD000) {
+            int cond = (insn >> 8) & 0xF;
+            s32 offset = (s32)(s8)(insn & 0xFF) << 1;
+            bool take = false;
+            switch (cond) {
+            case 0x0: take = CPU_Z; break;
+            case 0x1: take = !CPU_Z; break;
+            case 0x2: take = CPU_C; break;
+            case 0x3: take = !CPU_C; break;
+            case 0x4: take = CPU_N; break;
+            case 0x5: take = !CPU_N; break;
+            case 0x6: take = CPU_V; break;
+            case 0x7: take = !CPU_V; break;
+            case 0x8: take = CPU_C && !CPU_Z; break;
+            case 0x9: take = !CPU_C || CPU_Z; break;
+            case 0xA: take = CPU_N == CPU_V; break;
+            case 0xB: take = CPU_N != CPU_V; break;
+            case 0xC: take = !CPU_Z && (CPU_N == CPU_V); break;
+            case 0xD: take = CPU_Z || (CPU_N != CPU_V); break;
+            case 0xF: /* SWI */
+                gba_swi(insn & 0xFF);
+                take = false;
+                break;
+            }
+            if (take) pc = (u32)((s32)pc + offset + 2);
+            continue;
+        }
+
+        /* Format 17: SWI */
+        if ((insn & 0xFF00) == 0xDF00) {
+            gba_swi(insn & 0xFF);
+            continue;
+        }
+
+        /* Format 18: Unconditional branch */
+        if ((insn & 0xF800) == 0xE000) {
+            s32 offset = (s32)(insn << 21) >> 20;
+            pc = (u32)((s32)pc + offset + 2);
+            continue;
+        }
+
+        /* Format 19: Long branch with link (BL) */
+        if ((insn & 0xF800) == 0xF000) {
+            u16 insn2 = bus_read16(pc);
+            pc += 2;
+            if ((insn2 & 0xF800) == 0xF800) {
+                s32 off_hi = (s32)((insn & 0x07FF) << 21) >> 9;
+                s32 off_lo = (insn2 & 0x07FF) << 1;
+                u32 bl_target = (u32)((s32)pc + off_hi + off_lo);
+                r[14] = pc | 1;
+
+                /* If BL target is in ROM, dispatch to recompiled code */
+                if ((bl_target >> 24) == 0x08) {
+                    cpu_bx(bl_target | 1);
+                    /* After BX returns, continue interpreting */
+                } else {
+                    /* BL to another RAM address - just update PC */
+                    pc = bl_target;
+                }
+            }
+            continue;
+        }
+
+        /* Unhandled instruction */
+        fprintf(stderr, "[interp] Unknown Thumb insn 0x%04X at 0x%08X\n", insn, pc - 2);
+        break;
+    }
+
+done:
+    if (steps >= max_steps) {
+        fprintf(stderr, "[interp] RAM code at 0x%08X hit step limit (%d steps)\n", target, steps);
+    } else if (call_count <= 20) {
+        fprintf(stderr, "[interp] RAM code at 0x%08X completed in %d steps\n", target, steps);
+    }
 }
 
 /* ---- BX Dispatch Tracing ---- */
