@@ -1208,11 +1208,13 @@ void run_iwram_function(u32 target) {
     static int call_count = 0;
     call_count++;
     if (call_count <= 20) {
-        /* Show first few bytes at target to verify code was copied */
         u32 peek_addr = target & ~1u;
-        fprintf(stderr, "[interp] Running RAM code at 0x%08X (bytes: %02X %02X %02X %02X) LR=0x%08X\n",
+        fprintf(stderr, "[interp] Running RAM code at 0x%08X (bytes: %02X %02X %02X %02X) LR=0x%08X SP=0x%08X\n",
                 target, bus_read8(peek_addr), bus_read8(peek_addr+1),
-                bus_read8(peek_addr+2), bus_read8(peek_addr+3), r[14]);
+                bus_read8(peek_addr+2), bus_read8(peek_addr+3), r[14], r[13]);
+        /* Show stack for backtrace */
+        fprintf(stderr, "         Stack: [SP]=0x%08X [SP+4]=0x%08X [SP+8]=0x%08X [SP+12]=0x%08X\n",
+                bus_read32(r[13]), bus_read32(r[13]+4), bus_read32(r[13]+8), bus_read32(r[13]+12));
         fflush(stderr);
     }
 
