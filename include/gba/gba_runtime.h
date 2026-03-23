@@ -164,7 +164,7 @@ void gba_swi(u32 number);
 /* Indirect branch (BX to register value) - runtime dispatch */
 void cpu_bx(u32 target);
 
-/* Run a function in IWRAM/EWRAM via mGBA's interpreter fallback */
+/* Run a function in IWRAM/EWRAM (pre-compiled or stub fallback) */
 void run_iwram_function(u32 target);
 
 /* Undefined instruction trap */

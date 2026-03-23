@@ -1,11 +1,17 @@
 /*
- * GBA Runtime Library - Standalone Implementation
+ * GBA Runtime Library - Static Recompilation Runtime
  *
- * Provides memory bus, CPU state, and basic hardware emulation
- * for statically recompiled GBA games.
+ * This is the standalone runtime for statically recompiled GBA games.
+ * No emulator runs underneath - recompiled C code IS the CPU.
+ * Memory is flat arrays, I/O writes dispatch to lightweight hardware modules.
  *
- * This is the minimal standalone runtime. For full accuracy,
- * replace with libmgba integration.
+ * Hardware provided:
+ *   - Flat memory bus (EWRAM, IWRAM, VRAM, Palette, OAM, ROM, SRAM)
+ *   - 4 hardware timers with prescaler and cascade
+ *   - 4-channel DMA with immediate, VBlank, and HBlank triggers
+ *   - Scanline-based timing (VCOUNT, DISPSTAT, HBlank/VBlank flags)
+ *   - Interrupt delivery (IE/IF/IME -> handler at [0x03007FFC])
+ *   - BIOS HLE (SWI implementations for Div, Sqrt, CpuSet, etc.)
  */
 
 #include "gba/gba_runtime.h"
@@ -27,7 +33,6 @@ static u32 spsr = 0;
 
 /* ---- Memory ---- */
 
-/* GBA memory regions */
 static u8* bios_mem  = NULL;  /* 16KB */
 static u8* ewram     = NULL;  /* 256KB */
 static u8* iwram     = NULL;  /* 32KB */
@@ -39,202 +44,470 @@ static u8* rom_data  = NULL;  /* Up to 32MB */
 static u32 rom_size  = 0;
 static u8* sram      = NULL;  /* 64KB */
 
+/* Save file path for SRAM persistence */
+static char sram_path[512] = {0};
+
+/* ---- I/O Register Helpers ---- */
+
+static inline u16 io_read16(u32 offset) {
+    return (u16)io_regs[offset] | ((u16)io_regs[offset + 1] << 8);
+}
+
+static inline void io_write16(u32 offset, u16 val) {
+    io_regs[offset]     = (u8)(val);
+    io_regs[offset + 1] = (u8)(val >> 8);
+}
+
+static inline u32 io_read32(u32 offset) {
+    return io_regs[offset] | (io_regs[offset+1] << 8) |
+           (io_regs[offset+2] << 16) | (io_regs[offset+3] << 24);
+}
+
+static inline void io_write32(u32 offset, u32 val) {
+    io_regs[offset]   = (u8)(val);
+    io_regs[offset+1] = (u8)(val >> 8);
+    io_regs[offset+2] = (u8)(val >> 16);
+    io_regs[offset+3] = (u8)(val >> 24);
+}
+
 /* ---- Hardware Timing ---- */
 
-static u32 cycle_counter = 0;   /* Approximate cycle counter */
-static u32 scanline = 0;        /* Current VCOUNT (0-227) */
+static u32 cycle_counter = 0;
+static u32 scanline = 0;          /* Current VCOUNT (0-227) */
 static u32 frame_count = 0;
+static u32 scanline_cycles = 0;   /* Cycles within current scanline */
 static u32 last_poll_cycle = 0;
 
-#define CYCLES_PER_SCANLINE  1232  /* ~1232 cycles per scanline */
-#define SCANLINES_PER_FRAME  228   /* 160 visible + 68 VBlank */
+#define CYCLES_PER_SCANLINE  1232
+#define VISIBLE_SCANLINES    160
+#define VBLANK_SCANLINES     68
+#define SCANLINES_PER_FRAME  228
 #define CYCLES_PER_FRAME     (CYCLES_PER_SCANLINE * SCANLINES_PER_FRAME)
-#define POLL_INTERVAL        10000 /* Poll SDL events every N cycles */
+#define HBLANK_START_CYCLE   960   /* HBlank starts ~960 cycles into scanline */
+#define POLL_INTERVAL        10000
 
-/* Advance the hardware cycle counter. Called periodically from bus access. */
+/* ---- Forward Declarations ---- */
+
+static void timer_tick(u32 cycles);
+static void dma_execute(int channel);
+static void dma_trigger_vblank(void);
+static void dma_trigger_hblank(void);
+static void check_interrupts(void);
+static void io_write_hook(u32 offset, u32 value, int size);
+
+/* ---- Timer Hardware ---- */
+
+/* GBA has 4 hardware timers (TM0-TM3).
+ * Each has a 16-bit counter, reload value, and control register.
+ * Timers can cascade (increment when the previous timer overflows). */
+
+static const u16 timer_prescaler_shift[4] = { 0, 6, 8, 10 };
+/* Prescaler 0=1, 1=64, 2=256, 3=1024 -> shift values for division */
+
+typedef struct {
+    u32 internal_counter;  /* Sub-prescaler accumulator */
+    u16 counter;           /* Current timer value (TMXCNT_L read value) */
+    u16 reload;            /* Reload value (TMXCNT_L write value) */
+    u16 control;           /* TMXCNT_H */
+    bool running;          /* Cached from control bit 7 */
+    bool cascade;          /* Cached from control bit 2 */
+    int prescaler;         /* Cached prescaler selection (0-3) */
+} HWTimer;
+
+static HWTimer timers[4] = {0};
+
+#define TIMER_REG_BASE  0x100
+#define TIMER_CNT_L(n)  (TIMER_REG_BASE + (n) * 4)
+#define TIMER_CNT_H(n)  (TIMER_REG_BASE + (n) * 4 + 2)
+
+/* Timer overflow: increment counter, check for cascade/IRQ */
+static void timer_overflow(int idx) {
+    timers[idx].counter = timers[idx].reload;
+
+    /* Fire timer IRQ if enabled */
+    if (timers[idx].control & (1 << 6)) {
+        u16 if_val = io_read16(0x202);
+        if_val |= (u16)(1 << (3 + idx)); /* Timer 0-3 = IRQ bits 3-6 */
+        io_write16(0x202, if_val);
+    }
+
+    /* Cascade: if next timer exists and is in cascade mode, tick it */
+    if (idx < 3 && timers[idx + 1].running && timers[idx + 1].cascade) {
+        timers[idx + 1].counter++;
+        if (timers[idx + 1].counter == 0) { /* Overflow */
+            timer_overflow(idx + 1);
+        }
+    }
+}
+
+static void timer_tick(u32 cycles) {
+    for (int i = 0; i < 4; i++) {
+        if (!timers[i].running || timers[i].cascade) continue;
+
+        u32 shift = timer_prescaler_shift[timers[i].prescaler];
+        timers[i].internal_counter += cycles;
+
+        u32 ticks = timers[i].internal_counter >> shift;
+        timers[i].internal_counter &= (1u << shift) - 1;
+
+        while (ticks > 0) {
+            u32 until_overflow = (u32)(0x10000 - timers[i].counter);
+            if (ticks >= until_overflow) {
+                ticks -= until_overflow;
+                timer_overflow(i);
+            } else {
+                timers[i].counter += (u16)ticks;
+                ticks = 0;
+            }
+        }
+    }
+}
+
+/* Handle timer control register write */
+static void timer_write_control(int idx, u16 value) {
+    bool was_running = timers[idx].running;
+    bool now_running = (value >> 7) & 1;
+
+    timers[idx].control = value;
+    timers[idx].prescaler = value & 3;
+    timers[idx].cascade = (value >> 2) & 1;
+    timers[idx].running = now_running;
+
+    /* Starting a stopped timer reloads the counter */
+    if (!was_running && now_running) {
+        timers[idx].counter = timers[idx].reload;
+        timers[idx].internal_counter = 0;
+    }
+
+    /* Write back to I/O registers */
+    io_write16(TIMER_CNT_H(idx), value);
+}
+
+/* ---- DMA Controller ---- */
+
+#define DMA_REG_BASE  0x0B0
+#define DMA_SAD(n)    (DMA_REG_BASE + (n) * 12)
+#define DMA_DAD(n)    (DMA_REG_BASE + (n) * 12 + 4)
+#define DMA_CNT_L(n)  (DMA_REG_BASE + (n) * 12 + 8)
+#define DMA_CNT_H(n)  (DMA_REG_BASE + (n) * 12 + 10)
+
+/* Latched source/destination addresses (reloaded on DMA enable) */
+static u32 dma_src_latch[4] = {0};
+static u32 dma_dst_latch[4] = {0};
+
+static void dma_transfer(int channel) {
+    u32 base = DMA_REG_BASE + channel * 12;
+    u32 src = dma_src_latch[channel];
+    u32 dst = dma_dst_latch[channel];
+    u16 cnt_lo = io_read16(base + 8);
+    u16 cnt_hi = io_read16(base + 10);
+
+    u32 count = cnt_lo;
+    if (count == 0) {
+        count = (channel == 3) ? 0x10000 : 0x4000;
+    }
+
+    bool word = (cnt_hi >> 10) & 1;
+    int dst_ctrl = (cnt_hi >> 5) & 3;
+    int src_ctrl = (cnt_hi >> 7) & 3;
+    u32 size = word ? 4 : 2;
+
+    for (u32 i = 0; i < count; i++) {
+        if (word) {
+            /* Direct memory copy for DMA - bypass bus_read/write cycle counting */
+            u32 val = bus_read32(src);
+            bus_write32(dst, val);
+        } else {
+            u16 val = bus_read16(src);
+            bus_write16(dst, val);
+        }
+
+        switch (src_ctrl) {
+            case 0: src += size; break;
+            case 1: src -= size; break;
+            case 2: break;
+        }
+        switch (dst_ctrl) {
+            case 0: case 3: dst += size; break;
+            case 1: dst -= size; break;
+            case 2: break;
+        }
+    }
+
+    /* Update latched addresses */
+    dma_src_latch[channel] = src;
+    if (dst_ctrl != 3) {
+        dma_dst_latch[channel] = dst;
+    }
+    /* dst_ctrl 3 = increment/reload: dst reloads on next trigger */
+
+    /* Check repeat bit */
+    bool repeat = (cnt_hi >> 9) & 1;
+    int timing = (cnt_hi >> 12) & 3;
+
+    if (!repeat || timing == 0) {
+        /* Clear enable bit */
+        cnt_hi &= ~(1u << 15);
+        io_write16(base + 10, cnt_hi);
+    }
+
+    /* Fire DMA IRQ if enabled */
+    if (cnt_hi & (1 << 14)) {
+        u16 if_val = io_read16(0x202);
+        if_val |= (u16)(1 << (8 + channel));
+        io_write16(0x202, if_val);
+    }
+}
+
+static void dma_execute(int channel) {
+    u16 cnt_hi = io_read16(DMA_CNT_H(channel));
+    if (!(cnt_hi & (1 << 15))) return;
+
+    int timing = (cnt_hi >> 12) & 3;
+    if (timing == 0) {
+        /* Immediate DMA */
+        dma_transfer(channel);
+    }
+    /* VBlank/HBlank/Special DMAs are deferred to their trigger points */
+}
+
+/* Latch addresses when DMA is enabled */
+static void dma_enable(int channel) {
+    u32 base = DMA_REG_BASE + channel * 12;
+    dma_src_latch[channel] = io_read32(base);
+    dma_dst_latch[channel] = io_read32(base + 4);
+}
+
+static void dma_trigger_vblank(void) {
+    for (int ch = 0; ch < 4; ch++) {
+        u16 cnt_hi = io_read16(DMA_CNT_H(ch));
+        if ((cnt_hi & (1 << 15)) && ((cnt_hi >> 12) & 3) == 1) {
+            dma_transfer(ch);
+        }
+    }
+}
+
+static void dma_trigger_hblank(void) {
+    for (int ch = 0; ch < 4; ch++) {
+        u16 cnt_hi = io_read16(DMA_CNT_H(ch));
+        if ((cnt_hi & (1 << 15)) && ((cnt_hi >> 12) & 3) == 2) {
+            dma_transfer(ch);
+        }
+    }
+}
+
+/* ---- Interrupt Delivery ---- */
+
+static bool in_irq = false;
+
+static void check_interrupts(void) {
+    if (in_irq) return;
+
+    u16 ime = io_read16(0x208);
+    if (!ime) return;
+
+    u16 ie = io_read16(0x200);
+    u16 if_val = io_read16(0x202);
+    u16 pending = ie & if_val;
+    if (!pending) return;
+
+    /* Read handler address from 0x03007FFC (set by game's crt0) */
+    u32 handler_addr = iwram[0x7FFC] | (iwram[0x7FFD] << 8) |
+                       (iwram[0x7FFE] << 16) | (iwram[0x7FFF] << 24);
+    if (handler_addr == 0) return;
+
+    in_irq = true;
+
+    /* Set BIOS IF flags at 0x03007FF8 (for IntrWait/VBlankIntrWait) */
+    u16 bios_if = iwram[0x7FF8] | (iwram[0x7FF9] << 8);
+    bios_if |= pending;
+    iwram[0x7FF8] = (u8)(bios_if);
+    iwram[0x7FF9] = (u8)(bios_if >> 8);
+
+    /* Save recompiled state (IRQ handler runs with its own context) */
+    u32 saved_r[16];
+    bool saved_N = CPU_N, saved_Z = CPU_Z, saved_C = CPU_C, saved_V = CPU_V;
+    memcpy(saved_r, r, sizeof(r));
+
+    /* Call the handler via BX dispatch */
+    cpu_bx(handler_addr);
+
+    /* Restore game state */
+    memcpy(r, saved_r, sizeof(r));
+    CPU_N = saved_N; CPU_Z = saved_Z; CPU_C = saved_C; CPU_V = saved_V;
+
+    in_irq = false;
+}
+
+/* ---- Scanline Scheduler ---- */
+
+/* Advance hardware by a number of cycles. This is the heartbeat:
+ * tracks scanlines, fires HBlank/VBlank, triggers DMA, delivers IRQs. */
 static void advance_cycles(u32 cycles) {
     cycle_counter += cycles;
+    scanline_cycles += cycles;
 
-    /* Update scanline counter */
-    u32 new_scanline = (cycle_counter / CYCLES_PER_SCANLINE) % SCANLINES_PER_FRAME;
-    if (new_scanline != scanline) {
-        scanline = new_scanline;
-        /* Update VCOUNT I/O register */
+    /* Tick timers */
+    timer_tick(cycles);
+
+    /* Process complete scanlines */
+    while (scanline_cycles >= CYCLES_PER_SCANLINE) {
+        scanline_cycles -= CYCLES_PER_SCANLINE;
+
+        u32 prev_scanline = scanline;
+        scanline = (scanline + 1) % SCANLINES_PER_FRAME;
+
+        /* Update VCOUNT */
         io_regs[0x006] = (u8)(scanline & 0xFF);
         io_regs[0x007] = 0;
 
-        /* Update DISPSTAT VBlank/HBlank flags */
-        u16 dispstat = io_regs[0x004] | (io_regs[0x005] << 8);
-        dispstat &= ~0x0003; /* Clear VBlank and HBlank */
-        if (scanline >= 160) dispstat |= 1; /* VBlank */
-        io_regs[0x004] = (u8)(dispstat);
-        io_regs[0x005] = (u8)(dispstat >> 8);
+        /* Update DISPSTAT */
+        u16 dispstat = io_read16(0x004);
+        u16 vcount_target = (dispstat >> 8) & 0xFF;
 
-        /* At start of VBlank, render frame */
-        if (scanline == 160) {
+        dispstat &= ~0x0007; /* Clear VBlank, HBlank, VCount match */
+        if (scanline >= VISIBLE_SCANLINES)
+            dispstat |= 1; /* VBlank flag */
+        if (scanline == vcount_target)
+            dispstat |= 4; /* VCount match flag */
+        io_write16(0x004, dispstat);
+
+        /* VBlank start (scanline 160) */
+        if (scanline == VISIBLE_SCANLINES && prev_scanline != VISIBLE_SCANLINES) {
+            /* Set VBlank IRQ flag if VBlank IRQ enabled in DISPSTAT */
+            if (dispstat & (1 << 3)) {
+                u16 if_val = io_read16(0x202);
+                io_write16(0x202, if_val | 1); /* VBlank = bit 0 */
+            }
+
+            /* Trigger VBlank DMA */
+            dma_trigger_vblank();
+
+            /* Render frame and handle input */
             frame_count++;
-            /* Update KEYINPUT */
+
+            /* Update KEYINPUT from SDL */
             u16 keys = display_get_keys();
             io_regs[0x130] = (u8)(keys);
             io_regs[0x131] = (u8)(keys >> 8);
 
-            /* Debug: print DISPCNT and VRAM status every 60 frames */
-            if (frame_count <= 5 || frame_count % 60 == 0) {
-                u16 dispcnt = io_regs[0] | (io_regs[1] << 8);
-                /* Check if VRAM has any non-zero data */
-                int vram_nonzero = 0;
-                for (int i = 0; i < 0x18000; i++) {
-                    if (vram[i] != 0) { vram_nonzero++; }
-                }
-                int pal_nonzero = 0;
-                for (int i = 0; i < 0x400; i++) {
-                    if (palette[i] != 0) { pal_nonzero++; }
-                }
-                fprintf(stderr, "[frame %u] DISPCNT=0x%04X mode=%d BG_en=%d%d%d%d OBJ=%d | VRAM: %d bytes | PAL: %d bytes\n",
+            display_render_frame();
+
+            /* Frame pacing */
+            SDL_Delay(16);
+
+            /* Debug status */
+            if (frame_count <= 5 || frame_count % 300 == 0) {
+                u16 dispcnt = io_read16(0x000);
+                fprintf(stderr, "[frame %u] DISPCNT=0x%04X mode=%d BG=%d%d%d%d OBJ=%d\n",
                         frame_count, dispcnt, dispcnt & 7,
                         (dispcnt >> 8) & 1, (dispcnt >> 9) & 1,
                         (dispcnt >> 10) & 1, (dispcnt >> 11) & 1,
-                        (dispcnt >> 12) & 1,
-                        vram_nonzero, pal_nonzero);
+                        (dispcnt >> 12) & 1);
                 fflush(stderr);
             }
-
-            display_render_frame();
-
-            /* Frame timing (~60fps) */
-            SDL_Delay(16);
         }
+
+        /* VCount match IRQ */
+        if ((scanline == vcount_target) && (dispstat & (1 << 5))) {
+            u16 if_val = io_read16(0x202);
+            io_write16(0x202, if_val | 4); /* VCount = bit 2 */
+        }
+
+        /* HBlank fires at end of each visible scanline */
+        if (scanline < VISIBLE_SCANLINES) {
+            /* HBlank IRQ */
+            if (dispstat & (1 << 4)) {
+                u16 if_val = io_read16(0x202);
+                io_write16(0x202, if_val | 2); /* HBlank = bit 1 */
+            }
+            /* HBlank DMA */
+            dma_trigger_hblank();
+        }
+
+        /* Check for interrupts after each scanline */
+        check_interrupts();
     }
 
-    /* Periodically poll SDL events to prevent window freeze */
+    /* Periodically poll SDL events */
     if (cycle_counter - last_poll_cycle > POLL_INTERVAL) {
         last_poll_cycle = cycle_counter;
         if (display_poll_events()) {
             gba_shutdown();
             exit(0);
         }
-
-        /* Force-fire VBlank interrupt flag periodically.
-         * Many games poll DISPSTAT bit 0 or check IME for VBlank.
-         * Without real interrupt handling, we fake it here. */
-        u16 ie = io_regs[0x200] | (io_regs[0x201] << 8);
-        u16 ime = io_regs[0x208] | (io_regs[0x209] << 8);
-        if (ie & 1) { /* VBlank interrupt enabled */
-            /* Set IF VBlank bit */
-            io_regs[0x202] |= 1;
-        }
     }
-}
-
-/* ---- DMA Controller ---- */
-
-/* DMA register offsets from 0x040000B0 */
-#define DMA_REG_BASE  0x0B0
-#define DMA_SAD(n)    (DMA_REG_BASE + (n) * 12 + 0)
-#define DMA_DAD(n)    (DMA_REG_BASE + (n) * 12 + 4)
-#define DMA_CNT(n)    (DMA_REG_BASE + (n) * 12 + 8)
-
-static int dma_count = 0;
-static void dma_execute(int channel) {
-    u32 base = DMA_REG_BASE + channel * 12;
-    u32 src = io_regs[base] | (io_regs[base+1] << 8) |
-              (io_regs[base+2] << 16) | (io_regs[base+3] << 24);
-    u32 dst = io_regs[base+4] | (io_regs[base+5] << 8) |
-              (io_regs[base+6] << 16) | (io_regs[base+7] << 24);
-    u16 cnt_lo = io_regs[base+8] | (io_regs[base+9] << 8);
-    u16 cnt_hi = io_regs[base+10] | (io_regs[base+11] << 8);
-
-    bool enable = (cnt_hi >> 15) & 1;
-    if (!enable) return;
-
-    u32 count = cnt_lo;
-    if (count == 0) {
-        /* DMA0-2: 0 means 0x4000, DMA3: 0 means 0x10000 */
-        count = (channel == 3) ? 0x10000 : 0x4000;
-    }
-
-    bool word = (cnt_hi >> 10) & 1;     /* 0=halfword, 1=word */
-    int dst_ctrl = (cnt_hi >> 5) & 3;   /* 0=inc, 1=dec, 2=fixed, 3=inc/reload */
-    int src_ctrl = (cnt_hi >> 7) & 3;   /* 0=inc, 1=dec, 2=fixed */
-    int timing = (cnt_hi >> 12) & 3;    /* 0=immediate, 1=VBlank, 2=HBlank, 3=special */
-
-    dma_count++;
-    if (dma_count <= 20) {
-        fprintf(stderr, "[dma #%d] ch%d: 0x%08X -> 0x%08X, cnt=%u, %s, timing=%d\n",
-                dma_count, channel, src, dst, count,
-                word ? "word" : "half", timing);
-        fflush(stderr);
-    }
-
-    /* Only handle immediate DMA for now */
-    if (timing != 0) {
-        /* VBlank/HBlank/Special DMA - defer */
-        return;
-    }
-
-    u32 size = word ? 4 : 2;
-
-    for (u32 i = 0; i < count; i++) {
-        if (word) {
-            bus_write32(dst, bus_read32(src));
-        } else {
-            bus_write16(dst, bus_read16(src));
-        }
-
-        /* Source address control */
-        switch (src_ctrl) {
-            case 0: src += size; break;
-            case 1: src -= size; break;
-            case 2: break; /* fixed */
-        }
-
-        /* Destination address control */
-        switch (dst_ctrl) {
-            case 0: case 3: dst += size; break;
-            case 1: dst -= size; break;
-            case 2: break; /* fixed */
-        }
-    }
-
-    /* Clear enable bit after transfer (for immediate DMA) */
-    cnt_hi &= ~(1 << 15);
-    io_regs[base+10] = (u8)(cnt_hi);
-    io_regs[base+11] = (u8)(cnt_hi >> 8);
 }
 
 /* ---- I/O Write Hook ---- */
 
-static int io_write_count = 0;
+/* Dispatches side effects when the game writes to I/O registers. */
 static void io_write_hook(u32 offset, u32 value, int size) {
-    io_write_count++;
-    if (io_write_count <= 30) {
-        fprintf(stderr, "[io #%d] write 0x%03X = 0x%04X (size=%d)\n",
-                io_write_count, offset, value & 0xFFFF, size);
-        fflush(stderr);
-    }
-    /* Check for DMA enable writes */
+    (void)value; (void)size;
+
+    /* DMA control writes */
     for (int ch = 0; ch < 4; ch++) {
-        u32 cnt_hi_offset = DMA_REG_BASE + ch * 12 + 10;
-        if (offset == cnt_hi_offset || offset == cnt_hi_offset + 1) {
-            /* DMA control high byte was written - check if enable bit set */
-            u16 cnt_hi = io_regs[cnt_hi_offset] | (io_regs[cnt_hi_offset+1] << 8);
+        u32 cnt_hi_off = DMA_CNT_H(ch);
+        if (offset == cnt_hi_off || offset == cnt_hi_off + 1) {
+            u16 cnt_hi = io_read16(cnt_hi_off);
             if (cnt_hi & (1 << 15)) {
+                dma_enable(ch);
                 dma_execute(ch);
             }
         }
+    }
+
+    /* Timer control writes */
+    for (int t = 0; t < 4; t++) {
+        if (offset == TIMER_CNT_L(t) || offset == TIMER_CNT_L(t) + 1) {
+            /* Write to CNT_L sets the reload value (not the running counter) */
+            timers[t].reload = io_read16(TIMER_CNT_L(t));
+        }
+        if (offset == TIMER_CNT_H(t) || offset == TIMER_CNT_H(t) + 1) {
+            timer_write_control(t, io_read16(TIMER_CNT_H(t)));
+        }
+    }
+
+    /* IF register write: writing 1 bits CLEARS them (acknowledge) */
+    if (offset == 0x202 || offset == 0x203) {
+        /* The game wrote to IF - but GBA IF is write-1-to-clear.
+         * We need to read what was written and clear those bits from the
+         * actual IF value. The write already happened to io_regs, so we
+         * need to undo it and apply the clear semantics. */
+        /* This is handled specially in bus_write16 for I/O region */
+    }
+
+    /* HALTCNT write (0x04000301) - power down / halt */
+    if (offset == 0x301) {
+        /* Halt: advance to next interrupt */
+        /* In recompiled code, just advance a frame */
     }
 }
 
 /* ---- Memory Bus Implementation ---- */
 
+static inline void mem_write8(u8* mem, u32 off, u8 val) { mem[off] = val; }
+
+static inline void mem_write16_raw(u8* mem, u32 off, u16 val) {
+    mem[off]   = (u8)(val);
+    mem[off+1] = (u8)(val >> 8);
+}
+
+static inline void mem_write32_raw(u8* mem, u32 off, u32 val) {
+    mem[off]   = (u8)(val);
+    mem[off+1] = (u8)(val >> 8);
+    mem[off+2] = (u8)(val >> 16);
+    mem[off+3] = (u8)(val >> 24);
+}
+
 u32 bus_read32(u32 addr) {
-    advance_cycles(4); /* Approximate: each bus access ~4 cycles */
-    addr &= ~3u; /* Word-align */
+    advance_cycles(4);
+    addr &= ~3u;
     u32 region = addr >> 24;
     u32 offset;
 
     switch (region) {
-    case 0x00: /* BIOS */
+    case 0x00:
         offset = addr & 0x3FFF;
         if (bios_mem) {
             return bios_mem[offset] | (bios_mem[offset+1] << 8) |
@@ -242,45 +515,47 @@ u32 bus_read32(u32 addr) {
         }
         return 0;
 
-    case 0x02: /* EWRAM */
+    case 0x02:
         offset = addr & 0x3FFFF;
         return ewram[offset] | (ewram[offset+1] << 8) |
                (ewram[offset+2] << 16) | (ewram[offset+3] << 24);
 
-    case 0x03: /* IWRAM */
+    case 0x03:
         offset = addr & 0x7FFF;
         return iwram[offset] | (iwram[offset+1] << 8) |
                (iwram[offset+2] << 16) | (iwram[offset+3] << 24);
 
-    case 0x04: { /* I/O */
-        static int io_read_count = 0;
+    case 0x04: {
         offset = addr & 0x3FF;
-        io_read_count++;
-        if (io_read_count <= 30 && offset < 0x200) {
-            fprintf(stderr, "[io_rd #%d] read 0x%03X\n", io_read_count, offset);
-            fflush(stderr);
+        /* Timer counter reads return the running counter, not the reload */
+        for (int t = 0; t < 4; t++) {
+            if (offset == (u32)TIMER_CNT_L(t)) {
+                u16 cnt = timers[t].running ? timers[t].counter : timers[t].reload;
+                u16 ctl = timers[t].control;
+                return (u32)cnt | ((u32)ctl << 16);
+            }
         }
         return io_regs[offset] | (io_regs[offset+1] << 8) |
                (io_regs[offset+2] << 16) | (io_regs[offset+3] << 24);
     }
 
-    case 0x05: /* Palette */
+    case 0x05:
         offset = addr & 0x3FF;
         return palette[offset] | (palette[offset+1] << 8) |
                (palette[offset+2] << 16) | (palette[offset+3] << 24);
 
-    case 0x06: /* VRAM */
+    case 0x06:
         offset = addr & 0x1FFFF;
-        if (offset >= 0x18000) offset -= 0x8000; /* Mirror */
+        if (offset >= 0x18000) offset -= 0x8000;
         return vram[offset] | (vram[offset+1] << 8) |
                (vram[offset+2] << 16) | (vram[offset+3] << 24);
 
-    case 0x07: /* OAM */
+    case 0x07:
         offset = addr & 0x3FF;
         return oam[offset] | (oam[offset+1] << 8) |
                (oam[offset+2] << 16) | (oam[offset+3] << 24);
 
-    case 0x08: case 0x09: /* ROM */
+    case 0x08: case 0x09:
     case 0x0A: case 0x0B:
     case 0x0C: case 0x0D: {
         offset = (addr - 0x08000000) % rom_size;
@@ -288,17 +563,16 @@ u32 bus_read32(u32 addr) {
                (rom_data[offset+2] << 16) | (rom_data[offset+3] << 24);
     }
 
-    case 0x0E: case 0x0F: /* SRAM */
+    case 0x0E: case 0x0F:
         if (sram) {
             offset = addr & 0xFFFF;
-            /* SRAM is 8-bit bus, reads return same byte in all positions */
             u8 val = sram[offset];
             return val | (val << 8) | (val << 16) | (val << 24);
         }
         return 0;
 
     default:
-        return 0; /* Open bus */
+        return 0;
     }
 }
 
@@ -311,7 +585,17 @@ u16 bus_read16(u32 addr) {
     switch (region) {
     case 0x02: offset = addr & 0x3FFFF;  return ewram[offset] | (ewram[offset+1] << 8);
     case 0x03: offset = addr & 0x7FFF;   return iwram[offset] | (iwram[offset+1] << 8);
-    case 0x04: offset = addr & 0x3FF;    return io_regs[offset] | (io_regs[offset+1] << 8);
+    case 0x04: {
+        offset = addr & 0x3FF;
+        /* Timer counter reads */
+        for (int t = 0; t < 4; t++) {
+            if (offset == (u32)TIMER_CNT_L(t))
+                return timers[t].running ? timers[t].counter : timers[t].reload;
+            if (offset == (u32)TIMER_CNT_H(t))
+                return timers[t].control;
+        }
+        return io_regs[offset] | (io_regs[offset+1] << 8);
+    }
     case 0x05: offset = addr & 0x3FF;    return palette[offset] | (palette[offset+1] << 8);
     case 0x06:
         offset = addr & 0x1FFFF;
@@ -321,7 +605,9 @@ u16 bus_read16(u32 addr) {
     case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
         offset = (addr - 0x08000000) % rom_size;
         return rom_data[offset] | (rom_data[offset+1] << 8);
-    default: return (u16)bus_read32(addr);
+    case 0x0E: case 0x0F:
+        return sram ? sram[addr & 0xFFFF] : 0;
+    default: return 0;
     }
 }
 
@@ -349,48 +635,41 @@ u8 bus_read8(u32 addr) {
     }
 }
 
-static inline void mem_write8(u8* mem, u32 offset, u8 val) {
-    mem[offset] = val;
-}
-
-static inline void mem_write16(u8* mem, u32 offset, u16 val) {
-    mem[offset]   = (u8)(val);
-    mem[offset+1] = (u8)(val >> 8);
-}
-
-static inline void mem_write32(u8* mem, u32 offset, u32 val) {
-    mem[offset]   = (u8)(val);
-    mem[offset+1] = (u8)(val >> 8);
-    mem[offset+2] = (u8)(val >> 16);
-    mem[offset+3] = (u8)(val >> 24);
-}
-
 void bus_write32(u32 addr, u32 value) {
     addr &= ~3u;
     u32 region = addr >> 24;
 
     switch (region) {
-    case 0x02: mem_write32(ewram, addr & 0x3FFFF, value); break;
-    case 0x03: mem_write32(iwram, addr & 0x7FFF, value); break;
+    case 0x02: mem_write32_raw(ewram, addr & 0x3FFFF, value); break;
+    case 0x03: mem_write32_raw(iwram, addr & 0x7FFF, value); break;
     case 0x04: {
         u32 off = addr & 0x3FF;
-        mem_write32(io_regs, off, value);
-        io_write_hook(off, value, 4);
-        io_write_hook(off + 2, value >> 16, 4);
+        /* IF register: write-1-to-clear semantics */
+        if (off == 0x200) {
+            /* Lower 16 bits = IE (normal write), upper 16 bits = IF (write-1-to-clear) */
+            mem_write16_raw(io_regs, 0x200, (u16)value); /* IE */
+            u16 if_clear = (u16)(value >> 16);
+            u16 if_val = io_read16(0x202);
+            io_write16(0x202, if_val & ~if_clear);
+        } else {
+            mem_write32_raw(io_regs, off, value);
+            io_write_hook(off, value, 4);
+            io_write_hook(off + 2, value >> 16, 4);
+        }
         break;
     }
-    case 0x05: mem_write32(palette, addr & 0x3FF, value); break;
+    case 0x05: mem_write32_raw(palette, addr & 0x3FF, value); break;
     case 0x06: {
         u32 offset = addr & 0x1FFFF;
         if (offset >= 0x18000) offset -= 0x8000;
-        mem_write32(vram, offset, value);
+        mem_write32_raw(vram, offset, value);
         break;
     }
-    case 0x07: mem_write32(oam, addr & 0x3FF, value); break;
+    case 0x07: mem_write32_raw(oam, addr & 0x3FF, value); break;
     case 0x0E: case 0x0F:
         if (sram) sram[addr & 0xFFFF] = (u8)value;
         break;
-    default: break; /* ROM writes ignored */
+    default: break;
     }
 }
 
@@ -399,22 +678,28 @@ void bus_write16(u32 addr, u16 value) {
     u32 region = addr >> 24;
 
     switch (region) {
-    case 0x02: mem_write16(ewram, addr & 0x3FFFF, value); break;
-    case 0x03: mem_write16(iwram, addr & 0x7FFF, value); break;
+    case 0x02: mem_write16_raw(ewram, addr & 0x3FFFF, value); break;
+    case 0x03: mem_write16_raw(iwram, addr & 0x7FFF, value); break;
     case 0x04: {
         u32 off = addr & 0x3FF;
-        mem_write16(io_regs, off, value);
-        io_write_hook(off, value, 2);
+        /* IF register: write-1-to-clear */
+        if (off == 0x202) {
+            u16 if_val = io_read16(0x202);
+            io_write16(0x202, if_val & ~value);
+        } else {
+            mem_write16_raw(io_regs, off, value);
+            io_write_hook(off, value, 2);
+        }
         break;
     }
-    case 0x05: mem_write16(palette, addr & 0x3FF, value); break;
+    case 0x05: mem_write16_raw(palette, addr & 0x3FF, value); break;
     case 0x06: {
         u32 offset = addr & 0x1FFFF;
         if (offset >= 0x18000) offset -= 0x8000;
-        mem_write16(vram, offset, value);
+        mem_write16_raw(vram, offset, value);
         break;
     }
-    case 0x07: mem_write16(oam, addr & 0x3FF, value); break;
+    case 0x07: mem_write16_raw(oam, addr & 0x3FF, value); break;
     case 0x0E: case 0x0F:
         if (sram) sram[addr & 0xFFFF] = (u8)value;
         break;
@@ -428,12 +713,25 @@ void bus_write8(u32 addr, u8 value) {
     switch (region) {
     case 0x02: ewram[addr & 0x3FFFF] = value; break;
     case 0x03: iwram[addr & 0x7FFF] = value; break;
-    case 0x04: io_regs[addr & 0x3FF] = value; break;
-    /* Palette, VRAM: 8-bit writes behave specially on GBA */
+    case 0x04: {
+        u32 off = addr & 0x3FF;
+        /* IF byte write: write-1-to-clear */
+        if (off == 0x202 || off == 0x203) {
+            u16 if_val = io_read16(0x202);
+            if (off == 0x202)
+                io_write16(0x202, if_val & ~(u16)value);
+            else
+                io_write16(0x202, if_val & ~((u16)value << 8));
+        } else {
+            io_regs[off] = value;
+            io_write_hook(off, value, 1);
+        }
+        break;
+    }
     case 0x05: {
-        u32 offset = addr & 0x3FE; /* Force halfword aligned */
+        u32 offset = addr & 0x3FE;
         palette[offset] = value;
-        palette[offset+1] = value; /* Duplicate byte */
+        palette[offset+1] = value;
         break;
     }
     case 0x06: {
@@ -462,13 +760,13 @@ u32 cpu_get_cpsr(void) {
 }
 
 void cpu_set_cpsr(u32 value, u32 mask) {
-    if (mask & 8) { /* Flags field */
+    if (mask & 8) {
         CPU_N = (value >> 31) & 1;
         CPU_Z = (value >> 30) & 1;
         CPU_C = (value >> 29) & 1;
         CPU_V = (value >> 28) & 1;
     }
-    if (mask & 1) { /* Control field */
+    if (mask & 1) {
         cpsr = (cpsr & ~0xFF) | (value & 0xFF);
     }
 }
@@ -480,52 +778,90 @@ void cpu_set_spsr(u32 value, u32 mask) {
     if (mask & 1) spsr = (spsr & ~0xFF) | (value & 0xFF);
 }
 
-/* ---- Software Interrupts (BIOS Calls) ---- */
+/* ---- Software Interrupts (BIOS HLE) ---- */
 
-static int swi_count = 0;
 void gba_swi(u32 number) {
-    swi_count++;
-    if (swi_count <= 20) {
-        fprintf(stderr, "[swi #%d] SWI 0x%02X\n", swi_count, number);
-        fflush(stderr);
-    }
     switch (number) {
     case 0x00: /* SoftReset */
-        /* TODO: reset state */
+        memset(iwram + 0x7E00, 0, 0x200);
+        memset(r, 0, sizeof(r));
+        r[13] = 0x03007F00;
+        r[15] = 0x08000000;
+        cpsr = 0x0000001F;
         break;
-    case 0x01: /* RegisterRamReset */
-        /* TODO: selective reset */
+
+    case 0x01: { /* RegisterRamReset */
+        u32 flags = r[0];
+        if (flags & 0x01) memset(ewram, 0, 0x40000);
+        if (flags & 0x02) memset(iwram, 0, 0x7E00); /* Preserve top 0x200 */
+        if (flags & 0x04) memset(palette, 0, 0x400);
+        if (flags & 0x08) memset(vram, 0, 0x18000);
+        if (flags & 0x10) memset(oam, 0, 0x400);
+        /* bits 5-7: SIO, sound, other registers */
         break;
+    }
+
     case 0x02: /* Halt */
-        /* Wait for interrupt - in recompiled code, this is a no-op */
+        /* Advance to next interrupt event */
+        advance_cycles(CYCLES_PER_SCANLINE);
         break;
-    case 0x04: /* IntrWait */
+
+    case 0x04: { /* IntrWait */
+        bool discard = r[0] != 0;
+        u16 wait_flags = (u16)r[1];
+
+        if (discard) {
+            /* Clear the BIOS IF flags we're waiting for */
+            u16 bios_if = iwram[0x7FF8] | (iwram[0x7FF9] << 8);
+            bios_if &= ~wait_flags;
+            iwram[0x7FF8] = (u8)(bios_if);
+            iwram[0x7FF9] = (u8)(bios_if >> 8);
+        }
+
+        /* Spin until the requested interrupt fires */
+        int safety = 0;
+        while (safety < SCANLINES_PER_FRAME * 2) {
+            advance_cycles(CYCLES_PER_SCANLINE);
+            safety++;
+            u16 bios_if = iwram[0x7FF8] | (iwram[0x7FF9] << 8);
+            if (bios_if & wait_flags) break;
+        }
+        break;
+    }
+
     case 0x05: /* VBlankIntrWait */
-        /* In recompiled code: advance frame */
-        gba_frame();
+        /* Equivalent to IntrWait(1, 1) - wait for VBlank */
+        r[0] = 1;
+        r[1] = 1;
+        gba_swi(0x04);
         break;
-    case 0x06: { /* Div */
+
+    case 0x06: { /* Div: r0/r1 */
         s32 num = (s32)r[0];
         s32 den = (s32)r[1];
         if (den != 0) {
             r[0] = (u32)(num / den);
             r[1] = (u32)(num % den);
-            r[3] = (u32)(num < 0 ? -num / (den < 0 ? -den : den)
-                                 : num / (den < 0 ? -den : den));
+            s32 abs_result = (s32)r[0];
+            if (abs_result < 0) abs_result = -abs_result;
+            r[3] = (u32)abs_result;
         }
         break;
     }
-    case 0x07: { /* DivArm (swapped args) */
+
+    case 0x07: { /* DivArm: r1/r0 */
         s32 den = (s32)r[0];
         s32 num = (s32)r[1];
         if (den != 0) {
             r[0] = (u32)(num / den);
             r[1] = (u32)(num % den);
-            r[3] = (u32)(num < 0 ? -num / (den < 0 ? -den : den)
-                                 : num / (den < 0 ? -den : den));
+            s32 abs_result = (s32)r[0];
+            if (abs_result < 0) abs_result = -abs_result;
+            r[3] = (u32)abs_result;
         }
         break;
     }
+
     case 0x08: { /* Sqrt */
         u32 val = r[0];
         u32 result = 0;
@@ -543,6 +879,33 @@ void gba_swi(u32 number) {
         r[0] = result;
         break;
     }
+
+    case 0x09: { /* ArcTan */
+        /* Approximation: atan(r0) where r0 is 1.14 fixed-point */
+        s32 a = (s32)(s16)r[0];
+        s32 result = a - (a * a * a / 3) / (1 << 28);
+        r[0] = (u32)(s16)result;
+        break;
+    }
+
+    case 0x0A: { /* ArcTan2 */
+        /* Two-argument arctangent, returns angle in [0, 0xFFFF] */
+        s16 x = (s16)r[0];
+        s16 y = (s16)r[1];
+        /* Simple approximation using atan2 */
+        if (x == 0 && y == 0) {
+            r[0] = 0;
+        } else {
+            double angle = SDL_atan2((double)y, (double)x);
+            /* Convert from [-pi, pi] to [0, 0xFFFF] */
+            double normalized = angle / (2.0 * 3.14159265358979323846) + 0.5;
+            if (normalized < 0) normalized += 1.0;
+            if (normalized >= 1.0) normalized -= 1.0;
+            r[0] = (u32)(u16)(normalized * 65536.0);
+        }
+        break;
+    }
+
     case 0x0B: /* CpuSet */
     case 0x0C: { /* CpuFastSet */
         u32 src = r[0];
@@ -551,6 +914,11 @@ void gba_swi(u32 number) {
         u32 count = cnt & 0x1FFFFF;
         bool fill = (cnt >> 24) & 1;
         bool word = (number == 0x0C) || ((cnt >> 26) & 1);
+
+        /* CpuFastSet always works in 32-byte chunks */
+        if (number == 0x0C) {
+            count = (count + 7) & ~7u; /* Round up to multiple of 8 */
+        }
 
         if (word) {
             u32 fill_val = bus_read32(src);
@@ -567,32 +935,295 @@ void gba_swi(u32 number) {
         }
         break;
     }
+
+    case 0x0E: { /* BgAffineSet */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 count = r[2];
+        for (u32 i = 0; i < count; i++) {
+            /* Read source parameters (20 bytes each) */
+            s32 cx = (s32)bus_read32(src + i * 20);
+            s32 cy = (s32)bus_read32(src + i * 20 + 4);
+            s16 dispx = (s16)bus_read16(src + i * 20 + 8);
+            s16 dispy = (s16)bus_read16(src + i * 20 + 10);
+            s16 sx = (s16)bus_read16(src + i * 20 + 12);
+            s16 sy = (s16)bus_read16(src + i * 20 + 14);
+            u16 angle_raw = bus_read16(src + i * 20 + 16);
+
+            double angle = (double)angle_raw / 65536.0 * 2.0 * 3.14159265358979323846;
+            double cosA = SDL_cos(angle);
+            double sinA = SDL_sin(angle);
+
+            /* PA = sx * cos(angle) / 256, PB = -sx * sin(angle) / 256, etc. */
+            s16 pa = (s16)(cosA * 256.0 * 256.0 / sx);
+            s16 pb = (s16)(-sinA * 256.0 * 256.0 / sx);
+            s16 pc = (s16)(sinA * 256.0 * 256.0 / sy);
+            s16 pd = (s16)(cosA * 256.0 * 256.0 / sy);
+
+            /* Reference point */
+            s32 dx = cx - (s32)dispx * pa - (s32)dispy * pb;
+            s32 dy = cy - (s32)dispx * pc - (s32)dispy * pd;
+
+            /* Write dest (16 bytes each) */
+            bus_write16(dst + i * 16, (u16)pa);
+            bus_write16(dst + i * 16 + 2, (u16)pb);
+            bus_write16(dst + i * 16 + 4, (u16)pc);
+            bus_write16(dst + i * 16 + 6, (u16)pd);
+            bus_write32(dst + i * 16 + 8, (u32)dx);
+            bus_write32(dst + i * 16 + 12, (u32)dy);
+        }
+        break;
+    }
+
+    case 0x0F: { /* ObjAffineSet */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 count = r[2];
+        u32 stride = r[3]; /* Offset between PA entries in dest (8 for OAM, 2 for buffer) */
+
+        for (u32 i = 0; i < count; i++) {
+            s16 sx = (s16)bus_read16(src + i * 8);
+            s16 sy = (s16)bus_read16(src + i * 8 + 2);
+            u16 angle_raw = bus_read16(src + i * 8 + 4);
+
+            double angle = (double)angle_raw / 65536.0 * 2.0 * 3.14159265358979323846;
+            double cosA = SDL_cos(angle);
+            double sinA = SDL_sin(angle);
+
+            s16 pa = (s16)(cosA * 256.0 * 256.0 / sx);
+            s16 pb = (s16)(-sinA * 256.0 * 256.0 / sx);
+            s16 pc = (s16)(sinA * 256.0 * 256.0 / sy);
+            s16 pd = (s16)(cosA * 256.0 * 256.0 / sy);
+
+            bus_write16(dst + i * stride * 4, (u16)pa);
+            bus_write16(dst + i * stride * 4 + stride, (u16)pb);
+            bus_write16(dst + i * stride * 4 + stride * 2, (u16)pc);
+            bus_write16(dst + i * stride * 4 + stride * 3, (u16)pd);
+        }
+        break;
+    }
+
+    case 0x10: { /* BitUnPack */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 info = r[2];
+        u16 src_len = bus_read16(info);
+        u8 src_bpp = bus_read8(info + 2);
+        u8 dst_bpp = bus_read8(info + 3);
+        u32 data_offset = bus_read32(info + 4);
+        bool zero_flag = (data_offset >> 31) & 1;
+        data_offset &= 0x7FFFFFFF;
+
+        u32 src_off = 0;
+        u32 dst_off = 0;
+        u32 buffer = 0;
+        int bits_in_buffer = 0;
+        u8 src_mask = (u8)((1 << src_bpp) - 1);
+
+        while (src_off < src_len) {
+            u8 byte = bus_read8(src + src_off++);
+            for (int bit = 0; bit < 8; bit += src_bpp) {
+                u32 val = (byte >> bit) & src_mask;
+                if (val != 0 || !zero_flag) {
+                    val += (u32)data_offset;
+                }
+                buffer |= val << bits_in_buffer;
+                bits_in_buffer += dst_bpp;
+                if (bits_in_buffer >= 32) {
+                    bus_write32(dst + dst_off, buffer);
+                    dst_off += 4;
+                    buffer = 0;
+                    bits_in_buffer = 0;
+                }
+            }
+        }
+        if (bits_in_buffer > 0) {
+            bus_write32(dst + dst_off, buffer);
+        }
+        break;
+    }
+
+    case 0x11: { /* LZ77UnCompWram */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 header = bus_read32(src);
+        u32 decomp_size = header >> 8;
+        u32 sp = src + 4;
+        u32 dp = 0;
+
+        while (dp < decomp_size) {
+            u8 flags = bus_read8(sp++);
+            for (int i = 7; i >= 0 && dp < decomp_size; i--) {
+                if (flags & (1 << i)) {
+                    /* Compressed */
+                    u8 b1 = bus_read8(sp++);
+                    u8 b2 = bus_read8(sp++);
+                    u32 length = ((b1 >> 4) & 0xF) + 3;
+                    u32 disp = ((u32)(b1 & 0xF) << 8) | b2;
+                    u32 ref = dp - disp - 1;
+                    for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                        bus_write8(dst + dp, bus_read8(dst + ref + j));
+                        dp++;
+                    }
+                } else {
+                    /* Uncompressed */
+                    bus_write8(dst + dp++, bus_read8(sp++));
+                }
+            }
+        }
+        break;
+    }
+
+    case 0x12: { /* LZ77UnCompVram (16-bit writes) */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 header = bus_read32(src);
+        u32 decomp_size = header >> 8;
+        u32 sp = src + 4;
+        u32 dp = 0;
+        u8 tmp_buf[2] = {0};
+        int tmp_idx = 0;
+
+        while (dp < decomp_size) {
+            u8 flags = bus_read8(sp++);
+            for (int i = 7; i >= 0 && dp < decomp_size; i--) {
+                u8 byte;
+                if (flags & (1 << i)) {
+                    u8 b1 = bus_read8(sp++);
+                    u8 b2 = bus_read8(sp++);
+                    u32 length = ((b1 >> 4) & 0xF) + 3;
+                    u32 disp = ((u32)(b1 & 0xF) << 8) | b2;
+                    u32 ref = dp - disp - 1;
+                    for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                        byte = bus_read8(dst + ref + j);
+                        tmp_buf[tmp_idx++] = byte;
+                        if (tmp_idx == 2) {
+                            bus_write16(dst + dp - 1, (u16)tmp_buf[0] | ((u16)tmp_buf[1] << 8));
+                            tmp_idx = 0;
+                        }
+                        dp++;
+                    }
+                } else {
+                    byte = bus_read8(sp++);
+                    tmp_buf[tmp_idx++] = byte;
+                    if (tmp_idx == 2) {
+                        bus_write16(dst + dp - 1, (u16)tmp_buf[0] | ((u16)tmp_buf[1] << 8));
+                        tmp_idx = 0;
+                    }
+                    dp++;
+                }
+            }
+        }
+        break;
+    }
+
+    case 0x13: { /* HuffUnComp */
+        /* Huffman decompression - stub for now */
+        fprintf(stderr, "[swi] HuffUnComp not implemented\n");
+        break;
+    }
+
+    case 0x14: { /* RLUnCompWram */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 header = bus_read32(src);
+        u32 decomp_size = header >> 8;
+        u32 sp = src + 4;
+        u32 dp = 0;
+
+        while (dp < decomp_size) {
+            u8 flag = bus_read8(sp++);
+            if (flag & 0x80) {
+                /* Run-length */
+                u32 length = (flag & 0x7F) + 3;
+                u8 val = bus_read8(sp++);
+                for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                    bus_write8(dst + dp++, val);
+                }
+            } else {
+                /* Uncompressed */
+                u32 length = (flag & 0x7F) + 1;
+                for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                    bus_write8(dst + dp++, bus_read8(sp++));
+                }
+            }
+        }
+        break;
+    }
+
+    case 0x15: { /* RLUnCompVram (16-bit writes) */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 header = bus_read32(src);
+        u32 decomp_size = header >> 8;
+        u32 sp = src + 4;
+        u32 dp = 0;
+        u8 tmp_buf[2] = {0};
+        int tmp_idx = 0;
+
+        while (dp < decomp_size) {
+            u8 flag = bus_read8(sp++);
+            u32 length;
+            if (flag & 0x80) {
+                length = (flag & 0x7F) + 3;
+                u8 val = bus_read8(sp++);
+                for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                    tmp_buf[tmp_idx++] = val;
+                    if (tmp_idx == 2) {
+                        bus_write16(dst + dp - 1, (u16)tmp_buf[0] | ((u16)tmp_buf[1] << 8));
+                        tmp_idx = 0;
+                    }
+                    dp++;
+                }
+            } else {
+                length = (flag & 0x7F) + 1;
+                for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                    u8 val = bus_read8(sp++);
+                    tmp_buf[tmp_idx++] = val;
+                    if (tmp_idx == 2) {
+                        bus_write16(dst + dp - 1, (u16)tmp_buf[0] | ((u16)tmp_buf[1] << 8));
+                        tmp_idx = 0;
+                    }
+                    dp++;
+                }
+            }
+        }
+        break;
+    }
+
     default:
-        fprintf(stderr, "[runtime] Unhandled SWI 0x%02X at PC=0x%08X\n", number, r[15]);
+        fprintf(stderr, "[swi] Unhandled SWI 0x%02X at PC=0x%08X\n", number, r[15]);
         break;
     }
 }
 
+/* ---- IWRAM Code Execution ---- */
+
+/* For RAM-targeted BX calls where no recompiled function exists.
+ * In a true static recomp, all known IWRAM functions are pre-compiled.
+ * This stub handles the rare case of truly dynamic code. */
+void run_iwram_function(u32 target) {
+    static int warn_count = 0;
+    if (++warn_count <= 10) {
+        fprintf(stderr, "[runtime] IWRAM call 0x%08X not in function table (warn %d/10)\n",
+                target, warn_count);
+        fflush(stderr);
+    }
+    /* Set r[15] so the caller knows we "returned" */
+    r[15] = r[14];
+}
+
 /* ---- BX Dispatch Tracing ---- */
-static int bx_call_count = 0;
-static u32 last_bx_target = 0;
-static int last_bx_repeat = 0;
 
 void cpu_bx_trace(u32 target) {
-    bx_call_count++;
-    if (target == last_bx_target) {
-        last_bx_repeat++;
-    } else {
-        if (last_bx_repeat > 0 && bx_call_count < 200) {
-            fprintf(stderr, "  (repeated %d times)\n", last_bx_repeat);
-        }
-        last_bx_repeat = 0;
-        last_bx_target = target;
-        if (bx_call_count <= 100) {
-            fprintf(stderr, "[bx #%d] -> 0x%08X\n", bx_call_count, target);
-            fflush(stderr);
-        }
+    static int count = 0;
+    static u32 last = 0;
+    count++;
+    if (target != last && count <= 100) {
+        fprintf(stderr, "[bx #%d] -> 0x%08X\n", count, target);
+        fflush(stderr);
     }
+    last = target;
 }
 
 /* cpu_bx() is generated in game_entry.c with a dispatch table */
@@ -601,23 +1232,43 @@ void cpu_undefined(u32 insn) {
     fprintf(stderr, "[runtime] Undefined instruction 0x%08X at PC=0x%08X\n", insn, r[15]);
 }
 
-/* ---- Hardware Stubs ---- */
+/* ---- Hardware Interface (called by gba_runtime.h API) ---- */
 
-void ppu_render_scanline(void) { /* TODO: libmgba PPU */ }
-bool ppu_in_vblank(void) { return false; }
-bool ppu_in_hblank(void) { return false; }
-void apu_step(u32 cycles) { (void)cycles; }
-void dma_check(void) { }
-void timer_step(u32 cycles) { (void)cycles; }
-void irq_check(void) { }
+void ppu_render_scanline(void) { /* PPU is frame-based via display.c */ }
+bool ppu_in_vblank(void) { return scanline >= VISIBLE_SCANLINES; }
+bool ppu_in_hblank(void) { return scanline_cycles >= HBLANK_START_CYCLE; }
+void apu_step(u32 cycles) { (void)cycles; /* Audio stub - future work */ }
+void dma_check(void) { /* DMAs are triggered by io_write_hook */ }
+void timer_step(u32 cycles) { timer_tick(cycles); }
+void irq_check(void) { check_interrupts(); }
 
 void gba_frame(void) {
-    /* Fast-forward to next VBlank by advancing cycles.
-     * This is called from SWI VBlankIntrWait. */
-    u32 target = ((cycle_counter / CYCLES_PER_FRAME) + 1) * CYCLES_PER_FRAME
-                 + 160 * CYCLES_PER_SCANLINE;
-    while (cycle_counter < target) {
+    /* Advance to next VBlank. Called from VBlankIntrWait and similar. */
+    u32 target_cycle = ((cycle_counter / CYCLES_PER_FRAME) + 1) * CYCLES_PER_FRAME
+                       + VISIBLE_SCANLINES * CYCLES_PER_SCANLINE;
+    while (cycle_counter < target_cycle) {
         advance_cycles(CYCLES_PER_SCANLINE);
+    }
+}
+
+/* ---- SRAM Persistence ---- */
+
+static void sram_save(void) {
+    if (!sram || !sram_path[0]) return;
+    FILE* f = fopen(sram_path, "wb");
+    if (f) {
+        fwrite(sram, 1, 0x10000, f);
+        fclose(f);
+    }
+}
+
+static void sram_load(void) {
+    if (!sram || !sram_path[0]) return;
+    FILE* f = fopen(sram_path, "rb");
+    if (f) {
+        fread(sram, 1, 0x10000, f);
+        fclose(f);
+        fprintf(stderr, "[runtime] Loaded SRAM from %s\n", sram_path);
     }
 }
 
@@ -625,13 +1276,13 @@ void gba_frame(void) {
 
 void gba_init(const char* rom_path) {
     /* Allocate memory regions */
-    ewram   = calloc(1, 0x40000);  /* 256KB */
-    iwram   = calloc(1, 0x8000);   /* 32KB */
-    io_regs = calloc(1, 0x400);    /* 1KB */
-    palette = calloc(1, 0x400);    /* 1KB */
-    vram    = calloc(1, 0x18000);  /* 96KB */
-    oam     = calloc(1, 0x400);    /* 1KB */
-    sram    = calloc(1, 0x10000);  /* 64KB */
+    ewram   = calloc(1, 0x40000);
+    iwram   = calloc(1, 0x8000);
+    io_regs = calloc(1, 0x400);
+    palette = calloc(1, 0x400);
+    vram    = calloc(1, 0x18000);
+    oam     = calloc(1, 0x400);
+    sram    = calloc(1, 0x10000);
 
     /* Load ROM */
     FILE* f = fopen(rom_path, "rb");
@@ -649,37 +1300,55 @@ void gba_init(const char* rom_path) {
     }
     fclose(f);
 
-    /* Initialize CPU state */
-    memset(r, 0, sizeof(r));
-    r[13] = 0x03007F00; /* SP (IRQ mode) / system mode */
-    r[15] = 0x08000000; /* PC */
-    cpsr  = 0x0000001F; /* System mode */
+    /* Set up SRAM save path */
+    strncpy(sram_path, rom_path, sizeof(sram_path) - 5);
+    sram_path[sizeof(sram_path) - 5] = '\0';
+    char* dot = strrchr(sram_path, '.');
+    if (dot) strcpy(dot, ".sav");
+    else strcat(sram_path, ".sav");
+    sram_load();
 
-    /* Initialize KEYINPUT to all buttons released (active-low) */
+    /* Initialize CPU state (post-BIOS) */
+    memset(r, 0, sizeof(r));
+    r[13] = 0x03007F00;  /* SP - system/user mode */
+    r[15] = 0x08000000;  /* PC */
+    cpsr  = 0x0000001F;  /* System mode */
+
+    /* Set up IRQ stack pointer at standard location */
+    /* (Games expect r13_irq = 0x03007FA0) */
+
+    /* Initialize KEYINPUT to all released */
     io_regs[0x130] = 0xFF;
     io_regs[0x131] = 0x03;
 
-    printf("[runtime] GBA initialized, ROM: %u bytes\n", rom_size);
-    fflush(stdout);
+    /* Initialize SOUNDBIAS to default */
+    io_regs[0x088] = 0x00;
+    io_regs[0x089] = 0x02; /* 0x0200 = default SOUNDBIAS */
+
+    /* Initialize timer state */
+    memset(timers, 0, sizeof(timers));
+
+    fprintf(stderr, "[runtime] GBA static recomp runtime initialized\n");
+    fprintf(stderr, "[runtime] ROM: %u bytes (%s)\n", rom_size, rom_path);
+    fflush(stderr);
 
     /* Initialize display */
     if (display_init() != 0) {
         fprintf(stderr, "[runtime] Failed to initialize display\n");
         exit(1);
     }
-    printf("[runtime] Display initialized (SDL2)\n");
-    fflush(stdout);
 }
 
 void gba_shutdown(void) {
+    sram_save();
     display_shutdown();
-    free(ewram);   ewram = NULL;
-    free(iwram);   iwram = NULL;
-    free(io_regs); io_regs = NULL;
-    free(palette); palette = NULL;
-    free(vram);    vram = NULL;
-    free(oam);     oam = NULL;
+    free(ewram);    ewram = NULL;
+    free(iwram);    iwram = NULL;
+    free(io_regs);  io_regs = NULL;
+    free(palette);  palette = NULL;
+    free(vram);     vram = NULL;
+    free(oam);      oam = NULL;
     free(rom_data); rom_data = NULL;
-    free(sram);    sram = NULL;
-    printf("[runtime] GBA shutdown\n");
+    free(sram);     sram = NULL;
+    fprintf(stderr, "[runtime] Shutdown\n");
 }

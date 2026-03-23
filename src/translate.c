@@ -1461,6 +1461,148 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         /* (handled below in CMakeLists generation) */
     }
 
+    /* 3b. Write unresolved.c - empty bodies for ALL functions declared in
+     * game.h that don't have a definition in funcs_*.c or stubs_*.c.
+     * This catches functions referenced by translated code that weren't
+     * in the analysis (e.g., calls from stub functions into unanalyzed code). */
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/unresolved.c", outdir);
+        FILE* f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "/* Unresolved functions - trap stubs for unanalyzed code */\n");
+            fprintf(f, "#include \"game.h\"\n");
+            fprintf(f, "#include <stdio.h>\n\n");
+
+            /* Build set of all defined function addresses (funcs + stubs) */
+            int defined_cap = analysis->num_functions + num_stubs;
+            u32* defined = malloc(sizeof(u32) * defined_cap);
+            int ndef = 0;
+            for (int i = 0; i < analysis->num_functions; i++)
+                defined[ndef++] = analysis->functions[i].entry;
+            for (int i = 0; i < num_stubs; i++)
+                defined[ndef++] = stubs[i];
+
+            /* Scan ALL generated C files for func_XXXXXXXX references and
+             * generate stubs for any that aren't in the defined set.
+             * This is the most reliable approach - catches BL targets,
+             * tail branch targets, and any other references. */
+            int unresolved_cap = 2048;
+            u32* unresolved = malloc(sizeof(u32) * unresolved_cap);
+            int num_unresolved = 0;
+
+            /* Scan funcs_*.c and stubs_*.c files */
+            const char* scan_prefixes[] = { "funcs_", "stubs_", NULL };
+            for (int pi = 0; scan_prefixes[pi]; pi++) {
+                for (int fi2 = 0; fi2 < 999; fi2++) {
+                    char scan_path[512];
+                    snprintf(scan_path, sizeof(scan_path), "%s/%s%03d.c", outdir, scan_prefixes[pi], fi2);
+                    FILE* sf = fopen(scan_path, "rb");
+                    if (!sf) break;
+
+                    /* Read file and scan for func_XXXXXXXX( patterns */
+                    fseek(sf, 0, SEEK_END);
+                    long file_sz = ftell(sf);
+                    fseek(sf, 0, SEEK_SET);
+                    char* file_buf = malloc(file_sz + 1);
+                    fread(file_buf, 1, file_sz, sf);
+                    file_buf[file_sz] = '\0';
+                    fclose(sf);
+
+                    char* p = file_buf;
+                    while ((p = strstr(p, "func_")) != NULL) {
+                        /* Parse the hex address */
+                        char* hex_start = p + 5;
+                        u32 addr = 0;
+                        int digits = 0;
+                        while (digits < 8 && ((hex_start[digits] >= '0' && hex_start[digits] <= '9') ||
+                               (hex_start[digits] >= 'A' && hex_start[digits] <= 'F') ||
+                               (hex_start[digits] >= 'a' && hex_start[digits] <= 'f'))) {
+                            char c = hex_start[digits];
+                            addr = addr * 16;
+                            if (c >= '0' && c <= '9') addr += c - '0';
+                            else if (c >= 'A' && c <= 'F') addr += c - 'A' + 10;
+                            else addr += c - 'a' + 10;
+                            digits++;
+                        }
+                        p = hex_start + digits;
+                        if (digits != 8) continue;
+                        if ((addr >> 24) != 0x08) continue;
+
+                        /* Check if next char is '(' - it's a function call/definition */
+                        /* We want to catch both calls and declarations */
+
+                        /* Check if defined */
+                        bool is_def = false;
+                        for (int j = 0; j < ndef && !is_def; j++)
+                            if (defined[j] == addr) is_def = true;
+                        if (is_def) continue;
+
+                        /* Check not already unresolved */
+                        bool dup = false;
+                        for (int j = 0; j < num_unresolved && !dup; j++)
+                            if (unresolved[j] == addr) dup = true;
+                        if (dup) continue;
+
+                        if (num_unresolved >= unresolved_cap) {
+                            unresolved_cap *= 2;
+                            unresolved = realloc(unresolved, sizeof(u32) * unresolved_cap);
+                        }
+                        unresolved[num_unresolved++] = addr;
+                    }
+                    free(file_buf);
+                }
+            }
+
+            fprintf(f, "/* %d unresolved function targets */\n\n", num_unresolved);
+            for (int i = 0; i < num_unresolved; i++) {
+                fprintf(f, "void func_%08X(void) {\n", unresolved[i]);
+                fprintf(f, "    static int warn = 0;\n");
+                fprintf(f, "    if (++warn <= 3) {\n");
+                fprintf(f, "        fprintf(stderr, \"[unresolved] func_%08X called\\n\");\n", unresolved[i]);
+                fprintf(f, "    }\n");
+                fprintf(f, "}\n\n");
+            }
+
+            fclose(f);
+            printf("[translate] %d unresolved function stubs generated\n", num_unresolved);
+
+            /* Append unresolved declarations to game.h (before the #endif) */
+            if (num_unresolved > 0) {
+                char gameh_path[512];
+                snprintf(gameh_path, sizeof(gameh_path), "%s/game.h", outdir);
+                FILE* gh = fopen(gameh_path, "a");
+                if (gh) {
+                    /* Rewind past the #endif line we already wrote */
+                    /* Actually, just append - the #endif already closed the guard,
+                     * so reopen without the guard by just declaring in the file.
+                     * Simplest: write the file fresh with all declarations. */
+                    fclose(gh);
+
+                    gh = fopen(gameh_path, "w");
+                    if (gh) {
+                        fprintf(gh, "/* Auto-generated by gbarecomp - %s (%s) */\n", rom->title, rom->game_code);
+                        fprintf(gh, "#ifndef GAME_H\n#define GAME_H\n\n");
+                        fprintf(gh, "#include \"gba_runtime.h\"\n\n");
+                        for (int i = 0; i < analysis->num_functions; i++)
+                            fprintf(gh, "void func_%08X(void);\n", analysis->functions[i].entry);
+                        for (int i = 0; i < num_stubs; i++)
+                            fprintf(gh, "void func_%08X(void);\n", stubs[i]);
+                        fprintf(gh, "\n/* Unresolved function declarations (%d) */\n", num_unresolved);
+                        for (int i = 0; i < num_unresolved; i++)
+                            fprintf(gh, "void func_%08X(void);\n", unresolved[i]);
+                        fprintf(gh, "\nvoid game_entry(void);\n");
+                        fprintf(gh, "\n#endif /* GAME_H */\n");
+                        fclose(gh);
+                    }
+                }
+            }
+
+            free(unresolved);
+            free(defined);
+        }
+    }
+
     /* 4. Write game_entry.c with BX dispatch table */
     {
         char path[512];
@@ -1500,7 +1642,7 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    /* Prevent infinite recursion: if already inside a recompiled function,\n");
         fprintf(f, "     * just set r[15] and return (BX-as-return or indirect call). */\n");
         fprintf(f, "    if (_bx_depth > 10) { r[15] = target; return; }\n");
-        fprintf(f, "    /* RAM targets: run via mGBA interpreter */\n");
+        fprintf(f, "    /* RAM targets: pre-compiled IWRAM functions or stub */\n");
         fprintf(f, "    if ((target >> 24) == 0x02 || (target >> 24) == 0x03) {\n");
         fprintf(f, "        run_iwram_function(target);\n");
         fprintf(f, "        return;\n");
@@ -1526,48 +1668,12 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    r[15] = target;\n");
         fprintf(f, "}\n\n");
 
-        /* Interception setup - populates the function table for interception.c */
-        fprintf(f, "\n/* Set up function interception table from BX dispatch entries */\n");
-        fprintf(f, "typedef struct { unsigned int addr; void (*func)(void); } FuncEntry;\n");
-        fprintf(f, "extern void interception_init(FuncEntry* table, int size);\n\n");
-        fprintf(f, "void interception_setup_from_bx_table(void) {\n");
-        fprintf(f, "    /* Reuse the BX table for interception - only ROM functions */\n");
-        fprintf(f, "    static FuncEntry intercept_table[] = {\n");
-        int rom_func_count = 0;
-        for (int i = 0; i < analysis->num_functions; i++) {
-            u32 entry = analysis->functions[i].entry;
-            /* Only intercept ROM functions (not IWRAM) */
-            if ((entry >> 24) == 0x08) {
-                fprintf(f, "        { 0x%08Xu, func_%08X },\n", entry, entry);
-                rom_func_count++;
-            }
-        }
-        fprintf(f, "    };\n");
-        fprintf(f, "    interception_init(intercept_table, %d);\n", rom_func_count);
-        fprintf(f, "}\n\n");
-
-        /* Add main() - after mGBA init, call the main game function directly */
+        /* main() - static recomp entry point. No emulator, just init and go. */
         fprintf(f, "int main(int argc, char* argv[]) {\n");
         fprintf(f, "    const char* rom_path = argc > 1 ? argv[1] : \"game.gba\";\n");
-        fprintf(f, "    gba_init(rom_path); /* mGBA runs init, then hands off */\n");
-        fprintf(f, "    /* Call the main game function directly (skip crt0 - mGBA did that) */\n");
-
-        /* Find the main game function by looking at the call chain:
-         * crt0 -> AgbMain -> quick_init -> MAIN_GAME_FUNCTION */
-        u32 main_func = 0;
-        for (int i = 0; i < analysis->num_functions; i++) {
-            /* The main game function is the largest one discovered from entry point */
-            if (analysis->functions[i].num_blocks > 100) {
-                main_func = analysis->functions[i].entry;
-                break;
-            }
-        }
-        if (main_func) {
-            fprintf(f, "    func_%08X(); /* main game function */\n", main_func);
-        } else {
-            fprintf(f, "    game_entry(); /* fallback to full entry */\n");
-        }
-
+        fprintf(f, "    gba_init(rom_path);\n");
+        fprintf(f, "    /* Run the recompiled game directly - no emulator underneath */\n");
+        fprintf(f, "    game_entry();\n");
         fprintf(f, "    gba_shutdown();\n");
         fprintf(f, "    return 0;\n");
         fprintf(f, "}\n");
@@ -1591,24 +1697,12 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "else()\n");
         fprintf(f, "    add_compile_options(-Wall -Wno-unused-label -Wno-pointer-to-int-cast -O2)\n");
         fprintf(f, "endif()\n\n");
-        fprintf(f, "# ImGui (Dear ImGui with SDL2+SDL_Renderer backend)\n");
-        fprintf(f, "set(IMGUI_DIR \"D:/recomp/gba/imgui\")\n");
-        fprintf(f, "set(IMGUI_SOURCES\n");
-        fprintf(f, "    ${IMGUI_DIR}/imgui.cpp\n");
-        fprintf(f, "    ${IMGUI_DIR}/imgui_draw.cpp\n");
-        fprintf(f, "    ${IMGUI_DIR}/imgui_tables.cpp\n");
-        fprintf(f, "    ${IMGUI_DIR}/imgui_widgets.cpp\n");
-        fprintf(f, "    ${IMGUI_DIR}/imgui_demo.cpp\n");
-        fprintf(f, "    ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp\n");
-        fprintf(f, "    ${IMGUI_DIR}/backends/imgui_impl_sdlrenderer2.cpp\n");
-        fprintf(f, ")\n\n");
+        fprintf(f, "# No ImGui or mGBA dependencies - pure static recomp\n\n");
         fprintf(f, "set(SOURCES\n");
         fprintf(f, "    game_entry.c\n");
         fprintf(f, "    runtime.c\n");
         fprintf(f, "    display.c\n");
-        fprintf(f, "    menu.cpp\n");
-        fprintf(f, "    interception.c\n");
-        fprintf(f, "    verify.c\n");
+        fprintf(f, "    unresolved.c\n");
         {
             int stubs_per_file = 200;
             int nsf = (num_stubs + stubs_per_file - 1) / stubs_per_file;
@@ -1620,8 +1714,8 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
             fprintf(f, "    funcs_%03d.c\n", i);
         }
         fprintf(f, ")\n\n");
-        fprintf(f, "add_executable(%s ${SOURCES} ${IMGUI_SOURCES})\n", rom->game_code);
-        fprintf(f, "target_include_directories(%s PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends)\n\n", rom->game_code);
+        fprintf(f, "add_executable(%s ${SOURCES})\n", rom->game_code);
+        fprintf(f, "target_include_directories(%s PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})\n\n", rom->game_code);
         /* SDL2 integration */
         fprintf(f, "# SDL2 display\n");
         fprintf(f, "find_package(SDL2 CONFIG)\n");
@@ -1640,30 +1734,64 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fclose(f);
     }
 
-    /* 5. Write include shims pointing to real headers */
+    /* 5. Copy headers into output directory for standalone build */
     {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/gba_runtime.h", outdir);
-        FILE* f = fopen(path, "w");
-        if (f) {
-            fprintf(f, "/* Include shim - points to gbarecomp headers */\n");
-            fprintf(f, "#include \"../../include/gba/gba_runtime.h\"\n");
-            fclose(f);
+        char src_path[512], dst_path[512];
+        char buf[8192];
+        size_t n;
+        FILE *fin, *fout;
+
+        /* Copy gba_runtime.h */
+        snprintf(dst_path, sizeof(dst_path), "%s/gba_runtime.h", outdir);
+        /* Find the gbarecomp include directory relative to the executable.
+         * For robustness, try environment variable or known paths. */
+        const char* header_files[] = {
+            "include/gba/gba_runtime.h",
+            "../include/gba/gba_runtime.h",
+            "../../include/gba/gba_runtime.h",
+            NULL
+        };
+        fin = NULL;
+        for (int i = 0; header_files[i] && !fin; i++) {
+            fin = fopen(header_files[i], "rb");
         }
-        /* types.h shim (needed by display.h) */
-        snprintf(path, sizeof(path), "%s/gba", outdir);
-        MKDIR(path);
-        snprintf(path, sizeof(path), "%s/gba/types.h", outdir);
-        f = fopen(path, "w");
-        if (f) {
-            fprintf(f, "#include \"../../../include/gba/types.h\"\n");
-            fclose(f);
+        if (fin) {
+            fout = fopen(dst_path, "wb");
+            if (fout) {
+                while ((n = fread(buf, 1, sizeof(buf), fin)) > 0)
+                    fwrite(buf, 1, n, fout);
+                fclose(fout);
+            }
+            fclose(fin);
         }
-        snprintf(path, sizeof(path), "%s/gba/display.h", outdir);
-        f = fopen(path, "w");
-        if (f) {
-            fprintf(f, "#include \"../../../include/gba/display.h\"\n");
-            fclose(f);
+
+        /* Create gba/ subdirectory and copy types.h, display.h */
+        snprintf(dst_path, sizeof(dst_path), "%s/gba", outdir);
+        MKDIR(dst_path);
+
+        const char* sub_headers[] = { "types.h", "display.h", "gba_runtime.h", NULL };
+        for (int i = 0; sub_headers[i]; i++) {
+            fin = NULL;
+            const char* sub_paths[] = {
+                "include/gba/%s",
+                "../include/gba/%s",
+                "../../include/gba/%s",
+                NULL
+            };
+            for (int j = 0; sub_paths[j] && !fin; j++) {
+                snprintf(src_path, sizeof(src_path), sub_paths[j], sub_headers[i]);
+                fin = fopen(src_path, "rb");
+            }
+            if (fin) {
+                snprintf(dst_path, sizeof(dst_path), "%s/gba/%s", outdir, sub_headers[i]);
+                fout = fopen(dst_path, "wb");
+                if (fout) {
+                    while ((n = fread(buf, 1, sizeof(buf), fin)) > 0)
+                        fwrite(buf, 1, n, fout);
+                    fclose(fout);
+                }
+                fclose(fin);
+            }
         }
     }
 
