@@ -1206,15 +1206,50 @@ void gba_swi(u32 number) {
  * that the recompiled ROM functions call via BX to RAM addresses. */
 void run_iwram_function(u32 target) {
     static int call_count = 0;
+    /* Quick sanity check: if target has Thumb bit set, check for valid Thumb prologue.
+     * If target is even (ARM mode), skip the check - ARM instruction bytes often look like ASCII.
+     * Only filter obvious non-code for Thumb targets. */
+    /* Check for data-as-code: skip if target looks like non-code data.
+     * Read memory directly (not via bus_read) to avoid cycle side effects. */
+    {
+        u32 peek = target & ~1u;
+        u32 region = peek >> 24;
+        u8* mem = NULL;
+        u32 off = 0;
+        if (region == 0x02) { mem = ewram; off = peek & 0x3FFFF; }
+        else if (region == 0x03) { mem = iwram; off = peek & 0x7FFF; }
+        if (mem) {
+            u8 b0 = mem[off], b1 = mem[off+1];
+            u32 w = mem[off] | (mem[off+1]<<8) | (mem[off+2]<<16) | (mem[off+3]<<24);
+            bool is_data = (w == 0 || w == 0xFFFFFFFF || (w & 0xFFFF0000) == 0xFFFF0000);
+            if (!is_data && (target & 1)) {
+                /* Thumb: check if first halfword looks like ASCII */
+                if (b0 >= 0x20 && b0 < 0x7F && b1 >= 0x20 && b1 < 0x7F)
+                    is_data = true;
+            }
+            if (!is_data && !(target & 1)) {
+                /* ARM: check condition field (bits 28-31). Valid ARM has cond 0x0-0xE.
+                 * Also check that the word doesn't look like a pointer (0x0XXXXXXX) or ASCII. */
+                u8 cond = (w >> 28) & 0xF;
+                if (cond == 0xF) is_data = true; /* NV condition = unlikely real code */
+                /* ASCII 4-byte check */
+                if (b0 >= 0x20 && b0 < 0x7F && b1 >= 0x20 && b1 < 0x7F &&
+                    mem[off+2] >= 0x20 && mem[off+2] < 0x7F && mem[off+3] >= 0x20 && mem[off+3] < 0x7F)
+                    is_data = true;
+            }
+            if (is_data) {
+                r[15] = r[14] & ~1u;
+                return;
+            }
+        }
+    }
+
     call_count++;
     if (call_count <= 20) {
         u32 peek_addr = target & ~1u;
         fprintf(stderr, "[interp] Running RAM code at 0x%08X (bytes: %02X %02X %02X %02X) LR=0x%08X SP=0x%08X\n",
                 target, bus_read8(peek_addr), bus_read8(peek_addr+1),
                 bus_read8(peek_addr+2), bus_read8(peek_addr+3), r[14], r[13]);
-        /* Show stack for backtrace */
-        fprintf(stderr, "         Stack: [SP]=0x%08X [SP+4]=0x%08X [SP+8]=0x%08X [SP+12]=0x%08X\n",
-                bus_read32(r[13]), bus_read32(r[13]+4), bus_read32(r[13]+8), bus_read32(r[13]+12));
         fflush(stderr);
     }
 
@@ -1233,20 +1268,313 @@ void run_iwram_function(u32 target) {
         steps++;
 
         if (!thumb) {
-            /* ARM mode - not common for RAM code, but handle BX back */
+            /* ARM mode interpreter */
             u32 insn = bus_read32(pc);
             pc += 4;
 
-            /* Only handle BX LR (return) for now */
+            /* Check condition */
+            int cond = (insn >> 28) & 0xF;
+            bool exec = false;
+            switch (cond) {
+            case 0x0: exec = CPU_Z; break;
+            case 0x1: exec = !CPU_Z; break;
+            case 0x2: exec = CPU_C; break;
+            case 0x3: exec = !CPU_C; break;
+            case 0x4: exec = CPU_N; break;
+            case 0x5: exec = !CPU_N; break;
+            case 0x6: exec = CPU_V; break;
+            case 0x7: exec = !CPU_V; break;
+            case 0x8: exec = CPU_C && !CPU_Z; break;
+            case 0x9: exec = !CPU_C || CPU_Z; break;
+            case 0xA: exec = CPU_N == CPU_V; break;
+            case 0xB: exec = CPU_N != CPU_V; break;
+            case 0xC: exec = !CPU_Z && (CPU_N == CPU_V); break;
+            case 0xD: exec = CPU_Z || (CPU_N != CPU_V); break;
+            case 0xE: exec = true; break;
+            case 0xF: exec = false; break; /* NV / special */
+            }
+            if (!exec) continue;
+
+            /* BX Rm */
             if ((insn & 0x0FFFFFF0) == 0x012FFF10) {
                 u32 rm = insn & 0xF;
                 u32 addr = r[rm];
                 if ((addr & ~1u) == (return_sentinel & ~1u)) break;
+                if ((addr >> 24) == 0x08) { r[15] = addr; break; }
                 thumb = (addr & 1) != 0;
                 pc = addr & ~1u;
                 continue;
             }
-            /* Unknown ARM instruction in RAM - bail */
+
+            /* B / BL */
+            if ((insn & 0x0E000000) == 0x0A000000) {
+                s32 offset = (s32)(insn << 8) >> 6;
+                bool link = (insn >> 24) & 1;
+                if (link) r[14] = pc; /* PC already advanced */
+                u32 target = (u32)((s32)pc + offset + 4);
+                pc = target;
+                continue;
+            }
+
+            /* Data processing: AND, EOR, SUB, RSB, ADD, ADC, SBC, RSC, TST, TEQ, CMP, CMN, ORR, MOV, BIC, MVN */
+            if ((insn & 0x0C000000) == 0x00000000) {
+                int opcode = (insn >> 21) & 0xF;
+                bool s_bit = (insn >> 20) & 1;
+                int rn = (insn >> 16) & 0xF;
+                int rd = (insn >> 12) & 0xF;
+
+                /* Compute operand2 (shifter operand) */
+                u32 op2;
+                bool shift_carry = CPU_C;
+                if (insn & (1 << 25)) {
+                    /* Immediate: 8-bit rotated */
+                    u32 imm = insn & 0xFF;
+                    u32 rot = ((insn >> 8) & 0xF) * 2;
+                    if (rot > 0) {
+                        op2 = (imm >> rot) | (imm << (32 - rot));
+                        shift_carry = (op2 >> 31) & 1;
+                    } else {
+                        op2 = imm;
+                    }
+                } else {
+                    /* Register with shift */
+                    int rm = insn & 0xF;
+                    op2 = r[rm];
+                    if (rm == 15) op2 = pc + 4;
+                    int shift_type = (insn >> 5) & 3;
+                    u32 shift_amount;
+                    if (insn & (1 << 4)) {
+                        shift_amount = r[(insn >> 8) & 0xF] & 0xFF;
+                    } else {
+                        shift_amount = (insn >> 7) & 0x1F;
+                    }
+                    switch (shift_type) {
+                    case 0: /* LSL */
+                        if (shift_amount > 0) {
+                            if (shift_amount < 32) { shift_carry = (op2 >> (32 - shift_amount)) & 1; op2 <<= shift_amount; }
+                            else if (shift_amount == 32) { shift_carry = op2 & 1; op2 = 0; }
+                            else { shift_carry = 0; op2 = 0; }
+                        }
+                        break;
+                    case 1: /* LSR */
+                        if (shift_amount == 0) shift_amount = 32;
+                        if (shift_amount < 32) { shift_carry = (op2 >> (shift_amount - 1)) & 1; op2 >>= shift_amount; }
+                        else if (shift_amount == 32) { shift_carry = (op2 >> 31) & 1; op2 = 0; }
+                        else { shift_carry = 0; op2 = 0; }
+                        break;
+                    case 2: /* ASR */
+                        if (shift_amount == 0) shift_amount = 32;
+                        if (shift_amount >= 32) { shift_carry = (op2 >> 31) & 1; op2 = (u32)((s32)op2 >> 31); }
+                        else { shift_carry = (op2 >> (shift_amount - 1)) & 1; op2 = (u32)((s32)op2 >> shift_amount); }
+                        break;
+                    case 3: /* ROR/RRX */
+                        if (shift_amount == 0) { /* RRX */
+                            shift_carry = op2 & 1;
+                            op2 = (CPU_C ? 0x80000000u : 0) | (op2 >> 1);
+                        } else {
+                            shift_amount &= 31;
+                            if (shift_amount == 0) { shift_carry = (op2 >> 31) & 1; }
+                            else { op2 = (op2 >> shift_amount) | (op2 << (32 - shift_amount)); shift_carry = (op2 >> 31) & 1; }
+                        }
+                        break;
+                    }
+                }
+
+                u32 a = r[rn];
+                if (rn == 15) a = pc + 4;
+                u32 result;
+                switch (opcode) {
+                case 0x0: result = a & op2; if (rd < 15) r[rd] = result; break; /* AND */
+                case 0x1: result = a ^ op2; if (rd < 15) r[rd] = result; break; /* EOR */
+                case 0x2: /* SUB */ cpu_sub(rd < 15 ? &r[rd] : NULL, a, op2, s_bit); continue;
+                case 0x3: /* RSB */ cpu_sub(rd < 15 ? &r[rd] : NULL, op2, a, s_bit); continue;
+                case 0x4: /* ADD */ cpu_add(rd < 15 ? &r[rd] : NULL, a, op2, s_bit); continue;
+                case 0x5: /* ADC */ cpu_adc(rd < 15 ? &r[rd] : NULL, a, op2, s_bit); continue;
+                case 0x6: /* SBC */ cpu_sbc(rd < 15 ? &r[rd] : NULL, a, op2, s_bit); continue;
+                case 0x7: /* RSC */ { u32 tmp = CPU_C; cpu_sbc(rd < 15 ? &r[rd] : NULL, op2, a, s_bit); if (!s_bit) CPU_C = tmp; continue; }
+                case 0x8: result = a & op2; break; /* TST */
+                case 0x9: result = a ^ op2; break; /* TEQ */
+                case 0xA: /* CMP */ cpu_sub(NULL, a, op2, true); continue;
+                case 0xB: /* CMN */ cpu_add(NULL, a, op2, true); continue;
+                case 0xC: result = a | op2; if (rd < 15) r[rd] = result; break; /* ORR */
+                case 0xD: result = op2; if (rd < 15) r[rd] = result; break; /* MOV */
+                case 0xE: result = a & ~op2; if (rd < 15) r[rd] = result; break; /* BIC */
+                case 0xF: result = ~op2; if (rd < 15) r[rd] = result; break; /* MVN */
+                default: result = 0; break;
+                }
+                if (s_bit && opcode != 0x2 && opcode != 0x3 && opcode != 0x4 &&
+                    opcode != 0x5 && opcode != 0x6 && opcode != 0x7 &&
+                    opcode != 0xA && opcode != 0xB) {
+                    CPU_N = (result >> 31) & 1;
+                    CPU_Z = (result == 0);
+                    CPU_C = shift_carry;
+                    /* V unchanged for logical ops */
+                }
+                if (rd == 15) {
+                    pc = result & ~3u;
+                    /* Check for mode switch if S bit set */
+                }
+                continue;
+            }
+
+            /* Single data transfer: LDR/STR */
+            if ((insn & 0x0C000000) == 0x04000000) {
+                bool i = (insn >> 25) & 1;  /* 0=immediate, 1=register */
+                bool p = (insn >> 24) & 1;  /* pre/post indexing */
+                bool u = (insn >> 23) & 1;  /* up/down */
+                bool b = (insn >> 22) & 1;  /* byte/word */
+                bool w = (insn >> 21) & 1;  /* writeback */
+                bool l = (insn >> 20) & 1;  /* load/store */
+                int rn_idx = (insn >> 16) & 0xF;
+                int rd_idx = (insn >> 12) & 0xF;
+
+                u32 base = r[rn_idx];
+                if (rn_idx == 15) base = pc + 4;
+                u32 offset2;
+                if (!i) {
+                    offset2 = insn & 0xFFF;
+                } else {
+                    int rm = insn & 0xF;
+                    offset2 = r[rm];
+                    int shift_type = (insn >> 5) & 3;
+                    u32 shift_amt = (insn >> 7) & 0x1F;
+                    switch (shift_type) {
+                    case 0: offset2 = shift_amt ? offset2 << shift_amt : offset2; break;
+                    case 1: offset2 = shift_amt ? offset2 >> shift_amt : 0; break;
+                    case 2: offset2 = shift_amt ? (u32)((s32)offset2 >> shift_amt) : (u32)((s32)offset2 >> 31); break;
+                    case 3: offset2 = shift_amt ? (offset2 >> shift_amt) | (offset2 << (32 - shift_amt)) : (CPU_C ? 0x80000000u : 0) | (offset2 >> 1); break;
+                    }
+                }
+
+                u32 addr = p ? (u ? base + offset2 : base - offset2) : base;
+                if (l) {
+                    r[rd_idx] = b ? bus_read8(addr) : bus_read32(addr);
+                    if (rd_idx == 15) { pc = r[15] & ~3u; }
+                } else {
+                    u32 val = r[rd_idx];
+                    if (rd_idx == 15) val = pc + 4;
+                    if (b) bus_write8(addr, (u8)val);
+                    else bus_write32(addr, val);
+                }
+                if (!p) addr = u ? base + offset2 : base - offset2;
+                if (w || !p) r[rn_idx] = addr;
+                continue;
+            }
+
+            /* Block data transfer: LDM/STM */
+            if ((insn & 0x0E000000) == 0x08000000) {
+                bool p = (insn >> 24) & 1;
+                bool u = (insn >> 23) & 1;
+                bool s_bit2 = (insn >> 22) & 1; (void)s_bit2;
+                bool w = (insn >> 21) & 1;
+                bool l = (insn >> 20) & 1;
+                int rn_idx = (insn >> 16) & 0xF;
+                u16 rlist = insn & 0xFFFF;
+
+                u32 base = r[rn_idx];
+                int count = 0;
+                for (int i2 = 0; i2 < 16; i2++) if (rlist & (1 << i2)) count++;
+
+                u32 start;
+                if (u) start = p ? base + 4 : base;
+                else start = p ? base - count * 4 : base - count * 4 + 4;
+
+                u32 addr2 = start;
+                for (int i2 = 0; i2 < 16; i2++) {
+                    if (!(rlist & (1 << i2))) continue;
+                    if (l) {
+                        r[i2] = bus_read32(addr2);
+                        if (i2 == 15) pc = r[15] & ~3u;
+                    } else {
+                        bus_write32(addr2, r[i2]);
+                    }
+                    addr2 += 4;
+                }
+                if (w) r[rn_idx] = u ? base + count * 4 : base - count * 4;
+                continue;
+            }
+
+            /* MSR */
+            if ((insn & 0x0FB0F000) == 0x0120F000) {
+                u32 val;
+                if (insn & (1 << 25)) {
+                    u32 imm = insn & 0xFF;
+                    u32 rot = ((insn >> 8) & 0xF) * 2;
+                    val = rot ? (imm >> rot) | (imm << (32 - rot)) : imm;
+                } else {
+                    val = r[insn & 0xF];
+                }
+                u32 mask = 0;
+                if (insn & (1 << 19)) mask |= 0xF0000000;
+                if (insn & (1 << 16)) mask |= 0x000000FF;
+                bool spsr = (insn >> 22) & 1;
+                if (spsr) cpu_set_spsr(val, mask >> 28);
+                else cpu_set_cpsr(val, mask >> 28);
+                continue;
+            }
+
+            /* MRS */
+            if ((insn & 0x0FBF0FFF) == 0x010F0000) {
+                int rd_idx = (insn >> 12) & 0xF;
+                bool spsr = (insn >> 22) & 1;
+                r[rd_idx] = spsr ? cpu_get_spsr() : cpu_get_cpsr();
+                continue;
+            }
+
+            /* MUL/MLA */
+            if ((insn & 0x0FC000F0) == 0x00000090) {
+                int rd_idx = (insn >> 16) & 0xF;
+                int rn_idx2 = (insn >> 12) & 0xF;
+                int rs_idx = (insn >> 8) & 0xF;
+                int rm_idx = insn & 0xF;
+                bool accumulate = (insn >> 21) & 1;
+                bool s_mul = (insn >> 20) & 1;
+                u32 result = r[rm_idx] * r[rs_idx];
+                if (accumulate) result += r[rn_idx2];
+                r[rd_idx] = result;
+                if (s_mul) cpu_update_nz(result);
+                continue;
+            }
+
+            /* SWI */
+            if ((insn & 0x0F000000) == 0x0F000000) {
+                gba_swi((insn >> 16) & 0xFF);
+                continue;
+            }
+
+            /* Halfword transfer: LDRH/STRH/LDRSB/LDRSH */
+            if ((insn & 0x0E000090) == 0x00000090 && (insn & 0x00000060)) {
+                bool p = (insn >> 24) & 1;
+                bool u = (insn >> 23) & 1;
+                bool imm_off = (insn >> 22) & 1;
+                bool w = (insn >> 21) & 1;
+                bool l = (insn >> 20) & 1;
+                int rn_idx = (insn >> 16) & 0xF;
+                int rd_idx = (insn >> 12) & 0xF;
+                int sh = (insn >> 5) & 3;
+
+                u32 base = r[rn_idx];
+                u32 off;
+                if (imm_off) off = ((insn >> 4) & 0xF0) | (insn & 0xF);
+                else off = r[insn & 0xF];
+
+                u32 addr = p ? (u ? base + off : base - off) : base;
+                if (l) {
+                    switch (sh) {
+                    case 1: r[rd_idx] = bus_read16(addr); break; /* LDRH */
+                    case 2: r[rd_idx] = (u32)(s32)(s8)bus_read8(addr); break; /* LDRSB */
+                    case 3: r[rd_idx] = (u32)(s32)(s16)bus_read16(addr); break; /* LDRSH */
+                    }
+                } else {
+                    if (sh == 1) bus_write16(addr, (u16)r[rd_idx]); /* STRH */
+                }
+                if (!p) addr = u ? base + off : base - off;
+                if (w || !p) r[rn_idx] = addr;
+                continue;
+            }
+
+            /* Unhandled ARM instruction */
+            fprintf(stderr, "[interp] Unknown ARM insn 0x%08X at 0x%08X\n", insn, pc - 4);
             break;
         }
 
