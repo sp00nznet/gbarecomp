@@ -201,6 +201,10 @@ void gba_frame(void);
 /* Initialize the GBA runtime (memory, PPU, APU, etc.) */
 void gba_init(const char* rom_path);
 
+/* Run the game with SoftReset support. Calls entry_func() in a loop,
+ * restarting from the top whenever SWI 0x00 (SoftReset) is called. */
+void gba_run(void (*entry_func)(void));
+
 /* Shutdown */
 void gba_shutdown(void);
 

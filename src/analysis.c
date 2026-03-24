@@ -275,6 +275,12 @@ static void analyze_arm_block(AnalysisCtx* ctx, u32 start, Function* func) {
                 /* LDM with PC - likely a return */
                 block->is_return = true;
                 block->num_successors = 0;
+            } else if (insn.type == ARM_SWI) {
+                /* SWI is a BIOS call - execution continues after it */
+                block->successors[0] = addr + 4;
+                block->num_successors = 1;
+                queue_push_ex(ctx, addr + 4, CODE_ARM, addr, false,
+                             func ? func->entry : 0);
             } else {
                 /* Other PC-modifying instruction */
                 block->has_indirect = true;
@@ -472,6 +478,12 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
                         }
                     }
                 }
+            } else if (insn.type == THUMB_SWI) {
+                /* SWI is a call to BIOS - execution continues after it */
+                block->successors[0] = addr + 2;
+                block->num_successors = 1;
+                queue_push_ex(ctx, addr + 2, CODE_THUMB, addr, false,
+                             func ? func->entry : 0);
             } else {
                 block->num_successors = 0;
             }
@@ -1064,9 +1076,15 @@ void analysis_run(AnalysisCtx* ctx) {
                                     /* Thumb BL: prefix F0xx + suffix F8xx */
                                     if ((prev2_hw & 0xF800) == 0xF000 && (prev_hw & 0xF800) == 0xF800)
                                         is_bl_continuation = true;
+                                    /* Thumb SWI: DFxx */
+                                    if ((prev_hw & 0xFF00) == 0xDF00)
+                                        is_bl_continuation = true;
                                 } else if (blk->mode == CODE_ARM) {
                                     u32 last_arm = rom_read32(ctx->rom, blk->end - 4);
                                     if ((last_arm & 0x0F000000) == 0x0B000000)
+                                        is_bl_continuation = true;
+                                    /* ARM SWI: 0xEF...... */
+                                    if ((last_arm & 0x0F000000) == 0x0F000000)
                                         is_bl_continuation = true;
                                 }
                             }

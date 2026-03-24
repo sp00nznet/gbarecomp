@@ -1672,8 +1672,8 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "int main(int argc, char* argv[]) {\n");
         fprintf(f, "    const char* rom_path = argc > 1 ? argv[1] : \"game.gba\";\n");
         fprintf(f, "    gba_init(rom_path);\n");
-        fprintf(f, "    /* Run the recompiled game directly - no emulator underneath */\n");
-        fprintf(f, "    game_entry();\n");
+        fprintf(f, "    /* Run the recompiled game with SoftReset support */\n");
+        fprintf(f, "    gba_run(game_entry);\n");
         fprintf(f, "    gba_shutdown();\n");
         fprintf(f, "    return 0;\n");
         fprintf(f, "}\n");

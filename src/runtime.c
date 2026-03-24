@@ -19,6 +19,11 @@
 #include <SDL2/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <setjmp.h>
+
+/* SoftReset support: longjmp back to main loop entry */
+static jmp_buf soft_reset_jmp;
+static bool soft_reset_jmp_valid = false;
 
 /* ---- CPU State ---- */
 
@@ -788,6 +793,11 @@ void gba_swi(u32 number) {
         r[13] = 0x03007F00;
         r[15] = 0x08000000;
         cpsr = 0x0000001F;
+        /* On real GBA, SoftReset jumps to ROM entry. In recompiled code,
+         * longjmp back to the game_entry() caller to restart cleanly. */
+        if (soft_reset_jmp_valid) {
+            longjmp(soft_reset_jmp, 1);
+        }
         break;
 
     case 0x01: { /* RegisterRamReset */
@@ -1950,6 +1960,23 @@ void apu_step(u32 cycles) { (void)cycles; /* Audio stub - future work */ }
 void dma_check(void) { /* DMAs are triggered by io_write_hook */ }
 void timer_step(u32 cycles) { timer_tick(cycles); }
 void irq_check(void) { check_interrupts(); }
+
+void gba_run(void (*entry_func)(void)) {
+    /* Run the game with SoftReset support.
+     * SWI 0x00 (SoftReset) longjmps back here to restart. */
+    soft_reset_jmp_valid = true;
+    if (setjmp(soft_reset_jmp) != 0) {
+        /* Returned from SoftReset - game is restarting */
+        static int reset_count = 0;
+        reset_count++;
+        if (reset_count <= 5) {
+            fprintf(stderr, "[runtime] SoftReset #%d\n", reset_count);
+            fflush(stderr);
+        }
+    }
+    entry_func();
+    soft_reset_jmp_valid = false;
+}
 
 void gba_frame(void) {
     /* Advance to next VBlank. Called from VBlankIntrWait and similar. */
