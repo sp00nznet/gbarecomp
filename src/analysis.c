@@ -1041,7 +1041,10 @@ void analysis_run(AnalysisCtx* ctx) {
                         }
                         if (is_local) continue;
 
-                        /* Is this target a function entry? If so, it's a tail call - skip */
+                        /* Is this target a function entry? If so, it might be a tail call.
+                         * BUT: if the current block ends with a BL instruction, then this
+                         * successor is the return continuation, not a tail call. In that case,
+                         * we SHOULD merge it into our function. */
                         bool is_func_entry = false;
                         for (int k = 0; k < ctx->num_functions; k++) {
                             if (ctx->functions[k].entry == target) {
@@ -1049,7 +1052,27 @@ void analysis_run(AnalysisCtx* ctx) {
                                 break;
                             }
                         }
-                        if (is_func_entry) continue;
+                        if (is_func_entry) {
+                            /* Check if the current block ends with a BL (call).
+                             * If so, this successor is the return site, not a tail call. */
+                            bool is_bl_continuation = false;
+                            if (blk->end >= 4) {
+                                u32 last_addr = blk->end - 2;
+                                if (blk->mode == CODE_THUMB && last_addr >= 2) {
+                                    u16 prev_hw = rom_read16(ctx->rom, last_addr);
+                                    u16 prev2_hw = rom_read16(ctx->rom, last_addr - 2);
+                                    /* Thumb BL: prefix F0xx + suffix F8xx */
+                                    if ((prev2_hw & 0xF800) == 0xF000 && (prev_hw & 0xF800) == 0xF800)
+                                        is_bl_continuation = true;
+                                } else if (blk->mode == CODE_ARM) {
+                                    u32 last_arm = rom_read32(ctx->rom, blk->end - 4);
+                                    if ((last_arm & 0x0F000000) == 0x0B000000)
+                                        is_bl_continuation = true;
+                                }
+                            }
+                            if (!is_bl_continuation) continue;
+                            /* Fall through to merge this block into our function */
+                        }
 
                         /* Find which function currently owns this block */
                         bool found_block = false;

@@ -830,7 +830,6 @@ void gba_swi(u32 number) {
     }
 
     case 0x05: /* VBlankIntrWait */
-        /* Equivalent to IntrWait(1, 1) - wait for VBlank */
         r[0] = 1;
         r[1] = 1;
         gba_swi(0x04);
