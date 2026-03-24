@@ -1254,7 +1254,20 @@ void run_iwram_function(u32 target) {
         u16 insn = bus_read16(pc);
         pc += 2;
 
-        /* Format 1: Move shifted register - LSL/LSR/ASR Rd, Rs, #Offset5 */
+        /* Format 2: Add/Sub - MUST check before Format 1 (overlapping encoding) */
+        if ((insn & 0xF800) == 0x1800) {
+            int i = (insn >> 10) & 1;
+            int op = (insn >> 9) & 1;
+            u32 rn_or_imm = (insn >> 6) & 7;
+            int rs = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 operand = i ? rn_or_imm : r[rn_or_imm];
+            if (op) cpu_sub(&r[rd], r[rs], operand, true);
+            else cpu_add(&r[rd], r[rs], operand, true);
+            continue;
+        }
+
+        /* Format 1: Move shifted register - LSL/LSR/ASR (NOT add/sub which is Format 2) */
         if ((insn & 0xE000) == 0x0000) {
             int op = (insn >> 11) & 3;
             u32 offset = (insn >> 6) & 0x1F;
@@ -1278,19 +1291,6 @@ void run_iwram_function(u32 target) {
             }
             r[rd] = val;
             cpu_update_nz(val);
-            continue;
-        }
-
-        /* Format 2: Add/Sub */
-        if ((insn & 0xF800) == 0x1800) {
-            int i = (insn >> 10) & 1;
-            int op = (insn >> 9) & 1;
-            u32 rn_or_imm = (insn >> 6) & 7;
-            int rs = (insn >> 3) & 7;
-            int rd = insn & 7;
-            u32 operand = i ? rn_or_imm : r[rn_or_imm];
-            if (op) cpu_sub(&r[rd], r[rs], operand, true);
-            else cpu_add(&r[rd], r[rs], operand, true);
             continue;
         }
 
