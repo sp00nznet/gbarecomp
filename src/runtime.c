@@ -379,8 +379,10 @@ static void advance_cycles(u32 cycles) {
 
         /* VBlank start (scanline 160) */
         if (scanline == VISIBLE_SCANLINES && prev_scanline != VISIBLE_SCANLINES) {
-            /* Set VBlank IRQ flag if VBlank IRQ enabled in DISPSTAT */
-            if (dispstat & (1 << 3)) {
+            /* VBlank IF flag is ALWAYS set when VBlank starts.
+             * DISPSTAT bit 3 controls whether the IRQ fires, but IF is
+             * set unconditionally by the hardware. */
+            {
                 u16 if_val = io_read16(0x202);
                 io_write16(0x202, if_val | 1); /* VBlank = bit 0 */
             }
@@ -413,16 +415,16 @@ static void advance_cycles(u32 cycles) {
             }
         }
 
-        /* VCount match IRQ */
-        if ((scanline == vcount_target) && (dispstat & (1 << 5))) {
+        /* VCount match IRQ - IF bit set unconditionally on match */
+        if (scanline == vcount_target) {
             u16 if_val = io_read16(0x202);
             io_write16(0x202, if_val | 4); /* VCount = bit 2 */
         }
 
         /* HBlank fires at end of each visible scanline */
         if (scanline < VISIBLE_SCANLINES) {
-            /* HBlank IRQ */
-            if (dispstat & (1 << 4)) {
+            /* HBlank IF set unconditionally */
+            {
                 u16 if_val = io_read16(0x202);
                 io_write16(0x202, if_val | 2); /* HBlank = bit 1 */
             }
