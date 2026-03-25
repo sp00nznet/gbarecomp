@@ -11,80 +11,69 @@
    ╚═════╝ ╚═════╝ ╚═╝  ╚═╝    ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝╚═╝     ╚═╝╚═╝
 ```
 
-> **First of its kind.** As of March 2026, gbarecomp is the first toolkit to statically recompile GBA ROMs into native executables. The N64 has [N64Recomp](https://github.com/N64Recomp/N64Recomp) (9+ games ported). The Game Boy has [gb-recompiled](https://github.com/arcanite24/gb-recompiled). Now the GBA joins them. Built from scratch in 48 hours, 28 commits, from zero to a running game with graphics on screen.
-
-## Proof of Life
-
-The first successfully statically recompiled GBA game -- **Advance Wars** -- running natively on Windows x64:
-
-![Advance Wars Recompiled - Title Screen](https://raw.githubusercontent.com/sp00nznet/advancewars/master/title2.png)
-
-*Advance Wars title screen running natively on Windows x64. Full intro sequence plays, menus are navigable, and training missions are playable. Pixel-perfect rendering by mGBA's PPU with correct colors, 60fps, keyboard input.*
-
-## The Pitch
-
-The N64 got [static recompilation](https://github.com/N64Recomp/N64Recomp). The Game Boy got [its own recompiler](https://github.com/arcanite24/gb-recompiled). The GBA? The GBA has been sitting there with its incredible library -- Advance Wars, Fire Emblem, Metroid, Pokemon, Golden Sun -- waiting for someone to set it free.
-
-**This is that project.**
-
-`gbarecomp` takes a GBA ROM, analyzes the ARM7TDMI machine code, and spits out equivalent C source that compiles to a native binary. No emulation loop. No interpreter. Just your game, running on bare metal, at whatever speed and resolution your hardware can push.
+> **True static recompilation.** No emulator runs underneath. The recompiled C code IS the CPU. Memory is flat arrays, hardware is lightweight C modules, and the only runtime dependency is SDL2 for display.
 
 ## How It Works
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────────┐
-│  GBA ROM     │────>│  Disassemble  │────>│  Translate   │────>│  C Source     │
+│  GBA ROM     │────>│  Analyze      │────>│  Translate   │────>│  C Source     │
 │  (.gba)      │     │  ARM + Thumb  │     │  to C code   │     │  (.c/.h)      │
 └─────────────┘     └──────────────┘     └─────────────┘     └──────┬───────┘
                                                                      │
                     ┌──────────────┐     ┌─────────────┐            │
                     │  Native bin   │<────│  Compile     │<───────────┘
-                    │  (.exe/ELF)   │     │  gcc/clang   │     + GBA Runtime
-                    └──────────────┘     └─────────────┘       (libmgba)
+                    │  (.exe/ELF)   │     │  gcc/clang   │     + Standalone
+                    └──────────────┘     └─────────────┘       GBA Runtime
 ```
 
-1. **Disassembly** -- Full ARM7TDMI decoder (ARM 32-bit + Thumb 16-bit, all instruction formats)
-2. **Analysis** -- Recursive descent CFG, function discovery (prologue scanning, BX resolution, block splitting, connected-component merging), 6,289 functions discovered in Advance Wars
-3. **Translation** -- Every instruction converted to C with condition codes, flag updates, memory bus calls. Multi-file output (63 source files) for parallel compilation
-4. **Runtime** -- [libmgba](https://github.com/mgba-emu/mgba) provides pixel-perfect PPU, accurate DMA/timers/interrupts, and full GBA memory map. SDL2 for display and input
-5. **Compilation** -- MSVC/gcc/clang produces a native executable. 8MB for Advance Wars
+1. **Analysis** -- Recursive descent CFG with 6-phase pipeline: function discovery, prologue scanning, BX resolution, jump tables, block splitting, connected-component merging. Discovers 6,300+ functions in Advance Wars.
+2. **Translation** -- Every ARM/Thumb instruction converted to C. Multi-file output (63+ source files) for parallel compilation. BL/SWI continuations properly merged.
+3. **Standalone Runtime** -- Pure C implementation of GBA hardware: flat memory arrays, 4 hardware timers with cascade, DMA with VBlank/HBlank triggers, scanline-based scheduler, interrupt delivery, full BIOS HLE (Div, Sqrt, CpuSet, LZ77, RLE, BitUnPack, ArcTan, IntrWait, etc.)
+4. **Interpreters** -- Built-in ARM and Thumb interpreters handle RAM code (IWRAM/EWRAM routines copied at runtime by the game's crt0)
+5. **Display** -- SDL2 renderer with Mode 0/1/3/4 tiled and bitmap backgrounds, OBJ sprites, palette, 60fps
 
-## What's Working
+## Current Status
 
-| Feature | Status |
-|---------|--------|
-| ARM instruction decoder | All ARM7TDMI types |
-| Thumb instruction decoder | All 19 formats |
-| Control flow analysis | Recursive descent, 6-phase pipeline |
-| BX dispatch | Binary search table, 6,289 entries |
-| Function boundary detection | Prologue scan + connected-component merge |
-| C code generation | Multi-file, 1.1M lines for Advance Wars |
-| Memory bus | Via libmgba (all GBA regions) |
-| PPU rendering | Via libmgba (all modes, sprites, effects) |
-| DMA | Via libmgba (all channels, all timing) |
-| Display | SDL2 window, scalable (1x-6x) |
-| Input | Configurable keyboard + gamepad via ImGui menu |
-| Save file | Flash/SRAM auto-detected by mGBA, persistent |
-| ImGui menu | File/Config/Graphics/Audio/Controller menus |
-| **Function interception** | **N64Recomp-style: mGBA interprets, native C for matched functions** |
-| **First game playable** | **Advance Wars -- full intro, menus, training missions** |
+**Architecture: Standalone static recomp (no emulator)**
 
-## Function Interception
+| Component | Implementation |
+|-----------|---------------|
+| CPU | Recompiled C (6,304 functions for Advance Wars) |
+| Memory | Flat arrays (EWRAM 256KB, IWRAM 32KB, VRAM 96KB, etc.) |
+| Bus | Direct array access with I/O dispatch |
+| Timers | 4 hardware timers, prescaler, cascade |
+| DMA | 4 channels, immediate/VBlank/HBlank/repeat |
+| Interrupts | IE/IF/IME with handler dispatch via cpu_bx |
+| BIOS | Full HLE: 20+ SWI implementations |
+| PPU | Frame-based renderer (Mode 0/1/3/4, BG, OBJ) |
+| Input | SDL2 keyboard |
+| Save | SRAM auto-load/save (.sav files) |
+| RAM code | ARM + Thumb interpreters for IWRAM/EWRAM |
+| SoftReset | longjmp-based restart |
 
-The crown jewel. Like [N64Recomp](https://github.com/N64Recomp/N64Recomp), gbarecomp hooks directly into mGBA's `ARMRunLoop`. Before each instruction, the hook checks if the PC matches a recompiled function entry point. If so, the native C version executes instead of the interpreter.
+**Advance Wars test game:**
+- 7.3MB standalone executable (SDL2 only dependency)
+- Game init chain executes (24 sub-functions complete)
+- Frames render at 60fps
+- BIOS calls work (CpuSet, CpuFastSet for palette/OAM/VRAM)
+- Sound engine initializes
+- IRQ handler installed at 0x03000718 (ARM IWRAM)
 
-```
-mGBA ARMRunLoop
-  ├── Check PC against function table (O(log n) binary search)
-  ├── Match? → Sync registers → Execute native C → Sync back → Refill pipeline
-  └── No match? → Normal ThumbStep/ARMStep
-```
+**Known issues being worked:**
+- Game stays in forced blank (DISPCNT=0x0080) -- IE/IME not being set by game init, investigating function call chain for the interrupt enable code path
+- Some translator correctness issues found and fixed via register comparison verifier
 
-Key implementation details:
-- **Pipeline-aware PC**: ARM's pipeline means `gprs[15]` is 2 ahead (Thumb) or 4 ahead (ARM) of the actual instruction. The hook subtracts the pipeline offset before lookup.
-- **Safe cycle accounting**: Bus operations during interception accumulate cycles without calling `processEvents` (which could fire IRQs and corrupt CPU state mid-function). Cycles are applied after the function returns.
-- **Crash recovery**: Windows SEH (`__try/__except`) catches faults in recompiled code and falls back to the interpreter.
-- **Zero failures**: Tested at 1000+ frames with 0 crashes, 0 fallbacks.
+## Bugs Found and Fixed
+
+The register comparison verifier (runs functions through both recompiled C and Thumb interpreter, compares register output) has found several real bugs:
+
+| Bug | Impact | Fix |
+|-----|--------|-----|
+| Thumb Format 2/Format 1 encoding overlap | ADD/SUB instructions silently skipped by interpreter | Check Format 2 before Format 1 |
+| BL continuation blocks split into separate functions | Post-call code unreachable (func_080386E4 had 2 blocks instead of 24) | Merge BL successors in Phase 6 |
+| SWI continuation blocks split | RegisterRamReset + SoftReset in separate functions | Merge SWI successors in Phase 6 |
+| VBlank/HBlank IF flags gated behind DISPSTAT | Interrupts never fire if DISPSTAT IRQ enable not set | Set IF unconditionally |
 
 ## Quick Start
 
@@ -100,7 +89,7 @@ cmake -B build && cmake --build build --config Release
 # Generate C source (multi-file)
 ./build/gbarecomp translate game.gba -o output/ --multi
 
-# Build the game (requires libmgba + SDL2)
+# Build the game (requires SDL2 via vcpkg)
 cd output/
 cmake -B build -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
@@ -109,73 +98,40 @@ cmake --build build --config Release
 ./build/Release/GAME game.gba
 ```
 
+## Architecture
+
+The generated executable is completely standalone:
+
+```
+main()
+  └─ gba_run(game_entry)       ← setjmp for SoftReset
+       └─ game_entry()          ← calls recompiled crt0
+            └─ func_080000C0()  ← ARM crt0: set SP, BX to main
+                 └─ cpu_bx()    ← dispatches to recompiled functions
+                      ├─ func_XXXXXXXX()  ← recompiled game code
+                      │    ├─ bus_read32()  → flat memory arrays
+                      │    ├─ bus_write16() → I/O dispatch (DMA/timer/IRQ)
+                      │    └─ gba_swi()     → BIOS HLE
+                      └─ run_iwram_function() ← ARM/Thumb interpreter for RAM code
+```
+
+No emulator. No interpreter loop. The recompiled C code drives everything.
+
 ## Standing on the Shoulders of Giants
 
 ### Static Recompilation Pioneers
-- **[N64Recomp](https://github.com/N64Recomp/N64Recomp)** -- The project that proved static recompilation of console games is practical. 9+ N64 games ported including Zelda: Majora's Mask, Banjo-Kazooie, Star Fox 64. The architectural blueprint for gbarecomp.
-- **[gb-recompiled](https://github.com/arcanite24/gb-recompiled)** -- Static recompiler for original Game Boy (Z80 -> C). ~98% of the GB library compiles. Showed this works for handhelds too.
-
-### GBA Emulation
-- **[mGBA](https://github.com/mgba-emu/mgba)** -- The excellent GBA emulator whose `libmgba` core powers our hardware runtime. MPL-2.0 licensed with a clean `mCore` API. Without mGBA, this project wouldn't exist.
-
-### GBA Decompilation Community
-
-These incredible projects have manually reverse-engineered GBA games back to compilable C source. Their work proves the GBA library can be understood at the source level. If you're working on any of these, your decomp could be a starting point for a recomp too.
-
-| Game | Project | Status |
-|------|---------|--------|
-| **Zelda: The Minish Cap** | [zeldaret/tmc](https://github.com/zeldaret/tmc) | 100% complete |
-| **Metroid: Zero Mission** | [metroidret/mzm](https://github.com/metroidret/mzm) | ~99.89% |
-| **Pokemon Emerald** | [pret/pokeemerald](https://github.com/pret/pokeemerald) | Complete |
-| **Pokemon FireRed/LeafGreen** | [pret/pokefirered](https://github.com/pret/pokefirered) | Complete |
-| **Pokemon Ruby/Sapphire** | [pret/pokeruby](https://github.com/pret/pokeruby) | Complete |
-| **Fire Emblem: Sacred Stones** | [FireEmblemUniverse/fireemblem8u](https://github.com/FireEmblemUniverse/fireemblem8u) | ~89% |
-| **Fire Emblem: Binding Blade** | [StanHash/fe6](https://github.com/StanHash/fe6) | WIP |
-| **Sonic Advance 2** | [SAT-R/sa2](https://github.com/SAT-R/sa2) | ~67%, has PC port |
-| **Advance Wars** | [ketsuban/advancewars](https://github.com/ketsuban/advancewars) | Byte-matching |
-| **Advance Wars 2** | [Eebit/aw2bhr](https://github.com/Eebit/aw2bhr) | WIP |
-| **Kirby & The Amazing Mirror** | [jiangzhengwenjz/katam](https://github.com/jiangzhengwenjz/katam) | WIP |
-| **Super Mario Advance 2** | [atasro2/sma2](https://github.com/atasro2/sma2) | WIP |
-
-Track progress at [decomp.dev](https://decomp.dev/projects).
+- **[N64Recomp](https://github.com/N64Recomp/N64Recomp)** -- Proved static recompilation of console games is practical. The architectural inspiration.
+- **[gb-recompiled](https://github.com/arcanite24/gb-recompiled)** -- Static recompiler for original Game Boy.
 
 ### References
-- **[GBATEK](https://problemkaputt.de/gbatek.htm)** -- Martin Korth's legendary GBA technical reference
-- **[pret](https://pret.github.io/)** -- The decompilation community hub
-- **[decomp.me](https://decomp.me/)** -- Collaborative decompilation platform
-- **[RetroReversing GBA](https://www.retroreversing.com/gba/)** -- GBA reverse engineering resources
-- **[agbcc](https://github.com/pret/agbcc)** -- Reconstructed GBA C compiler for matching decomps
-
-## Want to Recomp Your Favorite GBA Game?
-
-That's the dream. The GBA library has over 1,500 games. Any of them could be recompiled:
-
-```bash
-gbarecomp translate my_game.gba -o my_game_src/ --multi
-cd my_game_src/ && cmake -B build && cmake --build build
-./build/my_game my_game.gba
-```
-
-Games with existing decompilations would be the easiest targets since their code is already well-understood. But gbarecomp is designed to work with any ROM -- no prior reverse engineering needed.
-
-## Contributing
-
-We need people who are excited about:
-- **ARM architecture** -- The ARM7TDMI is well-documented but full of quirks
-- **Binary analysis** -- Disassembly, control flow recovery, pattern matching
-- **Compiler internals** -- Code generation, optimization, correctness
-- **GBA internals** -- Hardware timing, PPU modes, audio mixing, DMA edge cases
-- **Testing** -- ROM analysis, regression testing, compatibility tracking
-- **Other games** -- Pick your favorite GBA game and try recompiling it!
-
-Open an issue, submit a PR, or just come hang out. Every GBA game that gets recompiled is a win for preservation.
+- **[GBATEK](https://problemkaputt.de/gbatek.htm)** -- Martin Korth's GBA technical reference
+- **[mGBA](https://github.com/mgba-emu/mgba)** -- Excellent GBA emulator (used in early prototype, now replaced by standalone runtime)
+- **[pret](https://pret.github.io/)** -- GBA decompilation community
 
 ## Legal
 
-`gbarecomp` does not include or distribute any copyrighted game data. Users must provide their own legally obtained ROM files. The recompilation tools are open source. The GBA hardware runtime is based on [mGBA](https://github.com/mgba-emu/mgba) (MPL-2.0).
+`gbarecomp` does not include or distribute any copyrighted game data. Users must provide their own legally obtained ROM files.
 
 ---
 
-*"The GBA library is too good to be locked behind aging hardware. Let's set it free."*
-
-*Built with Claude Code. From zero to rendering in 28 commits, from rendering to native function interception in 48 more.*
+*Built with Claude Code. True static recompilation -- no emulator underneath.*
