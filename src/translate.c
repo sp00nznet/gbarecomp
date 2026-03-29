@@ -856,7 +856,24 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
         if (insn->rs == REG_LR) {
             emit(ctx, "return; /* BX LR */");
         } else {
-            emit(ctx, "cpu_bx(%s);", reg_c((u8)insn->rs));
+            /* Check if this is a POP {rN}; BX rN return pattern.
+             * If the previous instruction is POP {rN} where rN matches,
+             * this is a function return - just return instead of cpu_bx. */
+            bool is_pop_bx_return = false;
+            if (addr >= 2) {
+                u16 prev_raw = rom_read16(ctx->rom, addr - 2);
+                /* POP {single reg} encoding: 0xBC00 | (1 << rN) */
+                if ((prev_raw & 0xFF00) == 0xBC00) {
+                    u8 rlist = prev_raw & 0xFF;
+                    if (rlist == (1u << insn->rs))
+                        is_pop_bx_return = true;
+                }
+            }
+            if (is_pop_bx_return) {
+                emit(ctx, "return; /* POP+BX return */");
+            } else {
+                emit(ctx, "cpu_bx(%s);", reg_c((u8)insn->rs));
+            }
         }
         break;
 

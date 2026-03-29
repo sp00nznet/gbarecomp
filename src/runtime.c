@@ -1256,13 +1256,6 @@ void run_iwram_function(u32 target) {
     }
 
     call_count++;
-    if (call_count <= 20) {
-        u32 peek_addr = target & ~1u;
-        fprintf(stderr, "[interp] Running RAM code at 0x%08X (bytes: %02X %02X %02X %02X) LR=0x%08X SP=0x%08X\n",
-                target, bus_read8(peek_addr), bus_read8(peek_addr+1),
-                bus_read8(peek_addr+2), bus_read8(peek_addr+3), r[14], r[13]);
-        fflush(stderr);
-    }
 
     bool thumb = (target & 1) != 0;
     u32 pc = target & ~1u;
@@ -1273,7 +1266,7 @@ void run_iwram_function(u32 target) {
     r[14] = return_sentinel | 1; /* Thumb return address */
 
     int steps = 0;
-    int max_steps = 500000;
+    int max_steps = 2000000;
 
     while (steps < max_steps) {
         steps++;
@@ -1311,7 +1304,11 @@ void run_iwram_function(u32 target) {
                 u32 rm = insn & 0xF;
                 u32 addr = r[rm];
                 if ((addr & ~1u) == (return_sentinel & ~1u)) break;
-                if ((addr >> 24) == 0x08) { r[15] = addr; break; }
+                if ((addr >> 24) == 0x08) {
+                    /* ROM target: call recompiled function and continue */
+                    cpu_bx(addr);
+                    continue;
+                }
                 thumb = (addr & 1) != 0;
                 pc = addr & ~1u;
                 continue;
@@ -1708,8 +1705,11 @@ void run_iwram_function(u32 target) {
             case 2: r[rd] = val; if (rd == 15) { pc = r[15] & ~1u; } break;
             case 3: /* BX */
                 if ((val & ~1u) == (return_sentinel & ~1u)) goto done;
-                /* Check if target is back in ROM - return to recompiled code */
-                if ((val >> 24) == 0x08) { r[15] = val; goto done; }
+                /* ROM target: call recompiled function and continue */
+                if ((val >> 24) == 0x08) {
+                    cpu_bx(val);
+                    break;
+                }
                 thumb = (val & 1) != 0;
                 pc = val & ~1u;
                 break;
@@ -1928,9 +1928,9 @@ void run_iwram_function(u32 target) {
 
 done:
     if (steps >= max_steps) {
-        fprintf(stderr, "[interp] RAM code at 0x%08X hit step limit (%d steps)\n", target, steps);
-    } else if (call_count <= 20) {
-        fprintf(stderr, "[interp] RAM code at 0x%08X completed in %d steps\n", target, steps);
+        static int _limit_warns = 0;
+        if (_limit_warns++ < 3)
+            fprintf(stderr, "[interp] step limit hit at 0x%08X (%d steps)\n", target, steps);
     }
 }
 

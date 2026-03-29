@@ -122,6 +122,10 @@ static Function* add_function(AnalysisCtx* ctx, u32 entry, CodeType mode) {
 }
 
 static void function_add_block(Function* func, u32 block_addr) {
+    /* Check for duplicates */
+    for (int i = 0; i < func->num_blocks; i++) {
+        if (func->block_addrs[i] == block_addr) return;
+    }
     GROW(func->block_addrs, func->num_blocks, func->cap_blocks, u32);
     func->block_addrs[func->num_blocks++] = block_addr;
 }
@@ -1009,123 +1013,238 @@ void analysis_run(AnalysisCtx* ctx) {
     }
 
     /* Phase 6: Merge branch-connected blocks into the same function.
-     * For each function, follow all non-BL branch successors and pull those blocks
-     * into the function. This ensures switch/case, state machines, and loop structures
-     * stay within a single function instead of being broken by tail calls. */
+     * Uses a block-ownership map for O(1) lookups, then for each function,
+     * follows successor edges (DFS) to pull reachable blocks into the function.
+     * BL continuations are merged; function-entry successors without BL are
+     * treated as tail calls (left in their own function). */
     printf("[analysis] Phase 6: Merging branch-connected blocks into functions...\n");
     {
         int merged = 0;
-        bool changed = true;
-        int pass = 0;
 
-        while (changed && pass < 20) {
-            changed = false;
-            pass++;
+        /* Build block -> owner function index map */
+        /* Also build block address -> block index map */
+        int* block_owner = calloc(ctx->num_blocks, sizeof(int));  /* block_idx -> func_idx, -1 = unowned */
+        for (int i = 0; i < ctx->num_blocks; i++) block_owner[i] = -1;
 
-            for (int fi = 0; fi < ctx->num_functions; fi++) {
-                Function* func = &ctx->functions[fi];
-
-                /* For each block in this function, check successors */
-                for (int bi = 0; bi < func->num_blocks; bi++) {
-                    u32 block_addr = func->block_addrs[bi];
-
-                    /* Find the block */
-                    BasicBlock* blk = NULL;
-                    for (int j = 0; j < ctx->num_blocks; j++) {
-                        if (ctx->blocks[j].start == block_addr) {
-                            blk = &ctx->blocks[j];
-                            break;
-                        }
-                    }
-                    if (!blk) continue;
-
-                    for (int s = 0; s < blk->num_successors; s++) {
-                        u32 target = blk->successors[s];
-                        if (target == 0) continue;
-
-                        /* Is this target already in our function? */
-                        bool is_local = false;
-                        for (int k = 0; k < func->num_blocks; k++) {
-                            if (func->block_addrs[k] == target) {
-                                is_local = true;
-                                break;
-                            }
-                        }
-                        if (is_local) continue;
-
-                        /* Is this target a function entry? If so, it might be a tail call.
-                         * BUT: if the current block ends with a BL instruction, then this
-                         * successor is the return continuation, not a tail call. In that case,
-                         * we SHOULD merge it into our function. */
-                        bool is_func_entry = false;
-                        for (int k = 0; k < ctx->num_functions; k++) {
-                            if (ctx->functions[k].entry == target) {
-                                is_func_entry = true;
-                                break;
-                            }
-                        }
-                        if (is_func_entry) {
-                            /* Check if the current block ends with a BL (call).
-                             * If so, this successor is the return site, not a tail call. */
-                            bool is_bl_continuation = false;
-                            if (blk->end >= 4) {
-                                u32 last_addr = blk->end - 2;
-                                if (blk->mode == CODE_THUMB && last_addr >= 2) {
-                                    u16 prev_hw = rom_read16(ctx->rom, last_addr);
-                                    u16 prev2_hw = rom_read16(ctx->rom, last_addr - 2);
-                                    /* Thumb BL: prefix F0xx + suffix F8xx */
-                                    if ((prev2_hw & 0xF800) == 0xF000 && (prev_hw & 0xF800) == 0xF800)
-                                        is_bl_continuation = true;
-                                    /* Thumb SWI: DFxx */
-                                    if ((prev_hw & 0xFF00) == 0xDF00)
-                                        is_bl_continuation = true;
-                                } else if (blk->mode == CODE_ARM) {
-                                    u32 last_arm = rom_read32(ctx->rom, blk->end - 4);
-                                    if ((last_arm & 0x0F000000) == 0x0B000000)
-                                        is_bl_continuation = true;
-                                    /* ARM SWI: 0xEF...... */
-                                    if ((last_arm & 0x0F000000) == 0x0F000000)
-                                        is_bl_continuation = true;
-                                }
-                            }
-                            if (!is_bl_continuation) continue;
-                            /* Fall through to merge this block into our function */
-                        }
-
-                        /* Find which function currently owns this block */
-                        bool found_block = false;
-                        for (int j = 0; j < ctx->num_blocks; j++) {
-                            if (ctx->blocks[j].start == target) {
-                                found_block = true;
-                                break;
-                            }
-                        }
-                        if (!found_block) continue;
-
-                        /* Steal it: remove from other function, add to ours */
-                        for (int oi = 0; oi < ctx->num_functions; oi++) {
-                            if (oi == fi) continue;
-                            Function* other = &ctx->functions[oi];
-                            for (int ok = 0; ok < other->num_blocks; ok++) {
-                                if (other->block_addrs[ok] == target) {
-                                    /* Remove from other */
-                                    other->block_addrs[ok] = other->block_addrs[other->num_blocks - 1];
-                                    other->num_blocks--;
-                                    goto stolen;
-                                }
-                            }
-                        }
-                        stolen:
-
-                        /* Add to our function */
-                        function_add_block(func, target);
-                        merged++;
-                        changed = true;
+        for (int fi = 0; fi < ctx->num_functions; fi++) {
+            Function* func = &ctx->functions[fi];
+            for (int bi = 0; bi < func->num_blocks; bi++) {
+                /* Find block index for this address */
+                for (int j = 0; j < ctx->num_blocks; j++) {
+                    if (ctx->blocks[j].start == func->block_addrs[bi]) {
+                        block_owner[j] = fi;
+                        break;
                     }
                 }
             }
         }
-        printf("[analysis] Merged %d blocks across %d passes\n", merged, pass);
+
+        /* Build function entry set for O(1) lookup */
+        /* Use a simple sorted array + binary search */
+        u32* func_entries = malloc(ctx->num_functions * sizeof(u32));
+        for (int i = 0; i < ctx->num_functions; i++)
+            func_entries[i] = ctx->functions[i].entry;
+        /* Sort for binary search */
+        for (int i = 0; i < ctx->num_functions - 1; i++) {
+            for (int j = i + 1; j < ctx->num_functions; j++) {
+                if (func_entries[i] > func_entries[j]) {
+                    u32 tmp = func_entries[i];
+                    func_entries[i] = func_entries[j];
+                    func_entries[j] = tmp;
+                }
+            }
+        }
+
+        /* For each function, DFS through successors and merge reachable blocks.
+         * The inner loop over func->num_blocks naturally cascades because
+         * function_add_block appends to the end. */
+        for (int fi = 0; fi < ctx->num_functions; fi++) {
+            Function* func = &ctx->functions[fi];
+
+            for (int bi = 0; bi < func->num_blocks; bi++) {
+                u32 block_addr = func->block_addrs[bi];
+
+                /* Find the block */
+                int blk_idx = -1;
+                for (int j = 0; j < ctx->num_blocks; j++) {
+                    if (ctx->blocks[j].start == block_addr) {
+                        blk_idx = j;
+                        break;
+                    }
+                }
+                if (blk_idx < 0) continue;
+                BasicBlock* blk = &ctx->blocks[blk_idx];
+
+                for (int s = 0; s < blk->num_successors; s++) {
+                    u32 target = blk->successors[s];
+                    if (target == 0) continue;
+
+                    /* Find target block */
+                    int target_idx = -1;
+                    for (int j = 0; j < ctx->num_blocks; j++) {
+                        if (ctx->blocks[j].start == target) {
+                            target_idx = j;
+                            break;
+                        }
+                    }
+                    if (target_idx < 0) continue;
+
+                    /* Already in our function? */
+                    if (block_owner[target_idx] == fi) continue;
+
+                    /* If target is a function entry, only merge if current block ends with BL/SWI */
+                    {
+                        /* Binary search for function entry */
+                        bool is_entry = false;
+                        int lo = 0, hi = ctx->num_functions - 1;
+                        while (lo <= hi) {
+                            int mid = (lo + hi) / 2;
+                            if (func_entries[mid] == target) { is_entry = true; break; }
+                            else if (func_entries[mid] < target) lo = mid + 1;
+                            else hi = mid - 1;
+                        }
+                        if (is_entry) {
+                            /* Check if block ends with BL or SWI */
+                            bool is_call = false;
+                            if (blk->end >= 4) {
+                                u32 la = blk->end - 2;
+                                if (blk->mode == CODE_THUMB && la >= 2) {
+                                    u16 hw = rom_read16(ctx->rom, la);
+                                    u16 hw2 = rom_read16(ctx->rom, la - 2);
+                                    if ((hw2 & 0xF800) == 0xF000 && (hw & 0xF800) == 0xF800) is_call = true;
+                                    if ((hw & 0xFF00) == 0xDF00) is_call = true;
+                                } else if (blk->mode == CODE_ARM) {
+                                    u32 arm_insn = rom_read32(ctx->rom, blk->end - 4);
+                                    if ((arm_insn & 0x0F000000) == 0x0B000000) is_call = true;
+                                    if ((arm_insn & 0x0F000000) == 0x0F000000) is_call = true;
+                                }
+                            }
+                            if (!is_call) continue;
+                        }
+                    }
+
+                    /* Steal from previous owner */
+                    int prev_owner = block_owner[target_idx];
+                    if (prev_owner >= 0 && prev_owner != fi) {
+                        Function* other = &ctx->functions[prev_owner];
+                        for (int ok = 0; ok < other->num_blocks; ok++) {
+                            if (other->block_addrs[ok] == target) {
+                                other->block_addrs[ok] = other->block_addrs[other->num_blocks - 1];
+                                other->num_blocks--;
+                                break;
+                            }
+                        }
+                    }
+
+                    /* Add to our function */
+                    function_add_block(func, target);
+                    block_owner[target_idx] = fi;
+                    merged++;
+                }
+            }
+        }
+
+        free(block_owner);
+        free(func_entries);
+        printf("[analysis] Merged %d blocks in single pass\n", merged);
+    }
+
+    /* Phase 7: Fix empty functions (mid-function BX targets).
+     * When a BX target lands in the middle of another function,
+     * the target function has no blocks. Find the block at the
+     * target address and DUPLICATE it into the empty function.
+     *
+     * IMPORTANT: Skip BL continuation addresses that are already
+     * handled as labels in the parent function - those should remain
+     * as empty stubs (the POP {pc} -> cpu_bx dispatch calls the stub,
+     * then returns to the C caller which has the real code). */
+    printf("[analysis] Phase 7: Fixing empty functions (mid-function entries)...\n");
+    {
+        int fixed = 0;
+        for (int fi = 0; fi < ctx->num_functions; fi++) {
+            Function* func = &ctx->functions[fi];
+            if (func->num_blocks > 0) continue;
+
+            u32 entry = func->entry;
+
+            /* Try to find or create a block at this address. */
+            int found_bi = -1;
+            for (int j = 0; j < ctx->num_blocks; j++) {
+                if (ctx->blocks[j].start == entry) {
+                    found_bi = j;
+                    break;
+                }
+            }
+
+            if (found_bi < 0) {
+                /* No block starts here - check if address falls within a block */
+                for (int j = 0; j < ctx->num_blocks; j++) {
+                    if (ctx->blocks[j].start < entry && entry < ctx->blocks[j].end) {
+                        /* Split this block at 'entry' */
+                        BasicBlock* parent = &ctx->blocks[j];
+                        BasicBlock new_blk = {0};
+                        new_blk.start = entry;
+                        new_blk.end = parent->end;
+                        new_blk.mode = parent->mode;
+                        new_blk.num_successors = parent->num_successors;
+                        for (int s = 0; s < parent->num_successors; s++)
+                            new_blk.successors[s] = parent->successors[s];
+
+                        /* Truncate parent block */
+                        parent->end = entry;
+                        parent->num_successors = 1;
+                        parent->successors[0] = entry;
+
+                        /* Add new block */
+                        GROW(ctx->blocks, ctx->num_blocks, ctx->cap_blocks, BasicBlock);
+                        ctx->blocks[ctx->num_blocks++] = new_blk;
+                        found_bi = ctx->num_blocks - 1;
+
+                        /* Also add to the parent block's owner function */
+                        for (int oi = 0; oi < ctx->num_functions; oi++) {
+                            for (int ok = 0; ok < ctx->functions[oi].num_blocks; ok++) {
+                                if (ctx->functions[oi].block_addrs[ok] == parent->start) {
+                                    function_add_block(&ctx->functions[oi], entry);
+                                    goto split_done;
+                                }
+                            }
+                        }
+                        split_done:
+                        break;
+                    }
+                }
+            }
+
+            if (found_bi >= 0) {
+                /* Add this block and reachable successors to the empty function */
+                function_add_block(func, entry);
+
+                for (int bi = 0; bi < func->num_blocks; bi++) {
+                    u32 ba = func->block_addrs[bi];
+                    for (int j = 0; j < ctx->num_blocks; j++) {
+                        if (ctx->blocks[j].start == ba) {
+                            for (int s = 0; s < ctx->blocks[j].num_successors; s++) {
+                                u32 succ = ctx->blocks[j].successors[s];
+                                if (succ == 0) continue;
+                                bool is_other_entry = false;
+                                for (int k = 0; k < ctx->num_functions; k++) {
+                                    if (k != fi && ctx->functions[k].entry == succ && ctx->functions[k].num_blocks > 0) {
+                                        is_other_entry = true;
+                                        break;
+                                    }
+                                }
+                                if (!is_other_entry)
+                                    function_add_block(func, succ);
+                            }
+                            break;
+                        }
+                    }
+                }
+                fixed++;
+                printf("[analysis]   Fixed func_0x%08X (%d blocks)\n", entry, func->num_blocks);
+            }
+        }
+        printf("[analysis] Fixed %d empty functions\n", fixed);
     }
 
     /* Sort blocks and functions by address */
