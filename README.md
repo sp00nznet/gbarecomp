@@ -27,7 +27,7 @@
                     └──────────────┘     └─────────────┘       GBA Runtime
 ```
 
-1. **Analysis** -- Recursive descent CFG with 6-phase pipeline: function discovery, prologue scanning, BX resolution, jump tables, block splitting, connected-component merging. Discovers 6,300+ functions in Advance Wars.
+1. **Analysis** -- Recursive descent CFG with 7-phase pipeline: function discovery, prologue scanning, BX resolution, jump tables, block splitting, connected-component merging (single-pass O(n) with ownership map), and mid-function entry fixup. Discovers 6,300+ functions in Advance Wars.
 2. **Translation** -- Every ARM/Thumb instruction converted to C. Multi-file output (63+ source files) for parallel compilation. BL/SWI continuations properly merged.
 3. **Standalone Runtime** -- Pure C implementation of GBA hardware: flat memory arrays, 4 hardware timers with cascade, DMA with VBlank/HBlank triggers, scanline-based scheduler, interrupt delivery, full BIOS HLE (Div, Sqrt, CpuSet, LZ77, RLE, BitUnPack, ArcTan, IntrWait, etc.)
 4. **Interpreters** -- Built-in ARM and Thumb interpreters handle RAM code (IWRAM/EWRAM routines copied at runtime by the game's crt0)
@@ -49,20 +49,22 @@
 | PPU | Frame-based renderer (Mode 0/1/3/4, BG, OBJ) |
 | Input | SDL2 keyboard |
 | Save | SRAM auto-load/save (.sav files) |
-| RAM code | ARM + Thumb interpreters for IWRAM/EWRAM |
+| RAM code | ARM + Thumb interpreters for IWRAM/EWRAM + ROM fallback |
 | SoftReset | longjmp-based restart |
 
 **Advance Wars test game:**
 - 7.3MB standalone executable (SDL2 only dependency)
-- Game init chain executes (24 sub-functions complete)
-- Frames render at 60fps
-- BIOS calls work (CpuSet, CpuFastSet for palette/OAM/VRAM)
-- Sound engine initializes
-- IRQ handler installed at 0x03000718 (ARM IWRAM)
+- Game init chain completes: all init sub-functions execute, interrupts enabled (IE=0x2001, IME=1)
+- Main game loop running (label_0803880A with VBlank-synced frame callback)
+- IRQ handler at 0x03000718 dispatches to recompiled ROM functions
+- Frames render at 60fps, BIOS calls work (CpuSet, CpuFastSet, IntrWait)
+- Sound engine initializes and runs
+- Missing dispatch entries handled via interpreter fallback (transparent to game code)
 
 **Known issues being worked:**
-- Game stays in forced blank (DISPCNT=0x0080) -- IE/IME not being set by game init, investigating function call chain for the interrupt enable code path
-- Some translator correctness issues found and fixed via register comparison verifier
+- Display still in forced blank (DISPCNT=0x0080) during early init frames -- game needs more init time or has remaining mid-function entry gaps
+- Some functions interpreted instead of dispatched (performance, not correctness)
+- Register comparison verifier has found and fixed several translator bugs
 
 ## Bugs Found and Fixed
 
@@ -71,8 +73,12 @@ The register comparison verifier (runs functions through both recompiled C and T
 | Bug | Impact | Fix |
 |-----|--------|-----|
 | Thumb Format 2/Format 1 encoding overlap | ADD/SUB instructions silently skipped by interpreter | Check Format 2 before Format 1 |
-| BL continuation blocks split into separate functions | Post-call code unreachable (func_080386E4 had 2 blocks instead of 24) | Merge BL successors in Phase 6 |
+| BL continuation blocks split into separate functions | Post-call code unreachable (func_080386E4 had 2 blocks instead of 24) | Single-pass Phase 6 merge with ownership map |
 | SWI continuation blocks split | RegisterRamReset + SoftReset in separate functions | Merge SWI successors in Phase 6 |
+| Phase 6 merge O(n^3) with duplicate block explosion | 890K "merges" across 20 passes, most duplicates | Rewrite to single-pass O(n) with block ownership tracking |
+| Empty functions from mid-function BX targets | cpu_bx dispatches to empty stubs, skipping real code | Phase 7: detect and populate mid-function entries |
+| POP {rN}; BX rN causes double execution | Continuation code runs via cpu_bx AND via C-level label | Detect POP+BX return pattern, emit `return` instead |
+| Interpreter exits on BX-to-ROM | IRQ handler can't call ROM functions, gets stuck | Interpreter calls cpu_bx for ROM targets and continues |
 | VBlank/HBlank IF flags gated behind DISPSTAT | Interrupts never fire if DISPSTAT IRQ enable not set | Set IF unconditionally |
 
 ## Quick Start
