@@ -1544,10 +1544,12 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
                         }
                         p = hex_start + digits;
                         if (digits != 8) continue;
-                        if ((addr >> 24) != 0x08) continue;
-
-                        /* Check if next char is '(' - it's a function call/definition */
-                        /* We want to catch both calls and declarations */
+                        /* Accept any addr the translator emitted as a function call.
+                         * Previously restricted to ROM (0x08), but translator can emit
+                         * calls to garbage targets (e.g. BL after a misanalyzed undefined
+                         * instruction). Skipping them here produces link errors; better
+                         * to emit a trap stub so the link succeeds and the call faults
+                         * at runtime if ever reached. */
 
                         /* Check if defined */
                         bool is_def = false;
@@ -1710,9 +1712,11 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "set(CMAKE_C_STANDARD 11)\n");
         fprintf(f, "set(CMAKE_C_STANDARD_REQUIRED ON)\n\n");
         fprintf(f, "if(MSVC)\n");
-        fprintf(f, "    add_compile_options(/W2 /wd4244 /wd4146 /wd4018 /wd4047 /wd4024 /O2)\n");
+        fprintf(f, "    # /O1 not /O2: huge generated TUs (>2MB) make /O2's regalloc burn 20+ min/file.\n");
+        fprintf(f, "    # /MP enables parallel cl.exe across files.\n");
+        fprintf(f, "    add_compile_options(/W2 /wd4244 /wd4146 /wd4018 /wd4047 /wd4024 /O1 /MP)\n");
         fprintf(f, "else()\n");
-        fprintf(f, "    add_compile_options(-Wall -Wno-unused-label -Wno-pointer-to-int-cast -O2)\n");
+        fprintf(f, "    add_compile_options(-Wall -Wno-unused-label -Wno-pointer-to-int-cast -O1)\n");
         fprintf(f, "endif()\n\n");
         fprintf(f, "# No ImGui or mGBA dependencies - pure static recomp\n\n");
         fprintf(f, "set(SOURCES\n");
@@ -1801,6 +1805,30 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
             }
             if (fin) {
                 snprintf(dst_path, sizeof(dst_path), "%s/gba/%s", outdir, sub_headers[i]);
+                fout = fopen(dst_path, "wb");
+                if (fout) {
+                    while ((n = fread(buf, 1, sizeof(buf), fin)) > 0)
+                        fwrite(buf, 1, n, fout);
+                    fclose(fout);
+                }
+                fclose(fin);
+            }
+        }
+
+        /* Copy runtime.c and display.c so the generated project builds standalone
+         * without manual file copies. */
+        const char* runtime_files[] = { "runtime.c", "display.c", NULL };
+        for (int i = 0; runtime_files[i]; i++) {
+            const char* search[] = {
+                "src/%s", "../src/%s", "../../src/%s", NULL
+            };
+            fin = NULL;
+            for (int j = 0; search[j] && !fin; j++) {
+                snprintf(src_path, sizeof(src_path), search[j], runtime_files[i]);
+                fin = fopen(src_path, "rb");
+            }
+            if (fin) {
+                snprintf(dst_path, sizeof(dst_path), "%s/%s", outdir, runtime_files[i]);
                 fout = fopen(dst_path, "wb");
                 if (fout) {
                     while ((n = fread(buf, 1, sizeof(buf), fin)) > 0)
