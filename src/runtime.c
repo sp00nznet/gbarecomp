@@ -1309,6 +1309,19 @@ void run_iwram_function(u32 target) {
                     cpu_bx(addr);
                     continue;
                 }
+                /* Sanity check: BX to a region that holds no executable code is
+                 * almost always an uninitialized function pointer (e.g. game
+                 * dispatched IRQ before populating its subhandler table).
+                 * Bail out loudly instead of fetching zeros forever. */
+                u8 region = addr >> 24;
+                if (region != 0x02 /* EWRAM */ && region != 0x03 /* IWRAM */ &&
+                    region != 0x00 /* BIOS */) {
+                    static int _bx_warns = 0;
+                    if (_bx_warns++ < 5)
+                        fprintf(stderr, "[interp] ARM BX to unmapped 0x%08X (rm=r%u, pc=0x%08X) - bailing\n",
+                                addr, rm, pc - 4);
+                    break;
+                }
                 thumb = (addr & 1) != 0;
                 pc = addr & ~1u;
                 continue;
@@ -1929,8 +1942,21 @@ void run_iwram_function(u32 target) {
 done:
     if (steps >= max_steps) {
         static int _limit_warns = 0;
-        if (_limit_warns++ < 3)
-            fprintf(stderr, "[interp] step limit hit at 0x%08X (%d steps)\n", target, steps);
+        if (_limit_warns++ < 3) {
+            fprintf(stderr, "[interp] step limit hit at 0x%08X (%d steps), pc=0x%08X\n",
+                    target, steps, pc);
+            u32 base = (target & ~1u) & ~0x1Fu;
+            fprintf(stderr, "[interp]   bytes around target:");
+            for (int i = 0; i < 32; i += 2)
+                fprintf(stderr, " %04X", bus_read16(base + i));
+            fprintf(stderr, "\n[interp]   bytes around final pc:");
+            u32 pbase = pc & ~0x1Fu;
+            for (int i = 0; i < 32; i += 2)
+                fprintf(stderr, " %04X", bus_read16(pbase + i));
+            u16 ie = io_read16(0x200), if_v = io_read16(0x202), ime = io_read16(0x208);
+            fprintf(stderr, "\n[interp]   IE=0x%04X IF=0x%04X IME=%d DISPSTAT=0x%04X VCOUNT=%d\n",
+                    ie, if_v, ime, io_read16(0x004), io_read16(0x006) & 0xFF);
+        }
     }
 }
 
