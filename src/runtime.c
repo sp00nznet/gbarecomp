@@ -1337,6 +1337,37 @@ void run_iwram_function(u32 target) {
                 continue;
             }
 
+            /* MSR (must come BEFORE data-processing: MSR's encoding overlaps
+             * with TST/TEQ/CMP/CMN-without-S, and the data-processing path
+             * would otherwise misinterpret it and write the result into pc
+             * when Rd=15 (e.g. MSR CPSR_cf, r3 = 0xE129F003 looks like TEQ
+             * with Rd=pc, leading to garbage pc loads). */
+            if ((insn & 0x0FB0F000) == 0x0120F000) {
+                u32 val;
+                if (insn & (1 << 25)) {
+                    u32 imm = insn & 0xFF;
+                    u32 rot = ((insn >> 8) & 0xF) * 2;
+                    val = rot ? (imm >> rot) | (imm << (32 - rot)) : imm;
+                } else {
+                    val = r[insn & 0xF];
+                }
+                u32 mask = 0;
+                if (insn & (1 << 19)) mask |= 0xF0000000;
+                if (insn & (1 << 16)) mask |= 0x000000FF;
+                bool spsr = (insn >> 22) & 1;
+                if (spsr) cpu_set_spsr(val, mask >> 28);
+                else cpu_set_cpsr(val, mask >> 28);
+                continue;
+            }
+
+            /* MRS (also must precede data-processing for the same reason) */
+            if ((insn & 0x0FBF0FFF) == 0x010F0000) {
+                int rd_idx = (insn >> 12) & 0xF;
+                bool spsr = (insn >> 22) & 1;
+                r[rd_idx] = spsr ? cpu_get_spsr() : cpu_get_cpsr();
+                continue;
+            }
+
             /* Data processing: AND, EOR, SUB, RSB, ADD, ADC, SBC, RSC, TST, TEQ, CMP, CMN, ORR, MOV, BIC, MVN */
             if ((insn & 0x0C000000) == 0x00000000) {
                 int opcode = (insn >> 21) & 0xF;
@@ -1433,6 +1464,13 @@ void run_iwram_function(u32 target) {
                 }
                 if (rd == 15) {
                     pc = result & ~3u;
+                    u8 reg4 = pc >> 24;
+                    if (reg4 != 0x00 && reg4 != 0x02 && reg4 != 0x03 && reg4 != 0x08) {
+                        static int _dpc = 0;
+                        if (_dpc++ < 5)
+                            fprintf(stderr, "[interp] DataProc pc <- 0x%08X opcode=%X insn=0x%08X at 0x%08X\n",
+                                    pc, opcode, insn, pc - 4);
+                    }
                     /* Check for mode switch if S bit set */
                 }
                 continue;
@@ -1470,7 +1508,16 @@ void run_iwram_function(u32 target) {
                 u32 addr = p ? (u ? base + offset2 : base - offset2) : base;
                 if (l) {
                     r[rd_idx] = b ? bus_read8(addr) : bus_read32(addr);
-                    if (rd_idx == 15) { pc = r[15] & ~3u; }
+                    if (rd_idx == 15) {
+                        pc = r[15] & ~3u;
+                        u8 reg2 = pc >> 24;
+                        if (reg2 != 0x00 && reg2 != 0x02 && reg2 != 0x03 && reg2 != 0x08) {
+                            static int _lpc = 0;
+                            if (_lpc++ < 5)
+                                fprintf(stderr, "[interp] LDR pc <- 0x%08X from [0x%08X] insn=0x%08X at 0x%08X\n",
+                                        pc, addr, insn, pc - 4);
+                        }
+                    }
                 } else {
                     u32 val = r[rd_idx];
                     if (rd_idx == 15) val = pc + 4;
@@ -1505,7 +1552,16 @@ void run_iwram_function(u32 target) {
                     if (!(rlist & (1 << i2))) continue;
                     if (l) {
                         r[i2] = bus_read32(addr2);
-                        if (i2 == 15) pc = r[15] & ~3u;
+                        if (i2 == 15) {
+                            pc = r[15] & ~3u;
+                            u8 reg3 = pc >> 24;
+                            if (reg3 != 0x00 && reg3 != 0x02 && reg3 != 0x03 && reg3 != 0x08) {
+                                static int _lmpc = 0;
+                                if (_lmpc++ < 5)
+                                    fprintf(stderr, "[interp] LDM pc <- 0x%08X from [0x%08X] rlist=0x%04X (S=%d) base=0x%08X\n",
+                                            pc, addr2, rlist, s_bit2, r[rn_idx]);
+                            }
+                        }
                     } else {
                         bus_write32(addr2, r[i2]);
                     }
