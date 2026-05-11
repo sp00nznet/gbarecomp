@@ -1229,6 +1229,10 @@ void run_iwram_function(u32 target) {
         u32 off = 0;
         if (region == 0x02) { mem = ewram; off = peek & 0x3FFFF; }
         else if (region == 0x03) { mem = iwram; off = peek & 0x7FFF; }
+        else if (region >= 0x08 && region <= 0x0D) {
+            mem = rom_data;
+            off = (peek - 0x08000000u) % rom_size;
+        }
         if (mem) {
             u8 b0 = mem[off], b1 = mem[off+1];
             u32 w = mem[off] | (mem[off+1]<<8) | (mem[off+2]<<16) | (mem[off+3]<<24);

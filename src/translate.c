@@ -1681,9 +1681,14 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "            hi = mid - 1;\n");
         fprintf(f, "        }\n");
         fprintf(f, "    }\n");
-        fprintf(f, "    /* Target not in function table - this is a BX-as-return.\n");
-        fprintf(f, "     * The target is a return address (pushed LR) not a function entry.\n");
-        fprintf(f, "     * Set r[15] so the caller knows where to resume. */\n");
+        fprintf(f, "    /* ROM target not in bx_table - could be a function pointer to a handler\n");
+        fprintf(f, "     * that the static analyzer didn't discover (e.g. entry in a state-dispatch\n");
+        fprintf(f, "     * table reached only by indirect call). Run it through the interpreter so\n");
+        fprintf(f, "     * the call actually executes. Falls back to r[15] for non-code targets. */\n");
+        fprintf(f, "    if ((target >> 24) >= 0x08 && (target >> 24) <= 0x0D) {\n");
+        fprintf(f, "        run_iwram_function(target);\n");
+        fprintf(f, "        return;\n");
+        fprintf(f, "    }\n");
         fprintf(f, "    r[15] = target;\n");
         fprintf(f, "}\n\n");
 
