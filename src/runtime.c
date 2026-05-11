@@ -52,6 +52,175 @@ static u8* sram      = NULL;  /* 64KB */
 /* Save file path for SRAM persistence */
 static char sram_path[512] = {0};
 
+/* ---- EEPROM (8KB EEPROM_V) ----
+ * Bit-serial protocol over DMA3 to/from cart at 0x0D000000-0x0DFFFFFF.
+ * Game writes command bits via bus_write16 (only bit 0 matters), then
+ * reads response bits via bus_read16 (only bit 0 matters).
+ *
+ * Read sequence:
+ *   write: 2 bits "11" + 14 (or 6) addr bits + 1 stop bit
+ *   read:  4 dummy bits + 64 data bits
+ *
+ * Write sequence:
+ *   write: 2 bits "10" + 14 (or 6) addr bits + 64 data bits + 1 stop bit
+ *
+ * Idle reads return bit 0 = 1 ("ready"), which is what save-detection
+ * polling loops expect after a DMA completes.
+ */
+typedef enum {
+    EE_IDLE,
+    EE_READ_ADDR,
+    EE_READ_STOP,
+    EE_READ_OUT,
+    EE_WRITE_ADDR,
+    EE_WRITE_DATA,
+    EE_WRITE_STOP,
+} EepromMode;
+
+static struct {
+    bool present;
+    bool large;              /* 64Kbit (8KB) vs 4Kbit (512B) */
+    EepromMode mode;
+    int bit_cnt;
+    u32 cmd_bits;            /* first 2 command bits */
+    u32 addr_buf;
+    u64 data_buf;
+    u32 cur_addr;
+    int read_bit_idx;
+    u8 storage[0x2000];      /* 8 KB max */
+    char path[512];
+} eeprom;
+
+static u16 eeprom_read(void) {
+    if (eeprom.mode == EE_READ_OUT) {
+        int idx = eeprom.bit_cnt++;
+        if (eeprom.bit_cnt >= 68) {
+            eeprom.mode = EE_IDLE;
+            eeprom.bit_cnt = 0;
+        }
+        if (idx < 4) return 0;
+        int data_idx = idx - 4;
+        int byte_off = eeprom.cur_addr * 8 + (data_idx >> 3);
+        int bit_off = 7 - (data_idx & 7);
+        if (byte_off >= (int)sizeof(eeprom.storage)) return 0;
+        return (eeprom.storage[byte_off] >> bit_off) & 1;
+    }
+    /* Idle or busy: report ready */
+    return 1;
+}
+
+static void eeprom_write(u16 value) {
+    u8 bit = value & 1;
+    int addr_bits = eeprom.large ? 14 : 6;
+
+    switch (eeprom.mode) {
+    case EE_IDLE:
+        eeprom.cmd_bits = (eeprom.cmd_bits << 1) | bit;
+        eeprom.bit_cnt++;
+        if (eeprom.bit_cnt == 2) {
+            u32 c = eeprom.cmd_bits & 3;
+            eeprom.cmd_bits = 0;
+            eeprom.bit_cnt = 0;
+            if (c == 3) eeprom.mode = EE_READ_ADDR;        /* 11 = read */
+            else if (c == 2) eeprom.mode = EE_WRITE_ADDR;  /* 10 = write */
+            /* else invalid - stay idle */
+        }
+        break;
+    case EE_READ_ADDR:
+        eeprom.addr_buf = (eeprom.addr_buf << 1) | bit;
+        eeprom.bit_cnt++;
+        if (eeprom.bit_cnt == addr_bits) {
+            eeprom.cur_addr = eeprom.addr_buf & ((1u << addr_bits) - 1);
+            eeprom.addr_buf = 0;
+            eeprom.bit_cnt = 0;
+            eeprom.mode = EE_READ_STOP;
+        }
+        break;
+    case EE_READ_STOP:
+        /* 1 stop bit, then ready to output */
+        eeprom.mode = EE_READ_OUT;
+        eeprom.bit_cnt = 0;
+        break;
+    case EE_WRITE_ADDR:
+        eeprom.addr_buf = (eeprom.addr_buf << 1) | bit;
+        eeprom.bit_cnt++;
+        if (eeprom.bit_cnt == addr_bits) {
+            eeprom.cur_addr = eeprom.addr_buf & ((1u << addr_bits) - 1);
+            eeprom.addr_buf = 0;
+            eeprom.bit_cnt = 0;
+            eeprom.mode = EE_WRITE_DATA;
+        }
+        break;
+    case EE_WRITE_DATA:
+        eeprom.data_buf = (eeprom.data_buf << 1) | (u64)bit;
+        eeprom.bit_cnt++;
+        if (eeprom.bit_cnt == 64) {
+            int base = eeprom.cur_addr * 8;
+            if (base + 8 <= (int)sizeof(eeprom.storage)) {
+                for (int i = 0; i < 8; i++) {
+                    eeprom.storage[base + i] = (u8)(eeprom.data_buf >> (56 - i * 8));
+                }
+            }
+            eeprom.data_buf = 0;
+            eeprom.bit_cnt = 0;
+            eeprom.mode = EE_WRITE_STOP;
+        }
+        break;
+    case EE_WRITE_STOP:
+        /* 1 stop bit, then ready (we skip the busy phase) */
+        eeprom.mode = EE_IDLE;
+        eeprom.bit_cnt = 0;
+        break;
+    default:
+        eeprom.mode = EE_IDLE;
+        eeprom.bit_cnt = 0;
+        break;
+    }
+}
+
+/* Returns true if addr is an EEPROM access for this cart.
+ * For ROM <= 16MB the whole 0x0D region is EEPROM; for larger ROMs only
+ * 0x0DFFFF00-0x0DFFFFFF (LttP is 8MB so the simple test suffices). */
+static inline bool is_eeprom_addr(u32 addr) {
+    if (!eeprom.present) return false;
+    if (rom_size > 0x01000000) return (addr & 0x0FFFFF00) == 0x0DFFFF00;
+    return (addr >> 24) == 0x0D;
+}
+
+static void eeprom_detect(void) {
+    /* Scan ROM for "EEPROM_V" magic (Nintendo SDK marker). */
+    if (rom_size < 8) return;
+    const char* needle = "EEPROM_V";
+    for (u32 i = 0; i + 8 <= rom_size; i++) {
+        if (memcmp(rom_data + i, needle, 8) == 0) {
+            eeprom.present = true;
+            eeprom.large = true;  /* default 64Kbit; real detection is via DMA size */
+            fprintf(stderr, "[runtime] EEPROM detected at ROM 0x%08X (assuming 8KB)\n",
+                    0x08000000 + i);
+            return;
+        }
+    }
+}
+
+static void eeprom_load(void) {
+    if (!eeprom.present || !eeprom.path[0]) return;
+    FILE* f = fopen(eeprom.path, "rb");
+    if (f) {
+        fread(eeprom.storage, 1, sizeof(eeprom.storage), f);
+        fclose(f);
+        fprintf(stderr, "[runtime] Loaded EEPROM from %s\n", eeprom.path);
+    }
+}
+
+static void eeprom_save(void) {
+    if (!eeprom.present || !eeprom.path[0]) return;
+    FILE* f = fopen(eeprom.path, "wb");
+    if (f) {
+        fwrite(eeprom.storage, 1, sizeof(eeprom.storage), f);
+        fclose(f);
+    }
+}
+
 /* ---- I/O Register Helpers ---- */
 
 static inline u16 io_read16(u32 offset) {
@@ -565,6 +734,10 @@ u32 bus_read32(u32 addr) {
     case 0x08: case 0x09:
     case 0x0A: case 0x0B:
     case 0x0C: case 0x0D: {
+        if (is_eeprom_addr(addr)) {
+            u16 v = eeprom_read();
+            return v | ((u32)eeprom_read() << 16);
+        }
         offset = (addr - 0x08000000) % rom_size;
         return rom_data[offset] | (rom_data[offset+1] << 8) |
                (rom_data[offset+2] << 16) | (rom_data[offset+3] << 24);
@@ -610,6 +783,7 @@ u16 bus_read16(u32 addr) {
         return vram[offset] | (vram[offset+1] << 8);
     case 0x07: offset = addr & 0x3FF;    return oam[offset] | (oam[offset+1] << 8);
     case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+        if (is_eeprom_addr(addr)) return eeprom_read();
         offset = (addr - 0x08000000) % rom_size;
         return rom_data[offset] | (rom_data[offset+1] << 8);
     case 0x0E: case 0x0F:
@@ -634,6 +808,7 @@ u8 bus_read8(u32 addr) {
         return vram[offset];
     case 0x07: return oam[addr & 0x3FF];
     case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+        if (is_eeprom_addr(addr)) return (u8)eeprom_read();
         offset = (addr - 0x08000000) % rom_size;
         return rom_data[offset];
     case 0x0E: case 0x0F:
@@ -673,6 +848,9 @@ void bus_write32(u32 addr, u32 value) {
         break;
     }
     case 0x07: mem_write32_raw(oam, addr & 0x3FF, value); break;
+    case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+        if (is_eeprom_addr(addr)) { eeprom_write((u16)value); eeprom_write((u16)(value >> 16)); }
+        break;
     case 0x0E: case 0x0F:
         if (sram) sram[addr & 0xFFFF] = (u8)value;
         break;
@@ -707,6 +885,9 @@ void bus_write16(u32 addr, u16 value) {
         break;
     }
     case 0x07: mem_write16_raw(oam, addr & 0x3FF, value); break;
+    case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+        if (is_eeprom_addr(addr)) eeprom_write(value);
+        break;
     case 0x0E: case 0x0F:
         if (sram) sram[addr & 0xFFFF] = (u8)value;
         break;
@@ -2132,6 +2313,17 @@ void gba_init(const char* rom_path) {
     else strcat(sram_path, ".sav");
     sram_load();
 
+    /* Detect and set up EEPROM */
+    eeprom_detect();
+    if (eeprom.present) {
+        strncpy(eeprom.path, rom_path, sizeof(eeprom.path) - 5);
+        eeprom.path[sizeof(eeprom.path) - 5] = '\0';
+        char* dot2 = strrchr(eeprom.path, '.');
+        if (dot2) strcpy(dot2, ".eep");
+        else strcat(eeprom.path, ".eep");
+        eeprom_load();
+    }
+
     /* Initialize CPU state (post-BIOS) */
     memset(r, 0, sizeof(r));
     r[13] = 0x03007F00;  /* SP - system/user mode */
@@ -2165,6 +2357,7 @@ void gba_init(const char* rom_path) {
 
 void gba_shutdown(void) {
     sram_save();
+    eeprom_save();
     display_shutdown();
     free(ewram);    ewram = NULL;
     free(iwram);    iwram = NULL;
