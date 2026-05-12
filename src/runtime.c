@@ -2341,6 +2341,16 @@ void gba_init(const char* rom_path) {
     io_regs[0x088] = 0x00;
     io_regs[0x089] = 0x02; /* 0x0200 = default SOUNDBIAS */
 
+    /* Initialize SIO registers for "no link cable connected".
+     * On real hardware the SIOMULTI[0..3] data registers (0x120-0x127)
+     * read as 0xFFFF when no remote unit is attached - pull-ups bring
+     * the unconnected lines high. SIOCNT (0x128) and SIOMLT_SEND (0x12A)
+     * default to 0. Games that probe for link-cable presence (LttP+Four
+     * Swords, Pokemon, Mario Kart Super Circuit, etc.) read these regs
+     * during boot; leaving them as zero looks like "cable present, no
+     * data yet" and can stall the boot state machine. */
+    for (int i = 0x120; i < 0x128; i++) io_regs[i] = 0xFF;
+
     /* Initialize timer state */
     memset(timers, 0, sizeof(timers));
 
