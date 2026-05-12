@@ -1588,8 +1588,15 @@ void run_iwram_function(u32 target) {
                 continue;
             }
 
-            /* Data processing: AND, EOR, SUB, RSB, ADD, ADC, SBC, RSC, TST, TEQ, CMP, CMN, ORR, MOV, BIC, MVN */
-            if ((insn & 0x0C000000) == 0x00000000) {
+            /* Data processing: AND, EOR, SUB, RSB, ADD, ADC, SBC, RSC, TST, TEQ, CMP, CMN, ORR, MOV, BIC, MVN.
+             * Exclude halfword/signed transfers (bit 25=0, bit 7=1, bit 4=1 with bits 6-5 non-zero) and
+             * multiply/long-multiply (bit 25=0, bits 7-4 = 1001), which all share the bits 27-26 = 00
+             * encoding space with data-processing register form. */
+            if ((insn & 0x0C000000) == 0x00000000 &&
+                /* not halfword/signed transfer (bit 7=1 && bit 4=1 && bits 6-5 != 00) */
+                !((insn & (1u << 25)) == 0 && (insn & 0x90) == 0x90 && (insn & 0x60) != 0) &&
+                /* not multiply (bits 7-4 = 1001 with bit 25=0) */
+                !((insn & (1u << 25)) == 0 && (insn & 0xF0) == 0x90)) {
                 int opcode = (insn >> 21) & 0xF;
                 bool s_bit = (insn >> 20) & 1;
                 int rn = (insn >> 16) & 0xF;
