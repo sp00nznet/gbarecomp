@@ -658,6 +658,41 @@ static void io_write_hook(u32 offset, u32 value, int size) {
         /* Halt: advance to next interrupt */
         /* In recompiled code, just advance a frame */
     }
+
+    /* SIOCNT write (0x04000128) - if the multiplayer start bit (bit 7)
+     * goes high, simulate a transfer with no slaves connected:
+     *   - SIOMULTI[0] = whatever the parent put in SIOMLT_SEND
+     *   - SIOMULTI[1..3] = 0xFFFF (idle, no slave)
+     *   - SD bit (bit 3) stays as the game wrote it (we OR it high on
+     *     read elsewhere)
+     *   - Error bit (bit 6) = 1 (no slaves found - one common interpretation
+     *     used by games as a "running solo" signal)
+     *   - Start bit (bit 7) cleared (transfer complete)
+     *   - If IRQ enable (bit 14) set, raise IF bit 7 (SIO IRQ) */
+    if (offset == 0x128 || offset == 0x129) {
+        u16 siocnt = io_read16(0x128);
+        if (siocnt & 0x80) {
+            /* Transfer initiated */
+            u16 sio_send = io_read16(0x12A);
+            io_write16(0x120, sio_send);    /* SIOMULTI[0] = sent value */
+            io_write16(0x122, 0xFFFF);      /* SIOMULTI[1] = idle */
+            io_write16(0x124, 0xFFFF);      /* SIOMULTI[2] = idle */
+            io_write16(0x126, 0xFFFF);      /* SIOMULTI[3] = idle */
+            /* Clear start, set error (no slaves) */
+            siocnt = (siocnt & ~0x80) | 0x40;
+            io_write16(0x128, siocnt);
+            /* Raise SIO IRQ if enabled */
+            if (siocnt & 0x4000) {
+                u16 if_val = io_read16(0x202);
+                io_write16(0x202, if_val | 0x80);
+                /* Also set BIOS IF mirror for IntrWait */
+                u16 bios_if = iwram[0x7FF8] | (iwram[0x7FF9] << 8);
+                bios_if |= 0x80;
+                iwram[0x7FF8] = (u8)(bios_if);
+                iwram[0x7FF9] = (u8)(bios_if >> 8);
+            }
+        }
+    }
 }
 
 /* ---- Memory Bus Implementation ---- */
