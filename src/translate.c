@@ -838,14 +838,27 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
     case THUMB_HI_REG_OPS:
         switch (insn->hi_op) {
             case THUMB_HI_ADD:
-                emit(ctx, "%s += %s;", reg_c((u8)insn->rd), reg_c((u8)insn->rs));
+                if (insn->rd == 15) {
+                    /* ADD pc, rN: PC = PC + 4 + rN, then branch */
+                    emit(ctx, "cpu_bx((0x%08Xu) + %s); return; /* ADD pc, %s */",
+                         addr + 4, reg_c((u8)insn->rs), reg_c((u8)insn->rs));
+                } else {
+                    emit(ctx, "%s += %s;", reg_c((u8)insn->rd), reg_c((u8)insn->rs));
+                }
                 break;
             case THUMB_HI_CMP:
                 emit(ctx, "cpu_sub(NULL, %s, %s, true);",
                      reg_c((u8)insn->rd), reg_c((u8)insn->rs));
                 break;
             case THUMB_HI_MOV:
-                emit(ctx, "%s = %s;", reg_c((u8)insn->rd), reg_c((u8)insn->rs));
+                if (insn->rd == 15) {
+                    /* MOV pc, rN: branch to rN (preserves current Thumb mode).
+                     * The recompiler routes via cpu_bx (function-pointer dispatch). */
+                    emit(ctx, "cpu_bx(%s); return; /* MOV pc, %s */",
+                         reg_c((u8)insn->rs), reg_c((u8)insn->rs));
+                } else {
+                    emit(ctx, "%s = %s;", reg_c((u8)insn->rd), reg_c((u8)insn->rs));
+                }
                 break;
             default:
                 break;
