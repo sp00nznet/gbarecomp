@@ -48,9 +48,11 @@
 | BIOS | Full HLE: 20+ SWI implementations |
 | PPU | Frame-based renderer (Mode 0/1/3/4, BG, OBJ) |
 | Input | SDL2 keyboard |
-| Save | SRAM auto-load/save (.sav files) |
+| Save | SRAM + EEPROM_V (8KB) auto-load/save (.sav files) |
+| SIO | Minimal multiplayer transfer simulation; SIOMULTI default 0xFFFF (no cable) |
 | RAM code | ARM + Thumb interpreters for IWRAM/EWRAM + ROM fallback |
 | SoftReset | longjmp-based restart |
+| Translator | Trap stubs for non-ROM call targets; /O1+/MP; runtime auto-copied |
 
 **Advance Wars test game:**
 - 7.3MB standalone executable (SDL2 only dependency)
@@ -65,6 +67,12 @@
 - Display still in forced blank (DISPCNT=0x0080) during early init frames -- game needs more init time or has remaining mid-function entry gaps
 - Some functions interpreted instead of dispatched (performance, not correctness)
 - Register comparison verifier has found and fixed several translator bugs
+- Audio engine: stubs only; no mixer / FIFO playback yet
+- Affine BG (Mode 1/2) partial; HBlank-per-line BG2X/Y effects not yet driven by a test ROM
+
+**Next target: Pokémon FireRed (Flash 128KB)**
+
+Picked to drive Flash save support, which the runtime currently lacks. FireRed uses `FLASH1M_V103` -- the larger variant that requires bank switching and the full Atmel/Sanyo/Macronix command sequence. No RTC, no sensors, and the `pret/pokefirered` decomp gives ground-truth C for any function the recompiler mistranslates. Plan: detect Flash by ROM signature, implement command state machine at `0x0E000000-0x0E00FFFF`, back it with a 128KB `.sav`, then bring up FireRed and chase init blockers.
 
 ## Bugs Found and Fixed
 
@@ -80,6 +88,12 @@ The register comparison verifier (runs functions through both recompiled C and T
 | POP {rN}; BX rN causes double execution | Continuation code runs via cpu_bx AND via C-level label | Detect POP+BX return pattern, emit `return` instead |
 | Interpreter exits on BX-to-ROM | IRQ handler can't call ROM functions, gets stuck | Interpreter calls cpu_bx for ROM targets and continues |
 | VBlank/HBlank IF flags gated behind DISPSTAT | Interrupts never fire if DISPSTAT IRQ enable not set | Set IF unconditionally |
+| ARM MSR/MRS decoded as data-processing | CPSR control writes silently dropped | Check MSR/MRS encoding before data-processing in interpreter |
+| ARM data-processing check ate halfword/multiply encodings | LDRH/STRH/MUL silently mis-decoded | Tighten data-processing mask to exclude halfword/multiply encoding space |
+| Thumb MOV/ADD pc, rN fell through instead of branching | Tail-call/computed-branch idioms ran straight into next block | Emit branch in translator when destination register is PC |
+| cpu_bx to unknown ROM target | Generated code aborted | Fall back to interpreter for ROM targets not in dispatch table |
+| ARM BX to unmapped address | Silent corruption | Bail with diagnostic; dump state on step-limit hit |
+| SIOMULTI registers read as 0x0000 (active link) | Games hung waiting for nonexistent peer | Init SIOMULTI[0..3] = 0xFFFF; minimal transfer simulation |
 
 ## Quick Start
 
