@@ -18,7 +18,9 @@ jobs:
         run: cmake --build build --config Release
       - name: Smoke test
         shell: bash
-        run: ./build/Release/gbarecomp.exe 2>&1 | grep -q "gbarecomp - GBA Static Recompilation Toolkit"
+        run: |
+          ./build/Release/gbarecomp.exe 2>&1 | grep -q "gbarecomp - GBA Static Recompilation Toolkit"
       - name: Conformance (SKIP without a ROM)
         shell: bash
-        run: python tools/conformance.py --exe none.exe --rom none.gba --baseline none.txt | tee /dev/stderr | grep -q "conformance: skipped"
+        run: |
+          python tools/conformance.py --exe none.exe --rom none.gba --baseline none.txt | tee /dev/stderr | grep -q "conformance: skipped"
