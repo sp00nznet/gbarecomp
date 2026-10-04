@@ -221,6 +221,86 @@ static void eeprom_save(void) {
     }
 }
 
+/* ---- Flash backup (FLASH_V / FLASH512_V / FLASH1M_V) ----
+ *
+ * Command protocol (GBATEK "GBA Cart Backup Flash ROM"): AA->5555, 55->2AAA,
+ * then the command byte to 5555. 90/F0 enter/leave ID mode, 80 arms an erase
+ * (10 = chip, 30 to a sector = 4KB sector), A0 programs the next byte,
+ * B0 selects the 64KB bank on 1Mbit parts. The backing store is `sram`
+ * (128KB when Flash is present) so the existing .sav load/save covers it. */
+static struct {
+    bool present;
+    bool large;          /* FLASH1M: 128KB, two banks */
+    int  stage;          /* 0 idle, 1 got AA, 2 got 55 */
+    bool id_mode, erase_armed, write_next, bank_next;
+    u32  bank;
+} flash;
+
+static u32 backup_size = 0x10000;
+
+static void flash_detect(void) {
+    static const char* tags[] = { "FLASH1M_V", "FLASH512_V", "FLASH_V", NULL };
+    for (u32 i = 0; i + 10 <= rom_size; i++) {
+        if (rom_data[i] != 'F') continue;
+        for (int t = 0; tags[t]; t++) {
+            if (memcmp(rom_data + i, tags[t], strlen(tags[t])) == 0) {
+                flash.present = true;
+                flash.large = (t == 0);
+                fprintf(stderr, "[runtime] Flash %s detected (%s)\n",
+                        flash.large ? "128KB" : "64KB", tags[t]);
+                return;
+            }
+        }
+    }
+}
+
+static u8 backup_read8(u32 addr) {
+    u32 off = addr & 0xFFFF;
+    if (flash.present) {
+        if (flash.id_mode && off < 2) {
+            /* Sanyo LE26FV10N1TS (1M) / Panasonic MN63F805MNP (512K) */
+            static const u8 id_small[2] = { 0x32, 0x1B }, id_large[2] = { 0x62, 0x13 };
+            return flash.large ? id_large[off] : id_small[off];
+        }
+        return sram[flash.bank * 0x10000 + off];
+    }
+    return sram[off];
+}
+
+static void backup_write8(u32 addr, u8 val) {
+    u32 off = addr & 0xFFFF;
+    if (!flash.present) { sram[off] = val; return; }
+    u8* base = sram + flash.bank * 0x10000;
+    if (flash.write_next) { base[off] = val; flash.write_next = false; return; }
+    if (flash.bank_next) {
+        if (off == 0 && flash.large) flash.bank = val & 1;
+        flash.bank_next = false; return;
+    }
+    if (flash.stage == 0 && off == 0x5555 && val == 0xAA) { flash.stage = 1; return; }
+    if (flash.stage == 1 && off == 0x2AAA && val == 0x55) { flash.stage = 2; return; }
+    if (flash.stage == 2) {
+        flash.stage = 0;
+        if (flash.erase_armed && val == 0x30) {           /* sector erase */
+            memset(base + (off & 0xF000), 0xFF, 0x1000);
+            flash.erase_armed = false; return;
+        }
+        if (off != 0x5555) return;
+        if (flash.erase_armed && val == 0x10) {           /* chip erase */
+            memset(sram, 0xFF, backup_size);
+            flash.erase_armed = false; return;
+        }
+        switch (val) {
+        case 0x90: flash.id_mode = true; break;
+        case 0xF0: flash.id_mode = false; break;
+        case 0x80: flash.erase_armed = true; break;
+        case 0xA0: flash.write_next = true; break;
+        case 0xB0: flash.bank_next = true; break;
+        }
+        return;
+    }
+    flash.stage = 0;
+}
+
 /* ---- I/O Register Helpers ---- */
 
 static inline u16 io_read16(u32 offset) {
@@ -780,8 +860,7 @@ u32 bus_read32(u32 addr) {
 
     case 0x0E: case 0x0F:
         if (sram) {
-            offset = addr & 0xFFFF;
-            u8 val = sram[offset];
+            u8 val = backup_read8(addr);
             return val | (val << 8) | (val << 16) | (val << 24);
         }
         return 0;
@@ -821,8 +900,10 @@ u16 bus_read16(u32 addr) {
         if (is_eeprom_addr(addr)) return eeprom_read();
         offset = (addr - 0x08000000) % rom_size;
         return rom_data[offset] | (rom_data[offset+1] << 8);
-    case 0x0E: case 0x0F:
-        return sram ? sram[addr & 0xFFFF] : 0;
+    case 0x0E: case 0x0F: {
+        u8 v = sram ? backup_read8(addr) : 0;
+        return v * 0x0101u;
+    }
     default: return 0;
     }
 }
@@ -847,7 +928,7 @@ u8 bus_read8(u32 addr) {
         offset = (addr - 0x08000000) % rom_size;
         return rom_data[offset];
     case 0x0E: case 0x0F:
-        return sram ? sram[addr & 0xFFFF] : 0;
+        return sram ? backup_read8(addr) : 0;
     default: return 0;
     }
 }
@@ -887,7 +968,7 @@ void bus_write32(u32 addr, u32 value) {
         if (is_eeprom_addr(addr)) { eeprom_write((u16)value); eeprom_write((u16)(value >> 16)); }
         break;
     case 0x0E: case 0x0F:
-        if (sram) sram[addr & 0xFFFF] = (u8)value;
+        if (sram) backup_write8(addr, (u8)value);
         break;
     default: break;
     }
@@ -924,7 +1005,7 @@ void bus_write16(u32 addr, u16 value) {
         if (is_eeprom_addr(addr)) eeprom_write(value);
         break;
     case 0x0E: case 0x0F:
-        if (sram) sram[addr & 0xFFFF] = (u8)value;
+        if (sram) backup_write8(addr, (u8)value);
         break;
     default: break;
     }
@@ -965,7 +1046,7 @@ void bus_write8(u32 addr, u8 value) {
         break;
     }
     case 0x0E: case 0x0F:
-        if (sram) sram[addr & 0xFFFF] = value;
+        if (sram) backup_write8(addr, value);
         break;
     default: break;
     }
@@ -2304,7 +2385,7 @@ static void sram_save(void) {
     if (!sram || !sram_path[0]) return;
     FILE* f = fopen(sram_path, "wb");
     if (f) {
-        fwrite(sram, 1, 0x10000, f);
+        fwrite(sram, 1, backup_size, f);
         fclose(f);
     }
 }
@@ -2313,7 +2394,7 @@ static void sram_load(void) {
     if (!sram || !sram_path[0]) return;
     FILE* f = fopen(sram_path, "rb");
     if (f) {
-        fread(sram, 1, 0x10000, f);
+        fread(sram, 1, backup_size, f);
         fclose(f);
         fprintf(stderr, "[runtime] Loaded SRAM from %s\n", sram_path);
     }
@@ -2329,7 +2410,7 @@ void gba_init(const char* rom_path) {
     palette = calloc(1, 0x400);
     vram    = calloc(1, 0x18000);
     oam     = calloc(1, 0x400);
-    sram    = calloc(1, 0x10000);
+    sram    = calloc(1, 0x20000);
 
     /* Load ROM */
     FILE* f = fopen(rom_path, "rb");
@@ -2353,6 +2434,11 @@ void gba_init(const char* rom_path) {
     char* dot = strrchr(sram_path, '.');
     if (dot) strcpy(dot, ".sav");
     else strcat(sram_path, ".sav");
+    flash_detect();
+    if (flash.present) {
+        backup_size = flash.large ? 0x20000 : 0x10000;
+        memset(sram, 0xFF, backup_size);  /* erased flash reads 0xFF */
+    }
     sram_load();
 
     /* Detect and set up EEPROM */
