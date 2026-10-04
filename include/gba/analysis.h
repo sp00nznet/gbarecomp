@@ -78,6 +78,17 @@ typedef struct AnalysisCtx {
     int num_jump_tables;
     int cap_jump_tables;
 
+    /* Extra entry points from the title's entries file (--entries) */
+    u32* extra_entries;
+    int num_extra_entries;
+    int cap_extra_entries;
+
+    /* Code pointers into already-analyzed code (Phase 4b), made functions
+     * only after Phase 6 so they don't split their host */
+    u32* late_entries;
+    int num_late_entries;
+    int cap_late_entries;
+
     /* Work queue */
     WorkItem* queue;
     int queue_head;
@@ -102,6 +113,10 @@ void analysis_run(AnalysisCtx* ctx);
 
 /* Add an entry point to analyze (address + mode). Called before analysis_run. */
 void analysis_add_entry(AnalysisCtx* ctx, u32 addr, CodeType mode);
+
+/* Load extra entry points (one hex address per line, '#' comments) to be
+ * queued after the ROM header entry. Returns the count, or -1 on error. */
+int analysis_load_entries(AnalysisCtx* ctx, const char* path);
 
 /* Look up the basic block containing an address. Returns NULL if not found. */
 BasicBlock* analysis_find_block(AnalysisCtx* ctx, u32 addr);

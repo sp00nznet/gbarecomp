@@ -553,9 +553,10 @@ static void dma_trigger_hblank(void) {
 /* ---- Interrupt Delivery ---- */
 
 static bool in_irq = false;
+static int g_validating;   /* lockstep validation in progress (see recomp_validate) */
 
 static void check_interrupts(void) {
-    if (in_irq) return;
+    if (in_irq || g_validating) return;
 
     u16 ime = io_read16(0x208);
     if (!ime) return;
@@ -583,8 +584,12 @@ static void check_interrupts(void) {
     bool saved_N = CPU_N, saved_Z = CPU_Z, saved_C = CPU_C, saved_V = CPU_V;
     memcpy(saved_r, r, sizeof(r));
 
-    /* Call the handler via BX dispatch */
+    /* Call the handler via BX dispatch. An interrupt lands between two
+     * instructions, so the interrupted code's return tracking is untouched. */
+    u32 saved_ret = g_ret;
+    g_ret = 0;
     cpu_bx(handler_addr);
+    g_ret = saved_ret;
 
     /* Restore game state */
     memcpy(r, saved_r, sizeof(r));
@@ -597,9 +602,16 @@ static void check_interrupts(void) {
 
 /* Advance hardware by a number of cycles. This is the heartbeat:
  * tracks scanlines, fires HBlank/VBlank, triggers DMA, delivers IRQs. */
+static jmp_buf validate_jmp;
+static u32 validate_deadline;
+
 static void advance_cycles(u32 cycles) {
     cycle_counter += cycles;
     scanline_cycles += cycles;
+    /* A validated call that runs past its budget (a main loop, a wait on an
+     * interrupt we're holding off) is abandoned, not compared */
+    if (g_validating && (s32)(cycle_counter - validate_deadline) > 0)
+        longjmp(validate_jmp, 1);
 
     /* Tick timers */
     timer_tick(cycles);
@@ -647,19 +659,34 @@ static void advance_cycles(u32 cycles) {
             io_regs[0x130] = (u8)(keys);
             io_regs[0x131] = (u8)(keys >> 8);
 
-            display_render_frame();
+            if (!g_validating) display_render_frame();  /* never twice per frame */
 
-            /* Frame pacing */
-            SDL_Delay(16);
+            /* Frame pacing (headless runs flat out) */
+            if (!display_headless()) SDL_Delay(16);
+
+            /* Memory snapshot for diffing against tools/oracle */
+            {
+                const char* dp = display_dump_path(frame_count);
+                FILE* df = dp ? fopen(dp, "wb") : NULL;
+                if (df) {
+                    fwrite(ewram, 1, 0x40000, df); fwrite(iwram, 1, 0x8000, df);
+                    fwrite(io_regs, 1, 0x400, df); fwrite(palette, 1, 0x400, df);
+                    fwrite(vram, 1, 0x18000, df);  fwrite(oam, 1, 0x400, df);
+                    fclose(df);
+                }
+            }
 
             /* Debug status */
-            if (frame_count <= 5 || frame_count % 300 == 0) {
+            long log_every = display_log_every();
+            if (frame_count <= 5 || (log_every && frame_count % log_every == 0)) {
                 u16 dispcnt = io_read16(0x000);
-                fprintf(stderr, "[frame %u] DISPCNT=0x%04X mode=%d BG=%d%d%d%d OBJ=%d\n",
+                fprintf(stderr, "[frame %u] DISPCNT=0x%04X mode=%d BG=%d%d%d%d OBJ=%d "
+                        "BLDCNT=0x%04X BLDY=%u pal0=0x%04X pal1=0x%04X\n",
                         frame_count, dispcnt, dispcnt & 7,
                         (dispcnt >> 8) & 1, (dispcnt >> 9) & 1,
                         (dispcnt >> 10) & 1, (dispcnt >> 11) & 1,
-                        (dispcnt >> 12) & 1);
+                        (dispcnt >> 12) & 1, io_read16(0x050), io_read16(0x054) & 31,
+                        palette[0] | (palette[1] << 8), palette[2] | (palette[3] << 8));
                 fflush(stderr);
             }
         }
@@ -1557,6 +1584,19 @@ void run_iwram_function(u32 target) {
     }
 
     call_count++;
+    {
+        /* GBA_TRACE_INTERP=N: log the first N interpreter entries */
+        static long trace_left = -1;
+        if (trace_left < 0) {
+            const char* e = getenv("GBA_TRACE_INTERP");
+            trace_left = e ? atol(e) : 0;
+        }
+        if (trace_left > 0) {
+            trace_left--;
+            fprintf(stderr, "[interp] enter 0x%08X lr=0x%08X sp=0x%08X frame=%u\n",
+                    target, r[14], r[13], frame_count);
+        }
+    }
 
     bool thumb = (target & 1) != 0;
     u32 pc = target & ~1u;
@@ -1607,7 +1647,7 @@ void run_iwram_function(u32 target) {
                 if ((addr & ~1u) == (return_sentinel & ~1u)) break;
                 if ((addr >> 24) == 0x08) {
                     /* ROM target: call recompiled function and continue */
-                    cpu_bx(addr);
+                    cpu_bx(addr); g_ret = 0;  /* native return targets mean nothing in here */
                     continue;
                 }
                 /* Sanity check: BX to a region that holds no executable code is
@@ -2084,7 +2124,7 @@ void run_iwram_function(u32 target) {
                 if ((val & ~1u) == (return_sentinel & ~1u)) goto done;
                 /* ROM target: call recompiled function and continue */
                 if ((val >> 24) == 0x08) {
-                    cpu_bx(val);
+                    cpu_bx(val); g_ret = 0;
                     break;
                 }
                 thumb = (val & 1) != 0;
@@ -2288,7 +2328,7 @@ void run_iwram_function(u32 target) {
 
                 /* If BL target is in ROM, dispatch to recompiled code */
                 if ((bl_target >> 24) == 0x08) {
-                    cpu_bx(bl_target | 1);
+                    cpu_bx(bl_target | 1); g_ret = 0;
                     /* After BX returns, continue interpreting */
                 } else {
                     /* BL to another RAM address - just update PC */
@@ -2304,6 +2344,11 @@ void run_iwram_function(u32 target) {
     }
 
 done:
+    /* The sentinel stood in for the caller's LR; wherever it ended up (lr,
+     * or the register a POP {rN}; BX rN return used) it is that LR again,
+     * so native code after us never sees 0xDEAD0001 */
+    for (int i = 0; i < 15; i++)
+        if ((r[i] & ~1u) == (return_sentinel & ~1u)) r[i] = saved_lr;
     if (steps >= max_steps) {
         static int _limit_warns = 0;
         if (_limit_warns++ < 3) {
@@ -2403,6 +2448,8 @@ static void sram_load(void) {
 /* ---- Init/Shutdown ---- */
 
 void gba_init(const char* rom_path) {
+    if (getenv("GBA_VALIDATE")) g_validate = atoi(getenv("GBA_VALIDATE"));
+
     /* Allocate memory regions */
     ewram   = calloc(1, 0x40000);
     iwram   = calloc(1, 0x8000);
@@ -2493,7 +2540,152 @@ void gba_init(const char* rom_path) {
     }
 }
 
+u32 g_func_ring[4096];
+u32 g_func_ring_i;
+u32 g_ret;
+
+/* ---- Lockstep validation (GBA_VALIDATE=K) ----
+ *
+ * The first K calls of every recompiled function are run twice from the
+ * same machine state: natively, then through the interpreter. Registers and
+ * memory are compared, the native result is kept, and a mismatch names the
+ * function. Callees run natively in both, so a failure points at that one
+ * function's translation (or at the interpreter: both are suspects).
+ * Interrupts are held off while validating so both runs see the same world.
+ * See docs/conformance.md. */
+int g_validate = 0;
+
+typedef struct {
+    u8 ewram[0x40000], iwram[0x8000], io[0x400], pal[0x400], vram[0x18000], oam[0x400];
+    u32 r[16]; bool n, z, c, v; u32 cpsr, spsr;
+    u32 cycle_counter, scanline, scanline_cycles, last_poll_cycle, frame_count;
+    HWTimer timers[4];
+} MachineState;
+
+static void state_save(MachineState* s) {
+    memcpy(s->ewram, ewram, 0x40000); memcpy(s->iwram, iwram, 0x8000);
+    memcpy(s->io, io_regs, 0x400); memcpy(s->pal, palette, 0x400);
+    memcpy(s->vram, vram, 0x18000); memcpy(s->oam, oam, 0x400);
+    memcpy(s->r, r, sizeof(r));
+    s->n = CPU_N; s->z = CPU_Z; s->c = CPU_C; s->v = CPU_V; s->cpsr = cpsr; s->spsr = spsr;
+    s->cycle_counter = cycle_counter; s->scanline = scanline;
+    s->scanline_cycles = scanline_cycles; s->last_poll_cycle = last_poll_cycle;
+    s->frame_count = frame_count;
+    memcpy(s->timers, timers, sizeof(timers));
+}
+
+static void state_load(const MachineState* s) {
+    memcpy(ewram, s->ewram, 0x40000); memcpy(iwram, s->iwram, 0x8000);
+    memcpy(io_regs, s->io, 0x400); memcpy(palette, s->pal, 0x400);
+    memcpy(vram, s->vram, 0x18000); memcpy(oam, s->oam, 0x400);
+    memcpy(r, s->r, sizeof(r));
+    CPU_N = s->n; CPU_Z = s->z; CPU_C = s->c; CPU_V = s->v; cpsr = s->cpsr; spsr = s->spsr;
+    cycle_counter = s->cycle_counter; scanline = s->scanline;
+    scanline_cycles = s->scanline_cycles; last_poll_cycle = s->last_poll_cycle;
+    frame_count = s->frame_count;
+    memcpy(timers, s->timers, sizeof(timers));
+}
+
+/* First differing byte in [a, a+n), skipping [skip_lo, skip_hi). -1 if none. */
+static long first_diff(const u8* a, const u8* b, u32 n, u32 skip_lo, u32 skip_hi) {
+    for (u32 i = 0; i < n; i++)
+        if (a[i] != b[i] && !(i >= skip_lo && i < skip_hi)) return (long)i;
+    return -1;
+}
+
+static struct { u32 addr; u16 calls; u8 failed; } v_seen[32768];
+static int v_funcs, v_fail;
+
+int recomp_validate(u32 addr) {
+    if (g_validating || in_irq) return 0;
+    u32 h = (addr >> 1) & 32767;
+    while (v_seen[h].addr && v_seen[h].addr != addr) h = (h + 1) & 32767;
+    if (!v_seen[h].addr) { v_seen[h].addr = addr; v_funcs++; }
+    if (v_seen[h].calls >= g_validate || v_seen[h].failed) return 0;
+    v_seen[h].calls++;
+
+    u32 target = recomp_lookup(addr);       /* with the Thumb bit */
+    void (*fn)(void) = recomp_lookup_fn(addr);
+    if (!fn) return 0;
+
+    static MachineState s0, s_native, s_interp;
+    g_validating = 1;
+    state_save(&s0);
+    int bx_depth0 = g_bx_depth;
+    u32 sp0 = r[13], lr0 = r[14];
+    if (setjmp(validate_jmp)) {
+        /* Over budget: never returns in reasonable time. Run it for real. */
+        state_load(&s0);
+        g_bx_depth = bx_depth0;
+        g_ret = 0;
+        v_seen[h].calls = 0xFFFF;
+        g_validating = 0;
+        return 0;
+    }
+    validate_deadline = cycle_counter + 2 * CYCLES_PER_FRAME;
+    g_ret = 0;
+    fn();
+    u32 ret_native = g_ret;
+    state_save(&s_native);
+    state_load(&s0);
+    validate_deadline = cycle_counter + 2 * CYCLES_PER_FRAME;
+    g_ret = 0;
+    run_iwram_function(target);
+    /* The interpreter returns through a sentinel LR; wherever it surfaces
+     * (lr, or a register a POP {rN}; BX rN return used) it stands for lr0 */
+    for (int i = 0; i < 15; i++)
+        if ((r[i] & ~1u) == 0xDEAD0000u) r[i] = lr0;
+    r[14] = s_native.r[14];
+    state_save(&s_interp);
+
+    /* Below the entry SP is scratch: native pushes the real LR where the
+     * interpreter pushes its sentinel, so the frame itself isn't compared */
+    u32 stk_hi = (sp0 & 0x7FFF), stk_lo = stk_hi > 0x800 ? stk_hi - 0x800 : 0;
+    char why[160] = "";
+    for (int i = 0; i < 14 && !why[0]; i++)
+        if (s_native.r[i] != s_interp.r[i])
+            snprintf(why, sizeof(why), "r%d native=%08X interp=%08X", i, s_native.r[i], s_interp.r[i]);
+    long d;
+    if (!why[0] && (d = first_diff(s_native.ewram, s_interp.ewram, 0x40000, 1, 0)) >= 0)
+        snprintf(why, sizeof(why), "EWRAM %08lX native=%02X interp=%02X", 0x02000000 + d, s_native.ewram[d], s_interp.ewram[d]);
+    if (!why[0] && (d = first_diff(s_native.iwram, s_interp.iwram, 0x8000, stk_lo, stk_hi)) >= 0)
+        snprintf(why, sizeof(why), "IWRAM %08lX native=%02X interp=%02X", 0x03000000 + d, s_native.iwram[d], s_interp.iwram[d]);
+    if (!why[0] && (d = first_diff(s_native.pal, s_interp.pal, 0x400, 1, 0)) >= 0)
+        snprintf(why, sizeof(why), "PAL +%03lX", d);
+    if (!why[0] && (d = first_diff(s_native.vram, s_interp.vram, 0x18000, 1, 0)) >= 0)
+        snprintf(why, sizeof(why), "VRAM +%05lX", d);
+    if (!why[0] && (d = first_diff(s_native.oam, s_interp.oam, 0x400, 1, 0)) >= 0)
+        snprintf(why, sizeof(why), "OAM +%03lX", d);
+    if (why[0]) {
+        v_seen[h].failed = 1; v_fail++;
+        fprintf(stderr, "VALIDATE %08X FAIL %s (sp=%08X lr=%08X frame=%u)\n", addr, why, sp0, lr0, frame_count);
+    }
+    state_load(&s_native);
+    g_ret = ret_native;
+    g_validating = 0;
+    return 1;
+}
+
 void gba_shutdown(void) {
+    if (getenv("GBA_FUNC_TRACE")) {
+        /* Distinct functions among the last 4096 entries, in first-seen order */
+        static u32 seen[4096], count[4096];
+        u32 n = 0;
+        for (u32 i = 0; i < 4096; i++) {
+            u32 a = g_func_ring[(g_func_ring_i + i) & 4095], k = 0;
+            if (!a) continue;
+            while (k < n && seen[k] != a) k++;
+            if (k == n) { seen[n] = a; count[n++] = 0; }
+            count[k]++;
+        }
+        fprintf(stderr, "[runtime] last 4096 function entries, distinct (count):");
+        for (u32 k = 0; k < n; k++)
+            fprintf(stderr, "%s%08X(%u)", k % 6 ? " " : "\n  ", seen[k], count[k]);
+        fprintf(stderr, "\n");
+    }
+    if (g_validate)
+        fprintf(stderr, "validate: %d/%d functions agree (native vs interpreter)\n",
+                v_funcs - v_fail, v_funcs);
     sram_save();
     eeprom_save();
     display_shutdown();

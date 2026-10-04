@@ -164,6 +164,37 @@ void gba_swi(u32 number);
 /* Indirect branch (BX to register value) - runtime dispatch */
 void cpu_bx(u32 target);
 
+/* Last 4096 recompiled function entries, for "where is it stuck" diagnosis
+ * (printed at exit when GBA_FUNC_TRACE is set). One store per call. */
+extern u32 g_func_ring[4096];
+extern u32 g_func_ring_i;
+extern int g_validate;
+extern int g_bx_depth;   /* cpu_bx nesting (generated in game_entry.c) */
+
+/* Return-target tracking. Recompiled functions return through the C stack,
+ * but GBA code can return somewhere other than its caller: an epilogue that
+ * pops an outer frame (tail-shared code), or longjmp. Every return records
+ * where it actually goes (RECOMP_RETURN); every call site checks it
+ * (RECOMP_CALLED) and, if it isn't this site's continuation, returns too, so
+ * the unwind continues up the C stack to the frame it belongs to.
+ * 0 = "returned normally / nothing to check". See docs/analysis.md. */
+extern u32 g_ret;
+#define RECOMP_RETURN(target) do { g_ret = (u32)(target) | 1u; return; } while (0)
+#define RECOMP_CALLED(retaddr) do { \
+        if (g_ret && ((g_ret ^ (u32)(retaddr)) & ~1u)) return; \
+        g_ret = 0; \
+    } while (0)
+int recomp_validate(u32 addr);
+#define RECOMP_ENTER(addr) do { \
+        g_func_ring[g_func_ring_i++ & 4095] = (addr); \
+        if (g_validate && recomp_validate(addr)) return; \
+    } while (0)
+
+/* Dispatch-table lookups (generated in game_entry.c): the BX address of the
+ * recompiled function at `addr` (Thumb bit set as needed), and its body. */
+u32 recomp_lookup(u32 addr);
+void (*recomp_lookup_fn(u32 addr))(void);
+
 /* Run a function in IWRAM/EWRAM (pre-compiled or stub fallback) */
 void run_iwram_function(u32 target);
 

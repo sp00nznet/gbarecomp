@@ -440,7 +440,8 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
         u32 target = addr + 8 + (u32)insn->branch_offset;
         begin_cond(ctx, insn->cond);
         emit(ctx, "r[14] = 0x%08Xu; /* return address */", addr + 4);
-        emit(ctx, "func_%08X(); /* BL */", target);
+        emit(ctx, "g_ret = 0; func_%08X(); /* BL */", target);
+        emit(ctx, "RECOMP_CALLED(0x%08Xu);", addr + 4);
         end_cond(ctx, insn->cond);
         break;
     }
@@ -448,9 +449,13 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
     case ARM_BX:
         begin_cond(ctx, insn->cond);
         if (insn->rm == REG_LR) {
-            emit(ctx, "return; /* BX LR */");
+            emit(ctx, "RECOMP_RETURN(r[14]); /* BX LR */");
+        } else if (addr >= 4 && rom_read32(ctx->rom, addr - 4) == 0xE1A0E00Fu) {
+            /* MOV lr, pc; BX rN: an indirect call that comes back here */
+            emit(ctx, "g_ret = 0; cpu_bx(%s); /* call via MOV lr, pc */", reg_c(insn->rm));
+            emit(ctx, "RECOMP_CALLED(0x%08Xu);", addr + 4);
         } else {
-            emit(ctx, "cpu_bx(%s); /* indirect branch */", reg_c(insn->rm));
+            emit(ctx, "cpu_bx(%s); return; /* indirect branch */", reg_c(insn->rm));
         }
         end_cond(ctx, insn->cond);
         break;
@@ -597,39 +602,31 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
         begin_cond(ctx, insn->cond);
         emit(ctx, "{");
         ctx->indent++;
-        emit(ctx, "u32 _addr = %s;", reg_c(insn->rn));
-
-        /* Determine direction and ordering */
-        if (insn->type == ARM_LDM) {
-            for (int i = 0; i < 16; i++) {
-                if (!(insn->reg_list & (1 << i))) continue;
-                if (insn->p) {
-                    emit(ctx, "_addr %s= 4;", insn->u ? "+" : "-");
-                    emit(ctx, "r[%d] = bus_read32(_addr);", i);
-                } else {
-                    emit(ctx, "r[%d] = bus_read32(_addr);", i);
-                    emit(ctx, "_addr %s= 4;", insn->u ? "+" : "-");
-                }
-            }
-        } else {
-            for (int i = 0; i < 16; i++) {
-                if (!(insn->reg_list & (1 << i))) continue;
-                if (insn->p) {
-                    emit(ctx, "_addr %s= 4;", insn->u ? "+" : "-");
-                    emit(ctx, "bus_write32(_addr, r[%d]);", i);
-                } else {
-                    emit(ctx, "bus_write32(_addr, r[%d]);", i);
-                    emit(ctx, "_addr %s= 4;", insn->u ? "+" : "-");
-                }
-            }
+    {
+        /* Whatever the mode, the lowest register goes to the lowest address
+         * (ARM ARM, LDM/STM addressing modes). Decrementing modes used to walk
+         * registers upward from Rn, reversing every STMDB/LDMIA pair. */
+        int n = 0;
+        for (int i = 0; i < 16; i++) if (insn->reg_list & (1 << i)) n++;
+        int start = insn->u ? (insn->p ? 4 : 0) : (insn->p ? -4 * n : -4 * n + 4);
+        bool loads_rn = insn->type == ARM_LDM && (insn->reg_list & (1 << insn->rn));
+        emit(ctx, "u32 _addr = %s + (u32)(%d);", reg_c(insn->rn), start);
+        if (insn->w && !loads_rn)   /* ARM7: an LDM that loads Rn keeps the loaded value */
+            emit(ctx, "%s = %s + (u32)(%d);", reg_c(insn->rn), reg_c(insn->rn), insn->u ? 4 * n : -4 * n);
+        for (int i = 0; i < 16; i++) {
+            if (!(insn->reg_list & (1 << i))) continue;
+            if (insn->type == ARM_LDM)
+                emit(ctx, "r[%d] = bus_read32(_addr); _addr += 4;", i);
+            else
+                emit(ctx, "bus_write32(_addr, r[%d]); _addr += 4;", i);
         }
-        if (insn->w) {
-            emit(ctx, "%s = _addr;", reg_c(insn->rn));
-        }
+        if (insn->type == ARM_LDM && (insn->reg_list & (1 << REG_PC)))
+            emit(ctx, "RECOMP_RETURN(r[15]); /* LDM {.., pc} */");
         ctx->indent--;
         emit(ctx, "}");
         end_cond(ctx, insn->cond);
         break;
+    }
 
     /* ---- Status register ---- */
     case ARM_MRS:
@@ -840,7 +837,7 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
             case THUMB_HI_ADD:
                 if (insn->rd == 15) {
                     /* ADD pc, rN: PC = PC + 4 + rN, then branch */
-                    emit(ctx, "cpu_bx((0x%08Xu) + %s); return; /* ADD pc, %s */",
+                    emit(ctx, "cpu_bx(((0x%08Xu) + %s) | 1u); return; /* ADD pc, %s */",
                          addr + 4, reg_c((u8)insn->rs), reg_c((u8)insn->rs));
                 } else {
                     emit(ctx, "%s += %s;", reg_c((u8)insn->rd), reg_c((u8)insn->rs));
@@ -852,9 +849,31 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
                 break;
             case THUMB_HI_MOV:
                 if (insn->rd == 15) {
-                    /* MOV pc, rN: branch to rN (preserves current Thumb mode).
-                     * The recompiler routes via cpu_bx (function-pointer dispatch). */
-                    emit(ctx, "cpu_bx(%s); return; /* MOV pc, %s */",
+                    /* MOV pc, rN: branch to rN, staying in Thumb. A detected
+                     * jump table becomes a switch over this function's labels;
+                     * anything else goes through cpu_bx with the Thumb bit set. */
+                    const JumpTable* jt = NULL;
+                    for (int i = 0; i < ctx->analysis->num_jump_tables && !jt; i++)
+                        if (ctx->analysis->jump_tables[i].branch_addr == addr)
+                            jt = &ctx->analysis->jump_tables[i];
+                    if (insn->rs == REG_LR) {
+                        emit(ctx, "RECOMP_RETURN(r[14]); /* MOV pc, lr */");
+                        break;
+                    }
+                    if (jt) {
+                        emit(ctx, "switch (%s & ~1u) { /* jump table @0x%08X */",
+                             reg_c((u8)insn->rs), jt->table_addr);
+                        for (int i = 0; i < jt->num_entries; i++) {
+                            bool dup = false;
+                            for (int k = 0; k < i && !dup; k++)
+                                dup = jt->targets[k] == jt->targets[i];
+                            if (!dup && is_local_label(ctx, jt->targets[i]))
+                                emit(ctx, "case 0x%08Xu: goto label_%08X;",
+                                     jt->targets[i], jt->targets[i]);
+                        }
+                        emit(ctx, "}");
+                    }
+                    emit(ctx, "cpu_bx(%s | 1u); return; /* MOV pc, %s */",
                          reg_c((u8)insn->rs), reg_c((u8)insn->rs));
                 } else {
                     emit(ctx, "%s = %s;", reg_c((u8)insn->rd), reg_c((u8)insn->rs));
@@ -867,7 +886,12 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
 
     case THUMB_BX:
         if (insn->rs == REG_LR) {
-            emit(ctx, "return; /* BX LR */");
+            emit(ctx, "RECOMP_RETURN(r[14]); /* BX LR */");
+        } else if (insn->rs == REG_PC) {
+            /* BX pc: Thumb->ARM interworking veneer. Execution continues in
+             * ARM at the next word, and whatever runs there returns to our
+             * caller, so it's a tail call. */
+            emit(ctx, "func_%08X(); return; /* BX pc -> ARM */", (addr + 4) & ~3u);
         } else {
             /* Check if this is a POP {rN}; BX rN return pattern.
              * If the previous instruction is POP {rN} where rN matches,
@@ -883,9 +907,18 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
                 }
             }
             if (is_pop_bx_return) {
-                emit(ctx, "return; /* POP+BX return */");
+                /* The popped address is where this returns to; usually our
+                 * caller, but not always (see RECOMP_RETURN) */
+                emit(ctx, "r[15] = %s; RECOMP_RETURN(%s); /* POP+BX return */",
+                     reg_c((u8)insn->rs), reg_c((u8)insn->rs));
+            } else if (addr >= 2 && rom_read16(ctx->rom, addr - 2) == 0x46FE) {
+                /* MOV lr, pc; BX rN: an indirect call that comes back here */
+                emit(ctx, "g_ret = 0; cpu_bx(%s); /* call via MOV lr, pc */", reg_c((u8)insn->rs));
+                emit(ctx, "RECOMP_CALLED(0x%08Xu);", addr + 2);
             } else {
-                emit(ctx, "cpu_bx(%s);", reg_c((u8)insn->rs));
+                /* Otherwise BX never falls through: without the return, a call
+                 * veneer (_call_via_rN) ran on into the next veneer */
+                emit(ctx, "cpu_bx(%s); return;", reg_c((u8)insn->rs));
             }
         }
         break;
@@ -988,7 +1021,7 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
             }
             if (insn->pc_or_lr) {
                 emit(ctx, "r[15] = bus_read32(r[13]); r[13] += 4;");
-                emit(ctx, "return; /* POP {PC} */");
+                emit(ctx, "RECOMP_RETURN(r[15]); /* POP {PC} */");
             }
         } else {
             /* PUSH */
@@ -1106,10 +1139,31 @@ void translate_emit_footer(TranslateCtx* ctx) {
     emit_raw(ctx, "}\n");
 }
 
+/* MSVC's optimizer is superlinear in function size: Advance Wars' 14k-line
+ * func_0809E6D2 (under 200 blocks, ~5k instructions) held one TU at /O1 for
+ * over an hour. Functions above this many instructions compile unoptimized;
+ * they are rare and mostly straight-line, so little speed is lost. */
+#define HUGE_FUNC_INSNS 1500
+
+static bool function_is_huge(TranslateCtx* ctx, const Function* func) {
+    u32 insns = 0;
+    for (int b = 0; b < func->num_blocks; b++)
+        for (int j = 0; j < ctx->analysis->num_blocks; j++)
+            if (ctx->analysis->blocks[j].start == func->block_addrs[b]) {
+                const BasicBlock* bb = &ctx->analysis->blocks[j];
+                insns += (bb->end - bb->start) / (bb->mode == CODE_ARM ? 4 : 2);
+                break;
+            }
+    return insns > HUGE_FUNC_INSNS;
+}
+
 void translate_function(TranslateCtx* ctx, const Function* func) {
+    bool huge = function_is_huge(ctx, func);
     emit_raw(ctx, "\n/* Function at 0x%08X (%s) */\n",
              func->entry, func->mode == CODE_ARM ? "ARM" : "Thumb");
+    if (huge) emit_raw(ctx, "#ifdef _MSC_VER\n#pragma optimize(\"\", off)\n#endif\n");
     emit_raw(ctx, "void func_%08X(void) {\n", func->entry);
+    emit_raw(ctx, "    RECOMP_ENTER(0x%08Xu);\n", func->entry);
     ctx->indent = 1;
 
     /* Sort blocks by address for correct emission order.
@@ -1130,6 +1184,12 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
     /* Build local block address set for goto validation */
     ctx->local_blocks = sorted_blocks;
     ctx->num_local_blocks = func->num_blocks;
+
+    /* Blocks are emitted in address order, so a function that also owns code
+     * below its entry (merged predecessors, Phase 7 copies) must jump to the
+     * entry first or it would start running at its lowest block */
+    if (func->num_blocks > 0 && sorted_blocks[0] != func->entry && is_local_label(ctx, func->entry))
+        emit_raw(ctx, "    goto label_%08X; /* entry */\n", func->entry);
 
     /* Translate each block (in address order) */
     for (int b = 0; b < func->num_blocks; b++) {
@@ -1171,7 +1231,8 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
                         snprintf(disasm_buf, sizeof(disasm_buf), "BL 0x%08X", bl_target);
                         emit_comment(ctx, "0x%08X: %s", addr, disasm_buf);
                         emit(ctx, "r[14] = 0x%08Xu; /* return address */", (addr + 4) | 1);
-                        emit(ctx, "func_%08X(); /* BL */", bl_target);
+                        emit(ctx, "g_ret = 0; func_%08X(); /* BL */", bl_target);
+                        emit(ctx, "RECOMP_CALLED(0x%08Xu);", (addr + 4) | 1);
                         addr += 4;
                         continue;
                     }
@@ -1181,6 +1242,21 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
                 addr += 2;
             }
         }
+
+        /* A block that falls through must land on its successor even when
+         * that isn't the next label emitted (blocks are emitted in address
+         * order, and Phase 7 copies can interleave). Fall-through into code
+         * owned by another function still just returns, as it always has:
+         * tail-calling it broke Advance Wars' boot, because the analyzer
+         * decodes past calls that never return (SWI 0, panics) into literal
+         * pools that then "fall through" into the next function. Needs
+         * noreturn detection first (ROADMAP). */
+        bool falls_through = false;
+        for (int s = 0; s < block->num_successors; s++)
+            if (block->successors[s] == block->end) falls_through = true;
+        u32 next_emitted = b + 1 < func->num_blocks ? sorted_blocks[b + 1] : 0;
+        if (falls_through && next_emitted != block->end && is_local_label(ctx, block->end))
+            emit(ctx, "goto label_%08X; /* fall through */", block->end);
         emit_raw(ctx, "\n");
     }
 
@@ -1189,6 +1265,7 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
     ctx->num_local_blocks = 0;
     free(sorted_blocks);
     emit_raw(ctx, "}\n");
+    if (huge) emit_raw(ctx, "#ifdef _MSC_VER\n#pragma optimize(\"\", on)\n#endif\n");
 }
 
 void translate_all(TranslateCtx* ctx) {
@@ -1421,12 +1498,16 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
                         temp_func.entry = addr;
                         temp_func.mode = analysis->blocks[j].mode;
 
-                        int temp_cap = 32; /* Limit block count per stub */
+                        /* Bounded only as a runaway guard: a stub is a whole
+                         * function body (a fixed 32 truncated big ones, and
+                         * their missing blocks fell back to the interpreter). */
+                        int temp_cap = 4096;
                         temp_func.block_addrs = malloc(sizeof(u32) * temp_cap);
                         temp_func.num_blocks = 0;
 
-                        /* BFS: collect this block and nearby reachable non-function blocks */
-                        u32 queue[32];
+                        /* BFS: collect this block and reachable non-function blocks,
+                         * including jump-table cases */
+                        u32* queue = malloc(sizeof(u32) * temp_cap);
                         int qh = 0, qt = 0;
                         queue[qt++] = addr;
 
@@ -1452,10 +1533,20 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
 
                             temp_func.block_addrs[temp_func.num_blocks++] = cur;
 
-                            /* Queue successors that aren't function entries */
-                            for (int s = 0; s < blk->num_successors && qt < 32; s++) {
-                                u32 succ = blk->successors[s];
-                                if (succ == 0) continue;
+                            /* Successors that aren't function entries, plus the
+                             * cases of a jump table ending this block */
+                            u32 succs[2 + 256];
+                            int nsucc = 0;
+                            for (int s = 0; s < blk->num_successors; s++)
+                                if (blk->successors[s]) succs[nsucc++] = blk->successors[s];
+                            for (int t = 0; t < analysis->num_jump_tables; t++) {
+                                const JumpTable* jt = &analysis->jump_tables[t];
+                                if (jt->branch_addr < blk->start || jt->branch_addr >= blk->end) continue;
+                                for (int e = 0; e < jt->num_entries && nsucc < 2 + 256; e++)
+                                    succs[nsucc++] = jt->targets[e];
+                            }
+                            for (int s = 0; s < nsucc && qt < temp_cap; s++) {
+                                u32 succ = succs[s];
                                 bool is_func = false;
                                 for (int k = 0; k < analysis->num_functions; k++) {
                                     if (analysis->functions[k].entry == succ) {
@@ -1468,6 +1559,7 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
                                 }
                             }
                         }
+                        free(queue);
 
                         if (temp_func.num_blocks > 0) {
                             translate_function(stub_ctx, &temp_func);
@@ -1644,6 +1736,7 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
 
         fprintf(f, "/* Auto-generated by gbarecomp - %s (%s) */\n", rom->title, rom->game_code);
         fprintf(f, "#include \"game.h\"\n");
+        fprintf(f, "#include \"gba/display.h\"\n");
         fprintf(f, "#include <stdio.h>\n\n");
 
         TranslateCtx* ctx = translate_create(rom, analysis, f);
@@ -1666,14 +1759,32 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "};\n");
         fprintf(f, "static const int bx_table_size = %d;\n\n", analysis->num_functions);
 
+        /* Lookups by entry address (either Thumb bit), for the validator */
+        fprintf(f, "static int bx_find(u32 addr) {\n");
+        fprintf(f, "    int lo = 0, hi = bx_table_size - 1;\n");
+        fprintf(f, "    while (lo <= hi) {\n");
+        fprintf(f, "        int mid = (lo + hi) / 2;\n");
+        fprintf(f, "        u32 a = bx_table[mid].addr & ~1u;\n");
+        fprintf(f, "        if (a == addr) return mid;\n");
+        fprintf(f, "        if (a < addr) lo = mid + 1; else hi = mid - 1;\n");
+        fprintf(f, "    }\n");
+        fprintf(f, "    return -1;\n");
+        fprintf(f, "}\n");
+        fprintf(f, "u32 recomp_lookup(u32 addr) { int i = bx_find(addr); return i < 0 ? 0 : bx_table[i].addr; }\n");
+        fprintf(f, "void (*recomp_lookup_fn(u32 addr))(void) { int i = bx_find(addr); return i < 0 ? 0 : bx_table[i].func; }\n\n");
+
         /* Binary search BX dispatcher */
-        fprintf(f, "static int _bx_depth = 0;\n");
+        fprintf(f, "int g_bx_depth = 0;\n");
         fprintf(f, "void cpu_bx(u32 target) {\n");
         fprintf(f, "    /* NULL targets */\n");
         fprintf(f, "    if (target == 0 || target == 1) return;\n");
-        fprintf(f, "    /* Prevent infinite recursion: if already inside a recompiled function,\n");
-        fprintf(f, "     * just set r[15] and return (BX-as-return or indirect call). */\n");
-        fprintf(f, "    if (_bx_depth > 10) { r[15] = target; return; }\n");
+        fprintf(f, "    /* Runaway-recursion guard only: real code nests callbacks, and a\n");
+        fprintf(f, "     * dropped call is silent corruption, so say so when it happens. */\n");
+        fprintf(f, "    if (g_bx_depth > 512) {\n");
+        fprintf(f, "        static int warned = 0;\n");
+        fprintf(f, "        if (warned++ < 5) fprintf(stderr, \"[cpu_bx] depth limit: dropping call to 0x%%08X\\n\", target);\n");
+        fprintf(f, "        r[15] = target; return;\n");
+        fprintf(f, "    }\n");
         fprintf(f, "    /* RAM targets: pre-compiled IWRAM functions or stub */\n");
         fprintf(f, "    if ((target >> 24) == 0x02 || (target >> 24) == 0x03) {\n");
         fprintf(f, "        run_iwram_function(target);\n");
@@ -1684,9 +1795,9 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    while (lo <= hi) {\n");
         fprintf(f, "        int mid = (lo + hi) / 2;\n");
         fprintf(f, "        if (bx_table[mid].addr == target) {\n");
-        fprintf(f, "            _bx_depth++;\n");
+        fprintf(f, "            g_bx_depth++;\n");
         fprintf(f, "            bx_table[mid].func();\n");
-        fprintf(f, "            _bx_depth--;\n");
+        fprintf(f, "            g_bx_depth--;\n");
         fprintf(f, "            return;\n");
         fprintf(f, "        } else if (bx_table[mid].addr < target) {\n");
         fprintf(f, "            lo = mid + 1;\n");
@@ -1707,7 +1818,8 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
 
         /* main() - static recomp entry point. No emulator, just init and go. */
         fprintf(f, "int main(int argc, char* argv[]) {\n");
-        fprintf(f, "    const char* rom_path = argc > 1 ? argv[1] : \"game.gba\";\n");
+        fprintf(f, "    const char* rom_path = display_parse_args(argc, argv);\n");
+        fprintf(f, "    if (!rom_path) rom_path = \"game.gba\";\n");
         fprintf(f, "    gba_init(rom_path);\n");
         fprintf(f, "    /* Run the recompiled game with SoftReset support */\n");
         fprintf(f, "    gba_run(game_entry);\n");

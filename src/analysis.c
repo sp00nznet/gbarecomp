@@ -313,6 +313,10 @@ static bool thumb_is_return(const ThumbInsn* insn) {
     /* BX LR */
     if (insn->type == THUMB_BX && insn->rs == REG_LR)
         return true;
+    /* MOV pc, lr */
+    if (insn->type == THUMB_HI_REG_OPS && insn->hi_op == THUMB_HI_MOV &&
+        insn->rd == REG_PC && insn->rs == REG_LR)
+        return true;
     return false;
 }
 
@@ -324,7 +328,101 @@ static bool thumb_is_block_end(const ThumbInsn* insn) {
     if (insn->type == THUMB_SWI) return true;
     /* POP {.., PC} */
     if (insn->type == THUMB_PUSH_POP && insn->is_load && insn->pc_or_lr) return true;
+    /* MOV pc, Rs / ADD pc, Rs: what follows is usually a jump table, not code */
+    if (insn->type == THUMB_HI_REG_OPS && insn->rd == REG_PC &&
+        (insn->hi_op == THUMB_HI_MOV || insn->hi_op == THUMB_HI_ADD)) return true;
     return false;
+}
+
+/* True when a function end (BX, POP {pc}, unconditional B) sits within the 12
+ * bytes before `addr`: the usual place a new function starts, after optional
+ * alignment padding and up to two literal-pool words. Used to vet code
+ * pointers found in data before analyzing code nothing else reaches. The
+ * pool words aren't checked (they're arbitrary data), so this is a heuristic;
+ * an unanalyzed target that passes it is analyzed as a function entry. */
+static bool thumb_follows_function_end(const AnalysisCtx* ctx, u32 addr) {
+    for (u32 back = 2; back <= 12; back += 2) {
+        u32 prev = addr - back;
+        if (prev < GBA_ROM_START) return false;
+        u16 hw = rom_read16(ctx->rom, prev);
+        if ((hw & 0xFF87) == 0x4700) return true;          /* BX Rs */
+        if ((hw & 0xFF00) == 0xBD00) return true;          /* POP {.., pc} */
+        if ((hw & 0xF800) == 0xE000) return true;          /* B label */
+    }
+    return false;
+}
+
+/* Thumb switch as emitted by the GBA toolchains (GCC / ARM SDT):
+ *
+ *     CMP   rI, #N        ; maybe a block or two earlier
+ *     BHI   default       ; or BLS +2 / B default when default is far
+ *     LSL   rI, rI, #2
+ *     LDR   rT, =table
+ *     ADD   rX, rI, rT    ; either operand order
+ *     LDR   rX, [rX, #0]
+ *     MOV   pc, rX
+ *
+ * The table holds N+1 absolute code addresses. Targets become blocks of the
+ * enclosing function so the translator can turn the dispatch into a C switch
+ * over local labels instead of a cpu_bx into the middle of a function.
+ * Returns true if a table was recorded. */
+static bool detect_thumb_jump_table(AnalysisCtx* ctx, u32 mov_addr, u8 rx, Function* func) {
+    if (mov_addr < GBA_ROM_START + 8) return false;
+    ThumbInsn ld  = thumb_decode(rom_read16(ctx->rom, mov_addr - 2));
+    ThumbInsn add = thumb_decode(rom_read16(ctx->rom, mov_addr - 4));
+    if (ld.type != THUMB_LOAD_STORE_IMM || !ld.is_load || ld.is_byte ||
+        (u8)ld.rd != rx || (u8)ld.rs != rx || ld.imm != 0) return false;
+    if (add.type != THUMB_ADD_SUB || add.is_imm || add.is_subtract || (u8)add.rd != rx)
+        return false;
+
+    /* One ADD operand comes from a literal pool: that's the table */
+    u32 table = 0;
+    u8 idx_reg = 0xFF;
+    for (u32 scan = mov_addr - 6; scan + 16 >= mov_addr && !table; scan -= 2) {
+        ThumbInsn s = thumb_decode(rom_read16(ctx->rom, scan));
+        if (s.type == THUMB_PC_REL_LOAD &&
+            ((u8)s.rd == (u8)add.rs || (u8)s.rd == (u8)add.rm)) {
+            table = rom_read32(ctx->rom, ((scan + 4) & ~3u) + s.imm);
+            idx_reg = ((u8)s.rd == (u8)add.rs) ? (u8)add.rm : (u8)add.rs;
+        }
+    }
+    if (!table || !addr_in_rom(ctx, table)) return false;
+
+    /* Bound from the nearest CMP idx, #N ; BHI before the scaling */
+    int count = 0;
+    for (u32 scan = mov_addr - 6; scan + 24 >= mov_addr; scan -= 2) {
+        ThumbInsn s = thumb_decode(rom_read16(ctx->rom, scan));
+        ThumbInsn nx = thumb_decode(rom_read16(ctx->rom, scan + 2));
+        /* LSL rI, rJ, #2: the bound is checked on rJ */
+        if ((s.raw & 0xF800) == 0x0000 && ((s.raw >> 6) & 31) == 2 && (s.raw & 7) == idx_reg)
+            idx_reg = (u8)((s.raw >> 3) & 7);
+        if (s.type == THUMB_MOV_CMP_ADD_SUB_IMM && (s.raw & 0x1800) == 0x0800 &&
+            (u8)s.rd == idx_reg && nx.type == THUMB_COND_BRANCH &&
+            (nx.cond == COND_HI || nx.cond == COND_LS)) {  /* BLS ok; B default */
+            count = (int)s.imm + 1;
+            break;
+        }
+    }
+    if (count == 0) return false;  /* unbounded: leave it to cpu_bx */
+
+    GROW(ctx->jump_tables, ctx->num_jump_tables, ctx->cap_jump_tables, JumpTable);
+    JumpTable* jt = &ctx->jump_tables[ctx->num_jump_tables++];
+    memset(jt, 0, sizeof(JumpTable));
+    jt->branch_addr = mov_addr;
+    jt->table_addr = table;
+    jt->is_thumb = true;
+    jt->targets = malloc(sizeof(u32) * (size_t)count);
+    for (int i = 0; i < count; i++) {
+        u32 t = rom_read32(ctx->rom, table + (u32)i * 4) & ~1u;
+        if (!addr_in_rom(ctx, t)) break;
+        jt->targets[jt->num_entries++] = t;
+        mark_code(ctx, table + (u32)i * 4, CODE_DATA);
+        mark_code(ctx, table + (u32)i * 4 + 2, CODE_DATA);
+    }
+    for (int i = 0; i < jt->num_entries; i++)
+        queue_push_ex(ctx, jt->targets[i], CODE_THUMB, mov_addr, false, func ? func->entry : 0);
+    if (func) func->has_switch = true;
+    return true;
 }
 
 static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
@@ -410,6 +508,10 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
                 if (insn.rs == REG_LR) {
                     block->is_return = true;
                     block->num_successors = 0;
+                } else if (insn.rs == REG_PC) {
+                    /* Thumb->ARM veneer: tail call into ARM at the next word */
+                    block->num_successors = 0;
+                    queue_push(ctx, (addr + 4) & ~3u, CODE_ARM, addr, true);
                 } else {
                     /* Check for POP {Rn}; BX Rn return pattern */
                     bool is_pop_bx_return = false;
@@ -482,6 +584,13 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
                         }
                     }
                 }
+            } else if (insn.type == THUMB_HI_REG_OPS) {
+                /* MOV/ADD pc, Rs: a switch if the table pattern matches,
+                 * otherwise an unresolved computed branch. */
+                block->num_successors = 0;
+                block->has_indirect =
+                    !(insn.hi_op == THUMB_HI_MOV &&
+                      detect_thumb_jump_table(ctx, addr, (u8)insn.rs, func));
             } else if (insn.type == THUMB_SWI) {
                 /* SWI is a call to BIOS - execution continues after it */
                 block->successors[0] = addr + 2;
@@ -810,6 +919,8 @@ void analysis_free(AnalysisCtx* ctx) {
         free(ctx->jump_tables[i].targets);
     }
     free(ctx->jump_tables);
+    free(ctx->extra_entries);
+    free(ctx->late_entries);
 
     free(ctx->queue);
     free(ctx);
@@ -819,9 +930,28 @@ void analysis_add_entry(AnalysisCtx* ctx, u32 addr, CodeType mode) {
     queue_push(ctx, addr, mode, 0, true);
 }
 
+int analysis_load_entries(AnalysisCtx* ctx, const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\r' || !*p) continue;
+        u32 addr = (u32)strtoul(p, NULL, 16);
+        if (!addr) continue;
+        GROW(ctx->extra_entries, ctx->num_extra_entries, ctx->cap_extra_entries, u32);
+        ctx->extra_entries[ctx->num_extra_entries++] = addr & ~1u;
+    }
+    fclose(f);
+    return ctx->num_extra_entries;
+}
+
 void analysis_run(AnalysisCtx* ctx) {
-    /* If no explicit entries, find from ROM header */
-    if (queue_empty(ctx)) {
+    /* ROM header entry first, then the title's extra entries (function
+     * pointers the descent can't see), in that order: queue order decides
+     * which function a shared block is first attributed to. */
+    {
         CodeType mode = detect_entry_mode(ctx->rom);
         u32 entry_raw = rom_read32(ctx->rom, GBA_ROM_START);
         ArmInsn entry = arm_decode(entry_raw);
@@ -833,22 +963,8 @@ void analysis_run(AnalysisCtx* ctx) {
             analysis_add_entry(ctx, GBA_ROM_START, mode);
         }
     }
-
-    /* Add known function pointer targets (from BX dispatch misses) */
-    {
-        static const u32 extra_entries[] = {
-            0x0801A784, 0x0801A78A, 0x0801AFD0, 0x0801AFFE,
-            0x0801B01C, 0x08079716, 0x0807981E, 0x08079A74,
-            0x08079F92, 0x0807A0E0, 0x0807AE10, 0x080000E4,
-            0x0801B3CE, 0x08038734,
-            0x08015C0E, 0x08015C1A, 0x08015C26, 0x0801ADAC,
-            0x0803EC5C, 0x0803EC70,
-            0
-        };
-        for (int i = 0; extra_entries[i] != 0; i++) {
-            analysis_add_entry(ctx, extra_entries[i], CODE_THUMB);
-        }
-    }
+    for (int i = 0; i < ctx->num_extra_entries; i++)
+        analysis_add_entry(ctx, ctx->extra_entries[i], CODE_THUMB);
 
     printf("[analysis] Starting recursive descent...\n");
 
@@ -946,6 +1062,46 @@ void analysis_run(AnalysisCtx* ctx) {
         }
         printf("[analysis] Phase 4 complete: %d blocks, %d functions\n",
                ctx->num_blocks, ctx->num_functions);
+    }
+
+    /* Phase 4b: Function pointers. Callback tables and state machines hold
+     * Thumb code addresses (odd words) the descent never sees as calls, and
+     * many point into code it already attributed to a neighbouring function.
+     * Each becomes a function entry; Phase 7 materialises the ones that land
+     * mid-function. Without this they run in the interpreter at runtime.
+     * A data word that merely looks like such a pointer costs a duplicate
+     * function, never wrong behaviour: nothing dispatches to it but cpu_bx. */
+    printf("[analysis] Phase 4b: Scanning ROM for Thumb code pointers...\n");
+    for (int pass = 0; pass < 4; pass++) {
+        /* Repeat: code found through one pointer can make more pointers valid */
+        int before = ctx->num_functions, queued = 0;
+        for (u32 off = 0; off + 4 <= ctx->rom->size; off += 4) {
+            u32 w = rom_read32(ctx->rom, GBA_ROM_START + off);
+            if (!(w & 1)) continue;
+            u32 target = w & ~1u;
+            if (!addr_in_rom(ctx, target) || target < GBA_ROM_START + 4) continue;
+            u8 kind = ctx->codemap[addr_to_idx(target)];
+            if (kind == CODE_THUMB) {
+                /* Inside code already analyzed: registered after Phase 6, so
+                 * it gets its own copy of the blocks (Phase 7) instead of
+                 * splitting its host function (or a loop) into tail calls */
+                GROW(ctx->late_entries, ctx->num_late_entries, ctx->cap_late_entries, u32);
+                ctx->late_entries[ctx->num_late_entries++] = target;
+            } else if (kind == CODE_UNKNOWN && thumb_follows_function_end(ctx, target)) {
+                /* Unanalyzed leaf functions (no PUSH prologue, so Phase 4
+                 * misses them) sitting right after another function's end */
+                queue_push(ctx, target, CODE_THUMB, 0, true);
+                queued++;
+            }
+        }
+        while (!queue_empty(ctx)) {
+            WorkItem item = queue_pop(ctx);
+            process_work_item(ctx, &item);
+        }
+        int added = ctx->num_functions - before;
+        printf("[analysis] Pass %d: %d new entries from code pointers (%d analyzed fresh)\n",
+               pass + 1, added, queued);
+        if (added == 0) break;
     }
 
     /* Phase 5: Split blocks at branch targets that land mid-block.
@@ -1147,6 +1303,16 @@ void analysis_run(AnalysisCtx* ctx) {
         free(block_owner);
         free(func_entries);
         printf("[analysis] Merged %d blocks in single pass\n", merged);
+    }
+
+    /* Late entries from Phase 4b: now that Phase 6 has settled who owns
+     * what, each becomes an (empty) function for Phase 7 to fill */
+    {
+        int before = ctx->num_functions;
+        for (int i = 0; i < ctx->num_late_entries; i++)
+            add_function(ctx, ctx->late_entries[i], CODE_THUMB);
+        printf("[analysis] %d entries from code pointers into existing code\n",
+               ctx->num_functions - before);
     }
 
     /* Phase 7: Fix empty functions (mid-function BX targets).

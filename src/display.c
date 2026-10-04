@@ -6,6 +6,8 @@
  */
 
 #include <SDL2/SDL.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "gba/display.h"
 #include "gba/types.h"
@@ -75,6 +77,23 @@ static u32 s_framebuf[GBA_WIDTH * GBA_HEIGHT];
 
 /* Key state: bit set = pressed. Mapped to GBA button bits. */
 static u16 s_keys_pressed = 0;
+
+/* Headless mode (house style, see docs/headless.md): no window, frames go to
+ * ffmpeg over a pipe so runs work over RDP and never take a screen. */
+static int   s_headless = 0;
+static FILE* s_record = NULL;
+static const char* s_record_path = NULL;
+static const char* s_shot_path = NULL;
+static long  s_max_frames = 0;
+static long  s_frame_no = 0;
+static FILE* s_input = NULL;     /* --input script: "<frame> <keymask hex>" lines */
+static long  s_next_input_frame = -1;
+static u16   s_next_input_keys = 0;
+
+#ifdef _WIN32
+#define popen _popen
+#define pclose _pclose
+#endif
 
 /* ---------- Helper: read 16-bit from memory arrays ---------- */
 
@@ -398,7 +417,87 @@ static void render_objs(u16 dispcnt) {
 
 /* ---------- Public API ---------- */
 
+int display_headless(void) { return s_headless; }
+
+static long s_log_every = 300;
+long display_log_every(void) { return s_log_every; }
+
+/* --dump-at N file (repeatable): raw memory snapshots, same layout as
+ * tools/oracle/mgba_oracle so the two diff directly */
+static long s_dump_frame[16];
+static const char* s_dump_path[16];
+static int s_ndump;
+const char* display_dump_path(long frame) {
+    for (int d = 0; d < s_ndump; d++)
+        if (s_dump_frame[d] == frame) return s_dump_path[d];
+    return NULL;
+}
+
+const char* display_parse_args(int argc, char* argv[]) {
+    const char* rom = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--headless")) s_headless = 1;
+        else if (!strcmp(argv[i], "--record") && i + 1 < argc) { s_record_path = argv[++i]; s_headless = 1; }
+        else if (!strcmp(argv[i], "--frames") && i + 1 < argc) s_max_frames = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--log-every") && i + 1 < argc) s_log_every = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--dump-at") && i + 2 < argc && s_ndump < 16) {
+            s_dump_frame[s_ndump] = atol(argv[++i]);
+            s_dump_path[s_ndump++] = argv[++i];
+        }
+        else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) s_shot_path = argv[++i];
+        else if (!strcmp(argv[i], "--input") && i + 1 < argc) {
+            s_input = fopen(argv[++i], "r");
+            if (!s_input) fprintf(stderr, "[display] cannot open input script %s\n", argv[i]);
+        }
+        else if (argv[i][0] != '-' && !rom) rom = argv[i];
+        else fprintf(stderr, "[display] unknown option %s\n", argv[i]);
+    }
+    return rom;
+}
+
+static void input_script_step(void) {
+    while (s_input) {
+        if (s_next_input_frame < 0) {
+            char line[128];
+            if (!fgets(line, sizeof(line), s_input)) { fclose(s_input); s_input = NULL; return; }
+            unsigned keys;
+            if (line[0] == '#' || sscanf(line, "%ld %x", &s_next_input_frame, &keys) != 2) {
+                s_next_input_frame = -1; continue;
+            }
+            s_next_input_keys = (u16)keys;
+        }
+        if (s_frame_no < s_next_input_frame) return;
+        s_keys_pressed = s_next_input_keys;
+        s_next_input_frame = -1;
+    }
+}
+
+static void write_bmp(const char* path) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    u32 data = GBA_WIDTH * GBA_HEIGHT * 4, size = 54 + data;
+    u8 h[54] = { 'B','M' };
+    memcpy(h + 2, &size, 4); h[10] = 54; h[14] = 40;
+    s32 w = GBA_WIDTH, hh = -GBA_HEIGHT; /* top-down */
+    memcpy(h + 18, &w, 4); memcpy(h + 22, &hh, 4);
+    h[26] = 1; h[28] = 32; memcpy(h + 34, &data, 4);
+    fwrite(h, 1, 54, f);
+    fwrite(s_framebuf, 1, data, f);
+    fclose(f);
+}
+
 int display_init(void) {
+    if (s_record_path) {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd),
+            "ffmpeg -loglevel error -y -f rawvideo -pix_fmt bgra -s %dx%d -r 60 -i - "
+            "-vf scale=%d:%d:flags=neighbor -pix_fmt yuv420p \"%s\"",
+            GBA_WIDTH, GBA_HEIGHT, WIN_WIDTH, WIN_HEIGHT, s_record_path);
+        s_record = popen(cmd, "wb");
+        if (!s_record) { fprintf(stderr, "[display] cannot start ffmpeg\n"); return -1; }
+    }
+    if (s_headless) return 0;
+
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return -1;
@@ -501,6 +600,15 @@ void display_render_frame(void) {
     /* Render sprites on top */
     render_objs(dispcnt);
 
+    s_frame_no++;
+    input_script_step();
+    if (s_record) fwrite(s_framebuf, 4, GBA_WIDTH * GBA_HEIGHT, s_record);
+    if (s_max_frames && s_frame_no >= s_max_frames) {
+        if (s_shot_path) write_bmp(s_shot_path);
+        return;
+    }
+    if (s_headless) return;
+
     /* Upload framebuffer to texture and present */
     SDL_UpdateTexture(s_texture, NULL, s_framebuf, GBA_WIDTH * (int)sizeof(u32));
     SDL_RenderClear(s_renderer);
@@ -509,6 +617,8 @@ void display_render_frame(void) {
 }
 
 int display_poll_events(void) {
+    if (s_max_frames && s_frame_no >= s_max_frames) return 1;
+    if (s_headless) return 0;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT)
@@ -547,6 +657,9 @@ u16 display_get_keys(void) {
 }
 
 void display_shutdown(void) {
+    if (s_shot_path && !(s_max_frames && s_frame_no >= s_max_frames)) write_bmp(s_shot_path);
+    if (s_record) { pclose(s_record); s_record = NULL; }
+    if (s_headless) return;
     if (s_texture)  { SDL_DestroyTexture(s_texture);   s_texture  = NULL; }
     if (s_renderer) { SDL_DestroyRenderer(s_renderer); s_renderer = NULL; }
     if (s_window)   { SDL_DestroyWindow(s_window);     s_window   = NULL; }
