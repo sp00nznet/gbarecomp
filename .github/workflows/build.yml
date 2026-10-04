@@ -25,4 +25,6 @@ jobs:
       - name: Conformance (SKIP without a ROM)
         shell: bash
         run: |
-          python tools/conformance.py --exe none.exe --rom none.gba --baseline none.txt | tee /dev/stderr | grep -q "conformance: skipped"
+          out=$(python tools/conformance.py --exe none.exe --rom none.gba --baseline none.txt)
+          echo "$out"
+          grep -q "conformance: skipped" <<<"$out"
