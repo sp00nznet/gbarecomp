@@ -19,7 +19,9 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
-          ./build/Release/gbarecomp.exe 2>&1 | grep -q "gbarecomp - GBA Static Recompilation Toolkit"
+          # no arguments prints usage and exits 1, which pipefail would report
+          out=$(./build/Release/gbarecomp.exe 2>&1 || true)
+          grep -q "gbarecomp - GBA Static Recompilation Toolkit" <<<"$out"
       - name: Conformance (SKIP without a ROM)
         shell: bash
         run: |
