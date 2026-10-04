@@ -44,7 +44,8 @@ def main():
     if os.path.exists(sav):
         os.remove(sav)
 
-    cmd = [a.exe, a.rom, "--headless", "--frames", str(a.frames), "--log-every", "0"]
+    # Absolute: CreateProcess doesn't resolve a relative "build/x.exe"
+    cmd = [os.path.abspath(a.exe), a.rom, "--headless", "--frames", str(a.frames), "--log-every", "0"]
     if a.input:
         cmd += ["--input", a.input]
     env = dict(os.environ, GBA_VALIDATE=str(a.calls))
