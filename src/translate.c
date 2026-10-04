@@ -1181,18 +1181,37 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
         }
     }
 
+    /* Keep only addresses that are real blocks: Phase 7 copies successor
+     * addresses as they are, including branch targets out of ROM when the
+     * "code" was data. A label that's never emitted can't be a goto target. */
+    int nblocks = 0;
+    for (int i = 0; i < func->num_blocks; i++) {
+        /* exact-start lookup: blocks are sorted by start address */
+        int lo = 0, hi = ctx->analysis->num_blocks - 1;
+        bool exists = false;
+        while (lo <= hi && !exists) {
+            int mid = (lo + hi) / 2;
+            u32 s = ctx->analysis->blocks[mid].start;
+            if (s == sorted_blocks[i]) exists = true;
+            else if (s < sorted_blocks[i]) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        if (exists && (nblocks == 0 || sorted_blocks[nblocks - 1] != sorted_blocks[i]))
+            sorted_blocks[nblocks++] = sorted_blocks[i];
+    }
+
     /* Build local block address set for goto validation */
     ctx->local_blocks = sorted_blocks;
-    ctx->num_local_blocks = func->num_blocks;
+    ctx->num_local_blocks = nblocks;
 
     /* Blocks are emitted in address order, so a function that also owns code
      * below its entry (merged predecessors, Phase 7 copies) must jump to the
      * entry first or it would start running at its lowest block */
-    if (func->num_blocks > 0 && sorted_blocks[0] != func->entry && is_local_label(ctx, func->entry))
+    if (nblocks > 0 && sorted_blocks[0] != func->entry && is_local_label(ctx, func->entry))
         emit_raw(ctx, "    goto label_%08X; /* entry */\n", func->entry);
 
     /* Translate each block (in address order) */
-    for (int b = 0; b < func->num_blocks; b++) {
+    for (int b = 0; b < nblocks; b++) {
         u32 block_addr = sorted_blocks[b];
 
         /* Find the block */
@@ -1254,7 +1273,7 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
         bool falls_through = false;
         for (int s = 0; s < block->num_successors; s++)
             if (block->successors[s] == block->end) falls_through = true;
-        u32 next_emitted = b + 1 < func->num_blocks ? sorted_blocks[b + 1] : 0;
+        u32 next_emitted = b + 1 < nblocks ? sorted_blocks[b + 1] : 0;
         if (falls_through && next_emitted != block->end && is_local_label(ctx, block->end))
             emit(ctx, "goto label_%08X; /* fall through */", block->end);
         emit_raw(ctx, "\n");
