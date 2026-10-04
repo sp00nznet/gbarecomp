@@ -35,3 +35,8 @@ deps/
 external/
 imgui.ini
 src/imgui.ini
+
+# Local reference build and scratch
+build-oracle/
+scratch/
+__pycache__/
