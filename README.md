@@ -26,7 +26,7 @@ compared ([docs/conformance.md](docs/conformance.md)).
 
 Builds work with MSVC and, headless-only, on a clang-cl build farm without
 SDL2. Missing: audio output (the m4a driver runs, nothing is mixed out),
-mosaic/affine sprites in the PPU, recompiling RAM overlays, and the
+mosaic in the PPU, recompiling RAM overlays, and the
 other items in [ROADMAP.md](ROADMAP.md).
 
 ## Screenshots

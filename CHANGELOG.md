@@ -16,10 +16,11 @@ versions follow SemVer once the first one is tagged.
 ### Changed
 - Headless runs only draw the frames they keep (recorded, or the `--screenshot` frame): drawing was half the run time, and Advance Wars' 10000-frame runs went from 26 s to 20 s. (#11)
 - HBlank fires at cycle 960 of each line with VCOUNT still on that line, as on hardware: the line is drawn, then HBlank DMA and IRQs run; VCOUNT, VBlank and VCount match advance at the line end. Before, HBlank ran after VCOUNT had moved on, so a handler setting up the next line from VCOUNT landed a line late (one junk line at Advance Wars' dialog box edge). HBlank DMA no longer runs for line 227 and now runs for line 159. (#10)
-- The PPU renders per scanline at HBlank with the registers as they are then, composes layers by BG/OBJ priority, applies BLDCNT alpha/brighten/darken, and draws affine BGs (modes 1-2). Mosaic, affine sprites and mode 5 are still missing.
+- The PPU renders per scanline at HBlank with the registers as they are then, composes layers by BG/OBJ priority, applies BLDCNT alpha/brighten/darken, and draws affine BGs (modes 1-2). Mosaic and mode 5 are still missing.
 - `tools/conformance.py` fails on more failing functions than the baseline (`passed total`), not on fewer passes.
 
 ### Added
+- Affine sprites: OAM rotation/scaling parameters, double-size boxes, sampled about the sprite centre as on hardware. Before, they were skipped. Advance Wars' results screen lost its "Victory!" title, score labels and rank medal. (#19)
 - PPU windows: WIN0, WIN1 and the OBJ window mask layers and colour effects per pixel, with wrap-around ranges as mGBA does. (#9)
 - Headless-only builds: without SDL2 the generated project builds with `GBA_NO_SDL` instead of failing, so a build farm without SDL2 can build and run QA. The runtime no longer uses SDL (libm for its trig, pacing moved to the display module).
 - Diagnostics: `GBA_WATCH` write watchpoint, `GBA_FUNC_TRACE_AT` per-frame call histogram, `GBA_TRACE_UNWIND`, and `GBA_VALIDATE_RANGE`/`_FROM`/`_EVERY` to aim the validator ([docs/headless.md](docs/headless.md)).

@@ -13,7 +13,7 @@
   fall-throughs into another function's code can become tail calls.
 - **Audio.** The m4a mixer now runs, but the runtime has no output: Direct
   Sound FIFOs and the PSG channels are silent.
-- **PPU completeness.** Mosaic, affine sprites, mode 5.
+- **PPU completeness.** Mosaic, mode 5.
 - **Setup.cmd quick start** for game repos, per the house rules.
 - **netlab recipe** so builds and QA run on the farm.
 
