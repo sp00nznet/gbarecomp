@@ -45,8 +45,17 @@ recompiled build and the reference identically.
 | Variable | Effect |
 |---|---|
 | `GBA_VALIDATE=K` | Lockstep-validate the first K calls of every recompiled function ([conformance.md](conformance.md)). |
+| `GBA_VALIDATE_RANGE=lo-hi` | Validate only functions in that address range (hex). |
+| `GBA_VALIDATE_FROM=N` | Validate only from frame N on. |
+| `GBA_VALIDATE_EVERY=N` | Validate every Nth call of a function. A validated call runs its callees unvalidated, so an outer function checked on every call hides everything below it; skipping lets the callees take turns. |
 | `GBA_FUNC_TRACE=1` | At exit, print the distinct functions among the last 4096 entered, with counts: "where is it stuck". |
+| `GBA_FUNC_TRACE_AT=N[,N...]` | For each frame N, print every function entered during that frame, in first-call order, with call counts. |
 | `GBA_TRACE_INTERP=N` | Log the first N entries into the interpreter (RAM code, and any ROM code missing from the dispatch table). |
+| `GBA_TRACE_UNWIND=N` | Log the first N call sites a return-target unwind passes through (`RECOMP_CALLED` mismatches), with the target. A run that ends early with an unwind to a data address means a stack imbalance. |
+| `GBA_WATCH=addr` | Watchpoint: log every write to that 32-bit word with the frame, value, and the function that made it. |
+
+The watchpoint is how Advance Wars' dead sound driver was found: watching the
+m4a `SoundInfo.ident` lock showed SoundMain taking it and nothing releasing it.
 
 The frame status line is
 

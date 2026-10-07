@@ -554,6 +554,9 @@ static void dma_trigger_hblank(void) {
 
 static bool in_irq = false;
 static int g_validating;   /* lockstep validation in progress (see recomp_validate) */
+static void func_ring_dump(void);
+static void hist_dump(void);
+extern int g_hist_on;
 
 static void check_interrupts(void) {
     if (in_irq || g_validating) return;
@@ -621,6 +624,11 @@ static void advance_cycles(u32 cycles) {
         scanline_cycles -= CYCLES_PER_SCANLINE;
 
         u32 prev_scanline = scanline;
+
+        /* The line just drawn, with the registers as they are now, before
+         * HBlank DMA/IRQs change them for the next line */
+        if (prev_scanline < VISIBLE_SCANLINES && !g_validating)
+            display_render_line((int)prev_scanline);
         scanline = (scanline + 1) % SCANLINES_PER_FRAME;
 
         /* Update VCOUNT */
@@ -663,6 +671,18 @@ static void advance_cycles(u32 cycles) {
 
             /* Frame pacing (headless runs flat out) */
             if (!display_headless()) SDL_Delay(16);
+
+            {
+                /* GBA_FUNC_TRACE_AT=N[,N...]: histogram of the functions
+                 * entered between VBlank N and VBlank N+1 */
+                static const char* at = (const char*)1;
+                if (at == (const char*)1) at = getenv("GBA_FUNC_TRACE_AT");
+                if (g_hist_on) hist_dump();
+                for (const char* p = at; p && *p; ) {
+                    if ((u32)atol(p) == frame_count) { g_hist_on = 1; break; }
+                    p = strchr(p, ','); if (p) p++;
+                }
+            }
 
             /* Memory snapshot for diffing against tools/oracle */
             {
@@ -960,7 +980,23 @@ u8 bus_read8(u32 addr) {
     }
 }
 
+/* GBA_WATCH=addr (hex): log every write to that 32-bit word with the
+ * frame, value and the function that made it (most recent RECOMP_ENTER),
+ * a watchpoint for "who changed this" questions. */
+static u32 watch_addr = 1;   /* 1 = not read yet */
+static void watch_check(u32 addr, u32 value, int size) {
+    if (watch_addr == 1) {
+        const char* w = getenv("GBA_WATCH");
+        watch_addr = w ? ((u32)strtoul(w, NULL, 16) & ~3u) : 0;
+    }
+    if (!watch_addr || (addr & ~3u) != watch_addr) return;
+    fprintf(stderr, "[watch] frame %u: write%d [%08X] = %08X in func_%08X (r14=%08X)%s\n",
+            frame_count, size * 8, addr, value, g_func_ring[(g_func_ring_i - 1) & 4095], r[14],
+            in_irq ? " [irq]" : "");
+}
+
 void bus_write32(u32 addr, u32 value) {
+    watch_check(addr, value, 4);
     addr &= ~3u;
     u32 region = addr >> 24;
 
@@ -2122,10 +2158,11 @@ void run_iwram_function(u32 target) {
             case 2: r[rd] = val; if (rd == 15) { pc = r[15] & ~1u; } break;
             case 3: /* BX */
                 if ((val & ~1u) == (return_sentinel & ~1u)) goto done;
-                /* ROM target: call recompiled function and continue */
+                /* ROM target: a call if LR points back into RAM, otherwise
+                 * a return/tail jump out (see the ARM BX case) */
                 if ((val >> 24) == 0x08) {
-                    cpu_bx(val); g_ret = 0;
-                    break;
+                    if (RAM_LR()) { cpu_bx(val); g_ret = 0; break; }
+                    LEAVE_TO_ROM(val);
                 }
                 thumb = (val & 1) != 0;
                 pc = val & ~1u;
@@ -2244,7 +2281,7 @@ void run_iwram_function(u32 target) {
                 if (pclr) {
                     u32 val = bus_read32(r[13]); r[13] += 4;
                     if ((val & ~1u) == (return_sentinel & ~1u)) goto done;
-                    if ((val >> 24) == 0x08) { r[15] = val; goto done; }
+                    if ((val >> 24) == 0x08) { r[15] = val; g_ret = val | 1u; goto done; }
                     thumb = (val & 1) != 0;
                     pc = val & ~1u;
                 }
@@ -2449,6 +2486,7 @@ static void sram_load(void) {
 
 void gba_init(const char* rom_path) {
     if (getenv("GBA_VALIDATE")) g_validate = atoi(getenv("GBA_VALIDATE"));
+    if (getenv("GBA_TRACE_UNWIND")) g_unwind_trace = atoi(getenv("GBA_TRACE_UNWIND"));
 
     /* Allocate memory regions */
     ewram   = calloc(1, 0x40000);
@@ -2543,6 +2581,62 @@ void gba_init(const char* rom_path) {
 u32 g_func_ring[4096];
 u32 g_func_ring_i;
 u32 g_ret;
+int g_unwind_trace;
+
+void recomp_unwind_note(u32 retaddr) {
+    fprintf(stderr, "[unwind] frame %u: call site expecting %08X saw a return to %08X (last entered func_%08X)\n",
+            frame_count, retaddr, g_ret, g_func_ring[(g_func_ring_i - 1) & 4095]);
+    if (--g_unwind_trace == 0) fprintf(stderr, "[unwind] (further unwinds not logged)\n");
+}
+
+int g_hist_on;
+typedef struct { u32 addr, count, first; } HistEntry;
+static HistEntry hist[16384];
+static u32 hist_n, hist_seq;
+
+void recomp_hist(u32 addr) {
+    u32 h = (addr >> 1) & 16383;
+    while (hist[h].addr && hist[h].addr != addr) h = (h + 1) & 16383;
+    if (!hist[h].addr) { hist[h].addr = addr; hist[h].first = hist_seq++; hist_n++; }
+    hist[h].count++;
+}
+
+static int hist_cmp(const void* a, const void* b) {
+    const HistEntry* x = a; const HistEntry* y = b;   /* by first entry */
+    return x->first < y->first ? -1 : x->first > y->first;
+}
+
+static void hist_dump(void) {
+    static HistEntry out[16384];
+    u32 n = 0;
+    for (u32 i = 0; i < 16384; i++) if (hist[i].addr) out[n++] = hist[i];
+    qsort(out, n, sizeof(out[0]), hist_cmp);
+    fprintf(stderr, "[trace] frame %u: %u functions, in first-call order (count):", frame_count - 1, n);
+    for (u32 k = 0; k < n; k++)
+        fprintf(stderr, "%s%08X(%u)", k % 6 ? " " : "\n  ", out[k].addr, out[k].count);
+    fprintf(stderr, "\n");
+    memset(hist, 0, sizeof(hist));
+    hist_n = hist_seq = 0;
+    g_hist_on = 0;
+}
+
+/* Distinct functions among the last 4096 entered, in first-seen order
+ * (GBA_FUNC_TRACE at exit, GBA_FUNC_TRACE_AT=N[,N...] at those frames) */
+static void func_ring_dump(void) {
+    static u32 seen[4096], count[4096];
+    u32 n = 0;
+    for (u32 i = 0; i < 4096; i++) {
+        u32 a = g_func_ring[(g_func_ring_i + i) & 4095], k = 0;
+        if (!a) continue;
+        while (k < n && seen[k] != a) k++;
+        if (k == n) { seen[n] = a; count[n++] = 0; }
+        count[k]++;
+    }
+    fprintf(stderr, "[runtime] frame %u: last 4096 function entries, distinct (count):", frame_count);
+    for (u32 k = 0; k < n; k++)
+        fprintf(stderr, "%s%08X(%u)", k % 6 ? " " : "\n  ", seen[k], count[k]);
+    fprintf(stderr, "\n");
+}
 
 /* ---- Lockstep validation (GBA_VALIDATE=K) ----
  *
@@ -2593,11 +2687,24 @@ static long first_diff(const u8* a, const u8* b, u32 n, u32 skip_lo, u32 skip_hi
     return -1;
 }
 
-static struct { u32 addr; u16 calls; u8 failed; } v_seen[32768];
+static struct { u32 addr; u16 calls; u8 failed; u32 seen; } v_seen[32768];
 static int v_funcs, v_fail;
 
 int recomp_validate(u32 addr) {
     if (g_validating || in_irq) return 0;
+    {
+        /* GBA_VALIDATE_RANGE=lo-hi (hex) and GBA_VALIDATE_FROM=frame narrow
+         * the validator to one area of code and one stretch of the run, so
+         * a large K stays affordable */
+        static int init; static u32 lo = 0, hi = 0xFFFFFFFFu, from = 0;
+        if (!init) {
+            init = 1;
+            const char* r = getenv("GBA_VALIDATE_RANGE");
+            if (r) { lo = (u32)strtoul(r, NULL, 16); const char* d = strchr(r, '-'); if (d) hi = (u32)strtoul(d + 1, NULL, 16); }
+            if (getenv("GBA_VALIDATE_FROM")) from = (u32)atol(getenv("GBA_VALIDATE_FROM"));
+        }
+        if (addr < lo || addr > hi || frame_count < from) return 0;
+    }
     u32 h = (addr >> 1) & 32767;
     while (v_seen[h].addr && v_seen[h].addr != addr) h = (h + 1) & 32767;
     if (!v_seen[h].addr) { v_seen[h].addr = addr; v_funcs++; }
