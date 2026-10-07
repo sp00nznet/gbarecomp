@@ -339,6 +339,12 @@ static void window_line(int y, u16 dispcnt) {
 
 void display_render_line(int y) {
     if (!io_regs || !vram || !palette || !oam || y < 0 || y >= GBA_HEIGHT) return;
+    /* Headless, only the frames that are kept get drawn: recorded ones, and
+     * the --screenshot frame (the last one before --frames, or any frame
+     * when the shot is taken at exit). Drawing is half a headless run. */
+    if (s_headless && !s_record &&
+        !(s_shot_path && (!s_max_frames || s_frame_no + 1 >= s_max_frames)))
+        return;
     u16 dispcnt = io_read16(REG_DISPCNT);
     int mode = dispcnt & 7;
     u32* out = &s_framebuf[y * GBA_WIDTH];
