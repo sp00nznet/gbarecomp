@@ -6,6 +6,7 @@ versions follow SemVer once the first one is tagged.
 ## [Unreleased]
 
 ### Fixed
+- `BgAffineSet` and `ObjAffineSet` computed the matrix as 1/scale and used the full 16-bit angle. The BIOS multiplies by the 8.8 scale and uses the angle's high byte; they now match mGBA's HLE BIOS. (#18)
 - Splitting a block for a mid-block entry (Phase 5 branch targets, Phase 7 late entries) gave the tail to only the first function holding the block. Since Phase 6 shares blocks, other holders lost it and their C fell into whatever label came next. Advance Wars' score screen skipped the code that fills its score table, drew bars from garbage and hung in the RAM sprite builder. Both sites also read the block through a pointer the array grow could move. (#17)
 - Nested interrupts: an IRQ now enters IRQ mode with CPSR's I bit set (old CPSR in SPSR), and a handler that clears I takes further IRQs, as on hardware. Before, nothing could interrupt a handler. Advance Wars runs its frame from the VBlank handler with HBlank nested in, and its top-of-screen text box never appeared. (#15)
 - Calls into code already analyzed as part of another function (a bogus function decoded from the bytes before the callee, or a shared tail like `_call_via_r3`) got no function of their own and compiled to empty stubs. They now become entries that Phase 7 splits out. Advance Wars' `_call_via_r3` and its map-icon loader were empty; LttP gains about 7000 functions. (#13)

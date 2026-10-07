@@ -1324,69 +1324,36 @@ void gba_swi(u32 number) {
         break;
     }
 
+    /* BgAffineSet / ObjAffineSet, as mGBA's HLE BIOS computes them (the
+     * oracle's reference): scale is 8.8 and multiplies the matrix directly,
+     * and only the angle's high byte counts. */
     case 0x0E: { /* BgAffineSet */
-        u32 src = r[0];
-        u32 dst = r[1];
-        u32 count = r[2];
-        for (u32 i = 0; i < count; i++) {
-            /* Read source parameters (20 bytes each) */
-            s32 cx = (s32)bus_read32(src + i * 20);
-            s32 cy = (s32)bus_read32(src + i * 20 + 4);
-            s16 dispx = (s16)bus_read16(src + i * 20 + 8);
-            s16 dispy = (s16)bus_read16(src + i * 20 + 10);
-            s16 sx = (s16)bus_read16(src + i * 20 + 12);
-            s16 sy = (s16)bus_read16(src + i * 20 + 14);
-            u16 angle_raw = bus_read16(src + i * 20 + 16);
-
-            double angle = (double)angle_raw / 65536.0 * 2.0 * 3.14159265358979323846;
-            double cosA = cos(angle);
-            double sinA = sin(angle);
-
-            /* PA = sx * cos(angle) / 256, PB = -sx * sin(angle) / 256, etc. */
-            s16 pa = (s16)(cosA * 256.0 * 256.0 / sx);
-            s16 pb = (s16)(-sinA * 256.0 * 256.0 / sx);
-            s16 pc = (s16)(sinA * 256.0 * 256.0 / sy);
-            s16 pd = (s16)(cosA * 256.0 * 256.0 / sy);
-
-            /* Reference point */
-            s32 dx = cx - (s32)dispx * pa - (s32)dispy * pb;
-            s32 dy = cy - (s32)dispx * pc - (s32)dispy * pd;
-
-            /* Write dest (16 bytes each) */
-            bus_write16(dst + i * 16, (u16)pa);
-            bus_write16(dst + i * 16 + 2, (u16)pb);
-            bus_write16(dst + i * 16 + 4, (u16)pc);
-            bus_write16(dst + i * 16 + 6, (u16)pd);
-            bus_write32(dst + i * 16 + 8, (u32)dx);
-            bus_write32(dst + i * 16 + 12, (u32)dy);
+        u32 src = r[0], dst = r[1];
+        for (u32 i = 0; i < r[2]; i++, src += 20, dst += 16) {
+            float ox = (s32)bus_read32(src) / 256.f, oy = (s32)bus_read32(src + 4) / 256.f;
+            float cx = (s16)bus_read16(src + 8), cy = (s16)bus_read16(src + 10);
+            float sx = (s16)bus_read16(src + 12) / 256.f, sy = (s16)bus_read16(src + 14) / 256.f;
+            float th = (bus_read16(src + 16) >> 8) / 128.f * 3.14159265f;
+            float a = cosf(th) * sx, b = -sinf(th) * sx, c = sinf(th) * sy, d = cosf(th) * sy;
+            bus_write16(dst, (u16)(s16)(a * 256));
+            bus_write16(dst + 2, (u16)(s16)(b * 256));
+            bus_write16(dst + 4, (u16)(s16)(c * 256));
+            bus_write16(dst + 6, (u16)(s16)(d * 256));
+            bus_write32(dst + 8, (u32)(s32)((ox - (a * cx + b * cy)) * 256));
+            bus_write32(dst + 12, (u32)(s32)((oy - (c * cx + d * cy)) * 256));
         }
         break;
     }
 
-    case 0x0F: { /* ObjAffineSet */
-        u32 src = r[0];
-        u32 dst = r[1];
-        u32 count = r[2];
-        u32 stride = r[3]; /* Offset between PA entries in dest (8 for OAM, 2 for buffer) */
-
-        for (u32 i = 0; i < count; i++) {
-            s16 sx = (s16)bus_read16(src + i * 8);
-            s16 sy = (s16)bus_read16(src + i * 8 + 2);
-            u16 angle_raw = bus_read16(src + i * 8 + 4);
-
-            double angle = (double)angle_raw / 65536.0 * 2.0 * 3.14159265358979323846;
-            double cosA = cos(angle);
-            double sinA = sin(angle);
-
-            s16 pa = (s16)(cosA * 256.0 * 256.0 / sx);
-            s16 pb = (s16)(-sinA * 256.0 * 256.0 / sx);
-            s16 pc = (s16)(sinA * 256.0 * 256.0 / sy);
-            s16 pd = (s16)(cosA * 256.0 * 256.0 / sy);
-
-            bus_write16(dst + i * stride * 4, (u16)pa);
-            bus_write16(dst + i * stride * 4 + stride, (u16)pb);
-            bus_write16(dst + i * stride * 4 + stride * 2, (u16)pc);
-            bus_write16(dst + i * stride * 4 + stride * 3, (u16)pd);
+    case 0x0F: { /* ObjAffineSet; r3 = stride between PA, PB, PC, PD */
+        u32 src = r[0], dst = r[1], stride = r[3];
+        for (u32 i = 0; i < r[2]; i++, src += 8, dst += stride * 4) {
+            float sx = (s16)bus_read16(src) / 256.f, sy = (s16)bus_read16(src + 2) / 256.f;
+            float th = (bus_read16(src + 4) >> 8) / 128.f * 3.14159265f;
+            bus_write16(dst, (u16)(s16)(cosf(th) * sx * 256));
+            bus_write16(dst + stride, (u16)(s16)(-sinf(th) * sx * 256));
+            bus_write16(dst + stride * 2, (u16)(s16)(sinf(th) * sy * 256));
+            bus_write16(dst + stride * 3, (u16)(s16)(cosf(th) * sy * 256));
         }
         break;
     }
