@@ -330,6 +330,7 @@ static u32 cycle_counter = 0;
 static u32 scanline = 0;          /* Current VCOUNT (0-227) */
 static u32 frame_count = 0;
 static u32 scanline_cycles = 0;   /* Cycles within current scanline */
+static u32 hblank_done = 0;       /* this line's HBlank has fired */
 static u32 last_poll_cycle = 0;
 
 #define CYCLES_PER_SCANLINE  1232
@@ -619,16 +620,28 @@ static void advance_cycles(u32 cycles) {
     /* Tick timers */
     timer_tick(cycles);
 
-    /* Process complete scanlines */
-    while (scanline_cycles >= CYCLES_PER_SCANLINE) {
+    /* Two events per line, as on hardware: HBlank at cycle 960 (the line is
+     * drawn, then HBlank DMA/IRQs run with VCOUNT still on that line), and the
+     * line end at 1232 (VCOUNT advances; VBlank and VCount match). An HBlank
+     * handler that reads VCOUNT to set up the next line needs that order.
+     * The state is global because IRQ handlers re-enter advance_cycles. */
+    for (;;) {
+        if (!hblank_done && scanline_cycles >= HBLANK_START_CYCLE) {
+            hblank_done = 1;
+            /* The line just drawn, with the registers as they are now */
+            if (scanline < VISIBLE_SCANLINES && !g_validating)
+                display_render_line((int)scanline);
+            io_write16(0x004, io_read16(0x004) | 2);   /* HBlank flag */
+            io_write16(0x202, io_read16(0x202) | 2);   /* HBlank IF, unconditional */
+            if (scanline < VISIBLE_SCANLINES) dma_trigger_hblank();  /* not in VBlank */
+            check_interrupts();
+            continue;
+        }
+        if (scanline_cycles < CYCLES_PER_SCANLINE) break;
         scanline_cycles -= CYCLES_PER_SCANLINE;
+        hblank_done = 0;
 
         u32 prev_scanline = scanline;
-
-        /* The line just drawn, with the registers as they are now, before
-         * HBlank DMA/IRQs change them for the next line */
-        if (prev_scanline < VISIBLE_SCANLINES && !g_validating)
-            display_render_line((int)prev_scanline);
         scanline = (scanline + 1) % SCANLINES_PER_FRAME;
 
         /* Update VCOUNT */
@@ -717,18 +730,7 @@ static void advance_cycles(u32 cycles) {
             io_write16(0x202, if_val | 4); /* VCount = bit 2 */
         }
 
-        /* HBlank fires at end of each visible scanline */
-        if (scanline < VISIBLE_SCANLINES) {
-            /* HBlank IF set unconditionally */
-            {
-                u16 if_val = io_read16(0x202);
-                io_write16(0x202, if_val | 2); /* HBlank = bit 1 */
-            }
-            /* HBlank DMA */
-            dma_trigger_hblank();
-        }
-
-        /* Check for interrupts after each scanline */
+        /* Check for interrupts at each line start */
         check_interrupts();
     }
 
@@ -2677,7 +2679,7 @@ int g_validate = 0;
 typedef struct {
     u8 ewram[0x40000], iwram[0x8000], io[0x400], pal[0x400], vram[0x18000], oam[0x400];
     u32 r[16]; bool n, z, c, v; u32 cpsr, spsr;
-    u32 cycle_counter, scanline, scanline_cycles, last_poll_cycle, frame_count;
+    u32 cycle_counter, scanline, scanline_cycles, hblank_done, last_poll_cycle, frame_count;
     HWTimer timers[4];
 } MachineState;
 
@@ -2688,7 +2690,8 @@ static void state_save(MachineState* s) {
     memcpy(s->r, r, sizeof(r));
     s->n = CPU_N; s->z = CPU_Z; s->c = CPU_C; s->v = CPU_V; s->cpsr = cpsr; s->spsr = spsr;
     s->cycle_counter = cycle_counter; s->scanline = scanline;
-    s->scanline_cycles = scanline_cycles; s->last_poll_cycle = last_poll_cycle;
+    s->scanline_cycles = scanline_cycles; s->hblank_done = hblank_done;
+    s->last_poll_cycle = last_poll_cycle;
     s->frame_count = frame_count;
     memcpy(s->timers, timers, sizeof(timers));
 }
@@ -2700,7 +2703,8 @@ static void state_load(const MachineState* s) {
     memcpy(r, s->r, sizeof(r));
     CPU_N = s->n; CPU_Z = s->z; CPU_C = s->c; CPU_V = s->v; cpsr = s->cpsr; spsr = s->spsr;
     cycle_counter = s->cycle_counter; scanline = s->scanline;
-    scanline_cycles = s->scanline_cycles; last_poll_cycle = s->last_poll_cycle;
+    scanline_cycles = s->scanline_cycles; hblank_done = s->hblank_done;
+    last_poll_cycle = s->last_poll_cycle;
     frame_count = s->frame_count;
     memcpy(timers, s->timers, sizeof(timers));
 }
