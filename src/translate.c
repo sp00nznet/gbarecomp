@@ -1908,6 +1908,10 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    # /O1 not /O2: huge generated TUs (>2MB) make /O2's regalloc burn 20+ min/file.\n");
         fprintf(f, "    # /MP enables parallel cl.exe across files.\n");
         fprintf(f, "    add_compile_options(/W2 /wd4244 /wd4146 /wd4018 /wd4047 /wd4024 /O1 /MP)\n");
+        fprintf(f, "    # clang-cl (a build farm): every block gets a label, most unused\n");
+        fprintf(f, "    if(CMAKE_C_COMPILER_ID STREQUAL \"Clang\")\n");
+        fprintf(f, "        add_compile_options(-Wno-unused-label)\n");
+        fprintf(f, "    endif()\n");
         fprintf(f, "else()\n");
         fprintf(f, "    add_compile_options(-Wall -Wno-unused-label -Wno-pointer-to-int-cast -O1)\n");
         fprintf(f, "endif()\n\n");
