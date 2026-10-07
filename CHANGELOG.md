@@ -5,8 +5,11 @@ versions follow SemVer once the first one is tagged.
 
 ## [Unreleased]
 
+### Added
+- PPU windows: WIN0, WIN1 and the OBJ window mask layers and colour effects per pixel, with wrap-around ranges as mGBA does. (#9)
+
 ### Changed
-- The PPU renders per scanline at HBlank with the registers as they are then, composes layers by BG/OBJ priority, applies BLDCNT alpha/brighten/darken, and draws affine BGs (modes 1-2). Windows, mosaic, affine sprites and mode 5 are still missing.
+- The PPU renders per scanline at HBlank with the registers as they are then, composes layers by BG/OBJ priority, applies BLDCNT alpha/brighten/darken, and draws affine BGs (modes 1-2). Mosaic, affine sprites and mode 5 are still missing.
 - `tools/conformance.py` fails on more failing functions than the baseline (`passed total`), not on fewer passes.
 
 ### Added
