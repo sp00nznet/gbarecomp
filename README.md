@@ -17,7 +17,7 @@ conformance harness against a reference.
 
 | Title | Boots | Intro | Title screen | Menus | Gameplay | Conformance |
 |---|---|---|---|---|---|---|
-| Advance Wars (USA, Rev 1) | yes | full attract loop | yes | yes, matches mGBA screen for screen | first Field Training battle map reached | 151/151 functions |
+| Advance Wars (USA, Rev 1) | yes | full attract loop | yes | yes, matches mGBA screen for screen | Field Training: Day 1, the enemy turn and Day 2's battle, in step with mGBA | 151/151 functions |
 | LttP + Four Swords (USA) | yes | - | yes | no (blanks where mGBA goes to file select) | no | - |
 
 The conformance figure is lockstep validation: each recompiled function's
