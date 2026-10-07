@@ -5,6 +5,9 @@ versions follow SemVer once the first one is tagged.
 
 ## [Unreleased]
 
+### Fixed
+- Thumb register-offset loads and stores: the translator had LDRH and LDRSB swapped (format 8 opcode bits 11-10 are STRH, LDRSB, LDRH, LDRSH), and the interpreter had the byte and halfword forms of formats 7 and 8 crossed. Advance Wars' move range drew over the whole map. (#12)
+
 ### Added
 - PPU windows: WIN0, WIN1 and the OBJ window mask layers and colour effects per pixel, with wrap-around ranges as mGBA does. (#9)
 

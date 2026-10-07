@@ -2216,9 +2216,9 @@ void run_iwram_function(u32 target) {
             int op = (insn >> 10) & 3;
             switch (op) {
             case 0: bus_write32(addr, r[rd]); break;        /* STR */
-            case 1: bus_write16(addr, (u16)r[rd]); break;   /* STRH */
+            case 1: bus_write8(addr, (u8)r[rd]); break;     /* STRB */
             case 2: r[rd] = bus_read32(addr); break;        /* LDR */
-            case 3: r[rd] = bus_read16(addr); break;        /* LDRH - zero extend */
+            case 3: r[rd] = bus_read8(addr); break;         /* LDRB */
             }
             continue;
         }
@@ -2229,9 +2229,9 @@ void run_iwram_function(u32 target) {
             u32 addr = r[rb] + r[ro];
             int op = (insn >> 10) & 3;
             switch (op) {
-            case 0: bus_write8(addr, (u8)r[rd]); break;     /* STRB */
+            case 0: bus_write16(addr, (u16)r[rd]); break;   /* STRH */
             case 1: r[rd] = (u32)(s32)(s8)bus_read8(addr); break; /* LDSB */
-            case 2: r[rd] = bus_read8(addr); break;         /* LDRB */
+            case 2: r[rd] = bus_read16(addr); break;        /* LDRH */
             case 3: r[rd] = (u32)(s32)(s16)bus_read16(addr); break; /* LDSH */
             }
             continue;
