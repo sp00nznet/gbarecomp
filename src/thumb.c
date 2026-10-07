@@ -136,7 +136,7 @@ static ThumbInsn decode_load_store_reg(u16 raw) {
 
 static ThumbInsn decode_load_store_sign(u16 raw) {
     /* Format 8: 0101 H S 1 Ro Rb Rd
-       H=bit10, S=bit11
+       H=bit11, S=bit10 (opcode bits 11-10: 0 STRH, 1 LDRSB, 2 LDRH, 3 LDRSH)
        S=0,H=0 -> STRH; S=0,H=1 -> LDRH; S=1,H=0 -> LDRSB; S=1,H=1 -> LDRSH */
     ThumbInsn insn;
     memset(&insn, 0, sizeof(insn));
@@ -146,8 +146,8 @@ static ThumbInsn decode_load_store_sign(u16 raw) {
     insn.rs   = (ArmRegister)BITS(raw, 5, 3);  /* Rb */
     insn.rm   = (ArmRegister)BITS(raw, 8, 6);  /* Ro */
 
-    u32 s = BIT(raw, 11);
-    u32 h = BIT(raw, 10);
+    u32 s = BIT(raw, 10);
+    u32 h = BIT(raw, 11);
 
     if (s == 0 && h == 0) {
         /* STRH */
