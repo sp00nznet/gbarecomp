@@ -17,7 +17,7 @@ conformance harness against a reference.
 
 | Title | Boots | Intro | Title screen | Menus | Gameplay | Conformance |
 |---|---|---|---|---|---|---|
-| Advance Wars (USA, Rev 1) | yes | full attract loop | yes | yes, matches mGBA screen for screen | Field Training: Day 1, the enemy turn and Day 2's battle, in step with mGBA | 151/151 functions |
+| Advance Wars (USA, Rev 1) | yes | full attract loop | yes | yes, matches mGBA screen for screen | Field Training won (three days, results screen rank A, save), in step with mGBA | 138/138 functions |
 | LttP + Four Swords (USA) | yes | - | yes | no (blanks where mGBA goes to file select) | no | - |
 
 The conformance figure is lockstep validation: each recompiled function's
@@ -36,6 +36,8 @@ Advance Wars, recompiled, captured with `--headless --screenshot`:
 ![Advance Wars: title, Nell's welcome, the Field Training briefing and the first battle map](docs/screenshots/advance-wars-menus.png)
 
 ![Advance Wars intro: map, Max, the battle scene and the logo](docs/screenshots/advance-wars-intro.png)
+
+![Advance Wars: Field Training's last battle, the mission success, the results screen with rank A, and the next briefing](docs/screenshots/advance-wars-field-training-win.png)
 
 ## Getting Started
 
