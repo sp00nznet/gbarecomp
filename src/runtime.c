@@ -632,7 +632,11 @@ static void advance_cycles(u32 cycles) {
             if (scanline < VISIBLE_SCANLINES && !g_validating)
                 display_render_line((int)scanline);
             io_write16(0x004, io_read16(0x004) | 2);   /* HBlank flag */
-            io_write16(0x202, io_read16(0x202) | 2);   /* HBlank IF, unconditional */
+            /* HBlank IF only when DISPSTAT enables its IRQ (bit 4), as on
+             * hardware: Advance Wars leaves IE's HBlank bit set in battle and
+             * relies on DISPSTAT to keep its map-HUD split handler quiet */
+            if (io_read16(0x004) & 0x10)
+                io_write16(0x202, io_read16(0x202) | 2);
             if (scanline < VISIBLE_SCANLINES) dma_trigger_hblank();  /* not in VBlank */
             check_interrupts();
             continue;
@@ -724,8 +728,8 @@ static void advance_cycles(u32 cycles) {
             }
         }
 
-        /* VCount match IRQ - IF bit set unconditionally on match */
-        if (scanline == vcount_target) {
+        /* VCount match IF, only when DISPSTAT enables its IRQ (bit 5) */
+        if (scanline == vcount_target && (dispstat & 0x20)) {
             u16 if_val = io_read16(0x202);
             io_write16(0x202, if_val | 4); /* VCount = bit 2 */
         }

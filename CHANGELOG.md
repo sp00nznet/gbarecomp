@@ -7,6 +7,7 @@ versions follow SemVer once the first one is tagged.
 
 ### Fixed
 - Calls into code already analyzed as part of another function (a bogus function decoded from the bytes before the callee, or a shared tail like `_call_via_r3`) got no function of their own and compiled to empty stubs. They now become entries that Phase 7 splits out. Advance Wars' `_call_via_r3` and its map-icon loader were empty; LttP gains about 7000 functions. (#13)
+- HBlank and VCount IF bits are raised only when DISPSTAT enables their IRQs (bits 4 and 5), as on hardware. Advance Wars leaves IE's HBlank bit on in battle, and its map-HUD split handler drew four junk lines at the bottom of the battle screen. (#14)
 - Thumb register-offset loads and stores: the translator had LDRH and LDRSB swapped (format 8 opcode bits 11-10 are STRH, LDRSB, LDRH, LDRSH), and the interpreter had the byte and halfword forms of formats 7 and 8 crossed. Advance Wars' move range drew over the whole map. (#12)
 
 ### Changed
