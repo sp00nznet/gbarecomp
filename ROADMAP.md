@@ -14,8 +14,6 @@
 - **Audio.** The m4a mixer now runs, but the runtime has no output: Direct
   Sound FIFOs and the PSG channels are silent.
 - **PPU completeness.** Mosaic, affine sprites, mode 5.
-- **Hardware IF semantics.** HBlank and VCount IF bits are set unconditionally;
-  hardware gates them on the DISPSTAT enables.
 - **Setup.cmd quick start** for game repos, per the house rules.
 - **netlab recipe** so builds and QA run on the farm.
 
