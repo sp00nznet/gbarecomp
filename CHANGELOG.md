@@ -10,7 +10,7 @@ versions follow SemVer once the first one is tagged.
   piped to ffmpeg), `--frames N`, `--screenshot out.bmp`, `--input script.txt`,
   `--log-every K`, `--dump-at N out.bin` ([docs/headless.md](docs/headless.md)). (#3)
 - Flash backup (`FLASH_V`, `FLASH512_V`, `FLASH1M_V`): ID mode, byte program,
-  sector/chip erase and 1 Mbit bank switching, saved to the same `.sav`. (#2)
+  sector/chip erase and 1 Mbit bank switching, saved to the same `.sav`. (#4)
 - Thumb jump-table recognition, emitted as a C `switch` over local labels. (#3)
 - Code-pointer scan (analysis Phase 4b): callback targets and prologue-less
   leaf functions found in ROM data become recompiled functions. (#3)
