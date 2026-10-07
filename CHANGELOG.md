@@ -5,7 +5,11 @@ versions follow SemVer once the first one is tagged.
 
 ## [Unreleased]
 
+### Changed
+- `tools/conformance.py` fails on more failing functions than the baseline (`passed total`), not on fewer passes.
+
 ### Added
+- Diagnostics: `GBA_WATCH` write watchpoint, `GBA_FUNC_TRACE_AT` per-frame call histogram, `GBA_TRACE_UNWIND`, and `GBA_VALIDATE_RANGE`/`_FROM`/`_EVERY` to aim the validator ([docs/headless.md](docs/headless.md)).
 - Runtime flags shared by every title: `--headless`, `--record out.mp4` (frames
   piped to ffmpeg), `--frames N`, `--screenshot out.bmp`, `--input script.txt`,
   `--log-every K`, `--dump-at N out.bin` ([docs/headless.md](docs/headless.md)). (#3)

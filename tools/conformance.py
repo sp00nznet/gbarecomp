@@ -8,8 +8,8 @@ and reports the pass count against a committed baseline:
         --baseline conformance_baseline.txt [--frames 760] [--input script.txt]
 
     conformance: 154/158 functions agree (details: scratch/conformance.log)
-    REGRESSION: 150 < baseline 154            -> exit 1
-    --update writes the current count as the new baseline.
+    REGRESSION: 6 failing > baseline 4        -> exit 1
+    --update writes the current "passed total" as the new baseline.
 
 Without the ROM (CI, a test VM) it prints "conformance: skipped -- ..." and
 exits 0, so data-dependent runs report SKIP rather than PASS. The ROM never
@@ -26,7 +26,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
     ap.add_argument("--rom", required=True)
-    ap.add_argument("--baseline", required=True, help="file holding the passing count")
+    ap.add_argument("--baseline", required=True, help="file holding \"passed total\"")
     ap.add_argument("--frames", type=int, default=760)
     ap.add_argument("--input", help="button script (docs/headless.md)")
     ap.add_argument("--calls", type=int, default=3, help="calls validated per function")

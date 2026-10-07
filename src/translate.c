@@ -897,7 +897,10 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
              * If the previous instruction is POP {rN} where rN matches,
              * this is a function return - just return instead of cpu_bx. */
             bool is_pop_bx_return = false;
-            if (addr >= 2) {
+            /* The POP must be this function's code: m4a BLs straight to the
+             * BX of another function's "POP {r3}; BX r3" as a call-via-r3,
+             * and that BX alone is a call, not a return */
+            if (addr >= 2 && local_code_contains(ctx, addr - 2)) {
                 u16 prev_raw = rom_read16(ctx->rom, addr - 2);
                 /* POP {single reg} encoding: 0xBC00 | (1 << rN) */
                 if ((prev_raw & 0xFF00) == 0xBC00) {
@@ -1274,8 +1277,28 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
         for (int s = 0; s < block->num_successors; s++)
             if (block->successors[s] == block->end) falls_through = true;
         u32 next_emitted = b + 1 < nblocks ? sorted_blocks[b + 1] : 0;
-        if (falls_through && next_emitted != block->end && is_local_label(ctx, block->end))
-            emit(ctx, "goto label_%08X; /* fall through */", block->end);
+        if (falls_through && next_emitted != block->end) {
+            /* Falling into code another function owns: follow it when that
+             * code is a real prologue (m4a's SoundMain checks its lock, then
+             * runs into a PUSH the prologue scan made a function of; without
+             * this it returned holding the lock and the sound driver went
+             * dead). A call's continuation is excluded: when it isn't ours,
+             * the callee doesn't return. */
+            bool ends_in_call = false, into_prologue = false;
+            if (block->mode == CODE_THUMB) {
+                u16 last = rom_read16(ctx->rom, block->end - 2);
+                ends_in_call = (last & 0xF800) == 0xF800 || (last & 0xFF00) == 0xDF00;
+                into_prologue = (rom_read16(ctx->rom, block->end) & 0xFE00) == 0xB400;
+            } else {
+                u32 last = rom_read32(ctx->rom, block->end - 4);
+                ends_in_call = (last & 0x0F000000) == 0x0B000000 || (last & 0x0F000000) == 0x0F000000;
+                into_prologue = (rom_read32(ctx->rom, block->end) & 0xFFFF0000) == 0xE92D0000;
+            }
+            if (is_local_label(ctx, block->end))
+                emit(ctx, "goto label_%08X; /* fall through */", block->end);
+            else if (into_prologue && !ends_in_call)
+                emit(ctx, "func_%08X(); return; /* fall through into a function prologue */", block->end);
+        }
         emit_raw(ctx, "\n");
     }
 

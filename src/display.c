@@ -277,141 +277,76 @@ static void render_bg_mode0(int bg, u16 dispcnt) {
     }
 }
 
-/* ---------- OBJ (sprite) rendering ---------- */
+void display_render_line(int y) {
+    if (!io_regs || !vram || !palette || !oam || y < 0 || y >= GBA_HEIGHT) return;
+    u16 dispcnt = io_read16(REG_DISPCNT);
+    int mode = dispcnt & 7;
+    u32* out = &s_framebuf[y * GBA_WIDTH];
 
-static void render_objs(u16 dispcnt) {
-    /* Check if OBJ rendering is enabled (bit 12) */
-    if (!(dispcnt & 0x1000))
+    if (y == 0) { affine_latch(0, 1); affine_latch(1, 1); }
+    if (dispcnt & 0x80) {   /* forced blank: white */
+        for (int x = 0; x < GBA_WIDTH; x++) out[x] = 0xFFFFFFFFu;
         return;
+    }
 
-    /* OBJ VRAM base: 0x06010000 = vram offset 0x10000 */
-    u32 obj_vram_base = 0x10000;
+    u16 backdrop = pal_read16(0);
+    for (int x = 0; x < GBA_WIDTH; x++) {
+        s_top_c[x] = s_bot_c[x] = backdrop;
+        s_top_l[x] = s_bot_l[x] = 5;
+        s_top_semi[x] = 0;
+    }
 
-    /* OBJ tile mapping: bit 6 of DISPCNT
-     * 0 = 2D mapping (tiles arranged in 32-tile-wide grid)
-     * 1 = 1D mapping (tiles sequential) */
-    int mapping_1d = (dispcnt >> 6) & 1;
-
-    /* Render back-to-front: higher OAM index = lower priority when overlapping.
-     * Iterate in reverse so lower-index sprites draw on top. */
-    for (int i = 127; i >= 0; i--) {
-        u32 oam_off = (u32)i * 8;
-        u16 attr0 = (u16)oam[oam_off]     | ((u16)oam[oam_off + 1] << 8);
-        u16 attr1 = (u16)oam[oam_off + 2] | ((u16)oam[oam_off + 3] << 8);
-        u16 attr2 = (u16)oam[oam_off + 4] | ((u16)oam[oam_off + 5] << 8);
-
-        /* OBJ mode: 0=normal, 1=semi-transparent, 2=OBJ window, 3=forbidden(hidden) */
-        int obj_mode = (attr0 & OAM_ATTR0_MODE_MASK) >> OAM_ATTR0_MODE_SHIFT;
-        if (obj_mode == 2 || obj_mode == 3)
-            continue; /* Skip disabled/window sprites */
-
-        /* If affine bit set but we only support non-rotated, check double-size disable bit */
-        int is_affine = (attr0 >> 8) & 1;
-        if (is_affine)
-            continue; /* Skip affine/rotated sprites for now */
-
-        /* Check for hidden flag: attr0 bits 8-9 == 0b10 means OBJ is hidden (non-affine) */
-        /* Actually: bit 8=0 (non-affine) and bit 9=1 means hidden */
-        int hidden = (attr0 >> 9) & 1;
-        if (!is_affine && hidden)
-            continue;
-
-        int shape = (attr0 & OAM_ATTR0_SHAPE_MASK) >> OAM_ATTR0_SHAPE_SHIFT;
-        int size  = (attr1 & OAM_ATTR1_SIZE_MASK) >> OAM_ATTR1_SIZE_SHIFT;
-
-        if (shape > 2) continue;
-
-        int w = obj_width[shape][size];
-        int h = obj_height[shape][size];
-
-        int obj_x = attr1 & OAM_ATTR1_X_MASK;
-        int obj_y = attr0 & OAM_ATTR0_Y_MASK;
-
-        /* X is 9-bit signed, Y is 8-bit and wraps */
-        if (obj_x >= 240) obj_x -= 512;
-        if (obj_y >= 160) obj_y -= 256;
-
-        int hflip = (attr1 & OAM_ATTR1_HFLIP) ? 1 : 0;
-        int vflip = (attr1 & OAM_ATTR1_VFLIP) ? 1 : 0;
-
-        u16 tile_idx  = attr2 & OAM_ATTR2_TILE_MASK;
-        int pal_num   = (attr2 & OAM_ATTR2_PAL_MASK) >> OAM_ATTR2_PAL_SHIFT;
-        int bpp8      = (attr0 & OAM_ATTR0_BPP) ? 1 : 0;
-
-        /* Tile size in bytes */
-        int tile_bytes = bpp8 ? 64 : 32;
-
-        /* Width of a tile row in the 2D mapping grid (in tiles) */
-        int row_tiles_2d = bpp8 ? 16 : 32;
-
-        /* Number of 8x8 tiles this sprite spans */
-        int tiles_w = w / 8;
-        int tiles_h = h / 8;
-
-        for (int py = 0; py < h; py++) {
-            int screen_y = obj_y + py;
-            if (screen_y < 0 || screen_y >= GBA_HEIGHT) continue;
-
-            int fy = vflip ? (h - 1 - py) : py;
-
-            for (int px = 0; px < w; px++) {
-                int screen_x = obj_x + px;
-                if (screen_x < 0 || screen_x >= GBA_WIDTH) continue;
-
-                int fx = hflip ? (w - 1 - px) : px;
-
-                /* Which 8x8 tile within the sprite */
-                int tx = fx / 8;
-                int ty = fy / 8;
-
-                /* Pixel within the 8x8 tile */
-                int tpx = fx & 7;
-                int tpy = fy & 7;
-
-                /* Calculate tile number */
-                u32 tile_num;
-                if (mapping_1d) {
-                    /* 1D: tiles are sequential.
-                     * In 8bpp mode, tile_idx is in units of 32 bytes (same as 4bpp tile),
-                     * so each 8bpp tile consumes 2 "tile slots". */
-                    if (bpp8) {
-                        tile_num = tile_idx + (u32)(ty * tiles_w * 2 + tx * 2);
-                    } else {
-                        tile_num = tile_idx + (u32)(ty * tiles_w + tx);
-                    }
-                } else {
-                    /* 2D: tiles arranged in a 32-wide (4bpp) or 16-wide (8bpp) grid */
-                    if (bpp8) {
-                        tile_num = tile_idx + (u32)(ty * row_tiles_2d * 2 + tx * 2);
-                    } else {
-                        tile_num = tile_idx + (u32)(ty * row_tiles_2d + tx);
-                    }
-                }
-
-                u32 tile_addr = obj_vram_base + tile_num * 32; /* always 32-byte units in VRAM */
-
-                u8 color_idx;
-                if (bpp8) {
-                    color_idx = vram_read8(tile_addr + (u32)(tpy * 8 + tpx));
-                } else {
-                    u8 byte = vram_read8(tile_addr + (u32)(tpy * 4 + tpx / 2));
-                    color_idx = (tpx & 1) ? (byte >> 4) : (byte & 0x0F);
-                }
-
-                if (color_idx == 0)
-                    continue; /* Transparent */
-
-                /* OBJ palette is the second half of palette RAM (offset 0x200) */
-                u16 pal_color;
-                if (bpp8) {
-                    pal_color = pal_read16(0x200 + (u32)color_idx * 2);
-                } else {
-                    pal_color = pal_read16(0x200 + (u32)(pal_num * 16 + color_idx) * 2);
-                }
-
-                s_framebuf[screen_y * GBA_WIDTH + screen_x] = gba_to_argb(pal_color);
-            }
+    /* Back to front: priority 3 first; within a priority, higher BG numbers
+     * are further back, and OBJs sit in front of BGs of the same priority */
+    for (int prio = 3; prio >= 0; prio--) {
+        for (int bg = 3; bg >= 0; bg--) {
+            if (!(dispcnt & (0x100 << bg))) continue;
+            if ((io_read16((u16)(REG_BG0CNT + bg * 2)) & 3) != prio) continue;
+            if (mode == 0 || (mode == 1 && bg < 2)) line_text_bg(bg, y);
+            else if ((mode == 1 && bg == 2) || (mode == 2 && bg >= 2)) line_affine_bg(bg, y);
+            else if (bg == 2 && mode == 3) line_mode3(y);
+            else if (bg == 2 && mode == 4) line_mode4(y, dispcnt);
         }
+        line_objs(y, dispcnt, prio);
+    }
+    /* affine reference points still advance for layers that weren't drawn */
+    for (int i = 0; i < 2; i++) {
+        int bg = i + 2;
+        int drawn = (dispcnt & (0x100 << bg)) && ((mode == 1 && bg == 2) || (mode == 2));
+        if (!drawn) {
+            u32 base = 0x020 + (u32)i * 0x10;
+            s_aff_x[i] += (s16)io_read16((u16)(base + 2));
+            s_aff_y[i] += (s16)io_read16((u16)(base + 6));
+        }
+    }
+
+    /* Colour effects (BLDCNT): alpha blend, brighten, darken. Windows aren't
+     * applied, so an effect covers the whole line. */
+    u16 bldcnt = io_read16(0x050), bldalpha = io_read16(0x052);
+    int effect = (bldcnt >> 6) & 3;
+    int t1 = bldcnt & 0x3F, t2 = (bldcnt >> 8) & 0x3F;
+    int eva = bldalpha & 0x1F, evb = (bldalpha >> 8) & 0x1F, evy = io_read16(0x054) & 0x1F;
+    if (eva > 16) eva = 16;
+    if (evb > 16) evb = 16;
+    if (evy > 16) evy = 16;
+    for (int x = 0; x < GBA_WIDTH; x++) {
+        u16 c = s_top_c[x];
+        int top_in_t1 = (t1 >> s_top_l[x]) & 1, bot_in_t2 = (t2 >> s_bot_l[x]) & 1;
+        int r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31;
+        if ((s_top_semi[x] || (effect == 1 && top_in_t1)) && bot_in_t2) {
+            u16 d = s_bot_c[x];
+            r = (r * eva + (d & 31) * evb) >> 4;
+            g = (g * eva + ((d >> 5) & 31) * evb) >> 4;
+            b = (b * eva + ((d >> 10) & 31) * evb) >> 4;
+            if (r > 31) r = 31;
+            if (g > 31) g = 31;
+            if (b > 31) b = 31;
+        } else if (effect == 2 && top_in_t1) {
+            r += ((31 - r) * evy) >> 4; g += ((31 - g) * evy) >> 4; b += ((31 - b) * evy) >> 4;
+        } else if (effect == 3 && top_in_t1) {
+            r -= (r * evy) >> 4; g -= (g * evy) >> 4; b -= (b * evy) >> 4;
+        }
+        out[x] = gba_to_argb((u16)(r | (g << 5) | (b << 10)));
     }
 }
 
