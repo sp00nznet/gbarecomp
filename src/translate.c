@@ -1932,14 +1932,18 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "target_include_directories(%s PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})\n\n", rom->game_code);
         /* SDL2 integration */
         fprintf(f, "# SDL2 display\n");
-        fprintf(f, "find_package(SDL2 CONFIG)\n");
+        fprintf(f, "find_package(SDL2 CONFIG QUIET)\n");
         fprintf(f, "if(SDL2_FOUND)\n");
         fprintf(f, "    target_link_libraries(%s PRIVATE SDL2::SDL2 SDL2::SDL2main)\n", rom->game_code);
-        fprintf(f, "else()\n");
-        fprintf(f, "    # Fallback: manual SDL2 paths\n");
+        fprintf(f, "elseif(EXISTS C:/vcpkg/installed/x64-windows/include/SDL2/SDL.h)\n");
         fprintf(f, "    target_include_directories(%s PRIVATE C:/vcpkg/installed/x64-windows/include)\n", rom->game_code);
         fprintf(f, "    target_link_directories(%s PRIVATE C:/vcpkg/installed/x64-windows/lib)\n", rom->game_code);
         fprintf(f, "    target_link_libraries(%s PRIVATE SDL2 SDL2main)\n", rom->game_code);
+        fprintf(f, "else()\n");
+        fprintf(f, "    # No SDL2 (a build farm, CI): a headless-only build, enough for\n");
+        fprintf(f, "    # --headless runs, --record and the conformance harness\n");
+        fprintf(f, "    message(STATUS \"SDL2 not found: building headless-only\")\n");
+        fprintf(f, "    target_compile_definitions(%s PRIVATE GBA_NO_SDL)\n", rom->game_code);
         fprintf(f, "endif()\n\n");
         /* Stack size for deep call chains */
         fprintf(f, "if(MSVC)\n");

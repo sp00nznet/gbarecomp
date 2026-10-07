@@ -6,6 +6,9 @@
  * --screenshot out.bmp, --input script.txt). Returns the ROM path or NULL. */
 const char* display_parse_args(int argc, char* argv[]);
 
+/* Frame pacing (16 ms) when a window is up; nothing when headless. */
+void display_pace(void);
+
 /* Nonzero when running without a window (no frame pacing either). */
 int display_headless(void);
 

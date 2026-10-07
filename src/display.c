@@ -5,7 +5,9 @@
  * plus basic OBJ (sprite) rendering.
  */
 
+#ifndef GBA_NO_SDL
 #include <SDL2/SDL.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,9 +70,11 @@ extern u8* oam;
 
 /* ---------- SDL state ---------- */
 
+#ifndef GBA_NO_SDL
 static SDL_Window*   s_window   = NULL;
 static SDL_Renderer* s_renderer = NULL;
 static SDL_Texture*  s_texture  = NULL;
+#endif
 
 /* 240x160 ARGB8888 framebuffer */
 static u32 s_framebuf[GBA_WIDTH * GBA_HEIGHT];
@@ -377,6 +381,12 @@ void display_render_line(int y) {
 
 int display_headless(void) { return s_headless; }
 
+void display_pace(void) {
+#ifndef GBA_NO_SDL
+    if (!s_headless) SDL_Delay(16);
+#endif
+}
+
 static long s_log_every = 300;
 long display_log_every(void) { return s_log_every; }
 
@@ -393,6 +403,9 @@ const char* display_dump_path(long frame) {
 
 const char* display_parse_args(int argc, char* argv[]) {
     const char* rom = NULL;
+#ifdef GBA_NO_SDL
+    s_headless = 1;
+#endif
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--headless")) s_headless = 1;
         else if (!strcmp(argv[i], "--record") && i + 1 < argc) { s_record_path = argv[++i]; s_headless = 1; }
@@ -455,7 +468,10 @@ int display_init(void) {
         if (!s_record) { fprintf(stderr, "[display] cannot start ffmpeg\n"); return -1; }
     }
     if (s_headless) return 0;
-
+#ifdef GBA_NO_SDL
+    fprintf(stderr, "[display] built without SDL2: run with --headless\n");
+    return -1;
+#else
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return -1;
@@ -498,6 +514,7 @@ int display_init(void) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
 
     return 0;
+#endif
 }
 
 void display_render_frame(void) {
@@ -512,17 +529,20 @@ void display_render_frame(void) {
         return;
     }
     if (s_headless) return;
+#ifndef GBA_NO_SDL
 
     /* Upload framebuffer to texture and present */
     SDL_UpdateTexture(s_texture, NULL, s_framebuf, GBA_WIDTH * (int)sizeof(u32));
     SDL_RenderClear(s_renderer);
     SDL_RenderCopy(s_renderer, s_texture, NULL, NULL);
     SDL_RenderPresent(s_renderer);
+#endif
 }
 
 int display_poll_events(void) {
     if (s_max_frames && s_frame_no >= s_max_frames) return 1;
     if (s_headless) return 0;
+#ifndef GBA_NO_SDL
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT)
@@ -552,6 +572,7 @@ int display_poll_events(void) {
             }
         }
     }
+#endif
     return 0;
 }
 
@@ -564,8 +585,10 @@ void display_shutdown(void) {
     if (s_shot_path && !(s_max_frames && s_frame_no >= s_max_frames)) write_bmp(s_shot_path);
     if (s_record) { pclose(s_record); s_record = NULL; }
     if (s_headless) return;
+#ifndef GBA_NO_SDL
     if (s_texture)  { SDL_DestroyTexture(s_texture);   s_texture  = NULL; }
     if (s_renderer) { SDL_DestroyRenderer(s_renderer); s_renderer = NULL; }
     if (s_window)   { SDL_DestroyWindow(s_window);     s_window   = NULL; }
     SDL_Quit();
+#endif
 }
