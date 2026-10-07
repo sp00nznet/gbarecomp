@@ -156,14 +156,18 @@ static const u8 obj_height[3][4] = {
  *
  * Layers are drawn back to front in GBA priority order; each pixel keeps its
  * top two (colour, layer) so the BLDCNT effects can blend the top layer with
- * the one beneath. Layer ids: 0-3 BG, 4 OBJ, 5 backdrop. Not implemented:
- * windows, mosaic, affine sprites, mode 5. */
+ * the one beneath. Layer ids: 0-3 BG, 4 OBJ, 5 backdrop. WIN0/WIN1/OBJ
+ * windows mask layers and effects per pixel. Not implemented: mosaic,
+ * affine sprites, mode 5. */
 
 static u16 s_top_c[GBA_WIDTH], s_bot_c[GBA_WIDTH];
 static u8  s_top_l[GBA_WIDTH], s_bot_l[GBA_WIDTH];
 static u8  s_top_semi[GBA_WIDTH];   /* semi-transparent OBJ */
+/* Window control per pixel (WININ/WINOUT byte): bits 0-3 BG, 4 OBJ, 5 effects */
+static u8  s_win[GBA_WIDTH];
 
 static inline void plot(int x, u16 color, u8 layer, u8 semi) {
+    if (!((s_win[x] >> layer) & 1)) return;
     s_bot_c[x] = s_top_c[x]; s_bot_l[x] = s_top_l[x];
     s_top_c[x] = color; s_top_l[x] = layer; s_top_semi[x] = semi;
 }
@@ -257,21 +261,25 @@ static void line_affine_bg(int bg, int y) {
     s_aff_y[i] += pd;
 }
 
-/* Sprites of one priority on line y (regular sprites; affine ones skipped) */
+/* Sprites of one priority on line y (regular sprites; affine ones skipped).
+ * prio < 0 is the OBJ-window pass: mode-2 sprites of any priority mark their
+ * opaque pixels with WINOUT's OBJ-window byte instead of drawing. */
 static void line_objs(int y, u16 dispcnt, int prio) {
     if (!(dispcnt & 0x1000)) return;
     int mapping_1d = (dispcnt >> 6) & 1;
     int bitmap_mode = (dispcnt & 7) >= 3;
+    u8 objwin_ctl = (u8)(io_read16(0x04A) >> 8);
     for (int i = 127; i >= 0; i--) {   /* lower OAM index ends on top */
         u32 o = (u32)i * 8;
         u16 a0 = (u16)(oam[o] | (oam[o + 1] << 8));
         u16 a1 = (u16)(oam[o + 2] | (oam[o + 3] << 8));
         u16 a2 = (u16)(oam[o + 4] | (oam[o + 5] << 8));
         int mode = (a0 >> 10) & 3;
-        if (mode >= 2) continue;                    /* OBJ window / forbidden */
+        if (mode == 3) continue;                    /* forbidden */
+        if ((mode == 2) != (prio < 0)) continue;    /* OBJ window only in its pass */
         if (a0 & 0x100) continue;                   /* affine: not drawn yet */
         if (a0 & 0x200) continue;                   /* disabled */
-        if (((a2 >> 10) & 3) != prio) continue;
+        if (prio >= 0 && ((a2 >> 10) & 3) != prio) continue;
         int shape = a0 >> 14, size = a1 >> 14;
         if (shape > 2) continue;
         int w = obj_width[shape][size], h = obj_height[shape][size];
@@ -298,9 +306,34 @@ static void line_objs(int y, u16 dispcnt, int prio) {
                 ci = (fx & 1) ? (b >> 4) : (b & 15);
             }
             if (!ci) continue;
+            if (prio < 0) { s_win[sx] = objwin_ctl; continue; }
             u16 c = bpp8 ? pal_read16(0x200 + (u32)ci * 2) : pal_read16(0x200 + (u32)(pal * 16 + ci) * 2);
             plot(sx, c, 4, mode == 1);
         }
+    }
+}
+
+/* Window controls for line y. Precedence: WIN0, WIN1, OBJ window, outside.
+ * A window's X1 > X2 (or Y1 > Y2) wraps around the screen edge. */
+static int win_contains(u16 range, int v, int limit) {
+    int a = range >> 8, b = range & 0xFF;
+    if (a > b) return v >= a || v < b;
+    if (b > limit) b = limit;
+    return v >= a && v < b;
+}
+
+static void window_line(int y, u16 dispcnt) {
+    if (!(dispcnt & 0xE000)) { memset(s_win, 0x3F, sizeof s_win); return; }
+    u16 winin = io_read16(0x048), winout = io_read16(0x04A);
+    memset(s_win, winout & 0x3F, sizeof s_win);
+    if (dispcnt & 0x8000) line_objs(y, dispcnt, -1);
+    for (int w = 1; w >= 0; w--) {   /* WIN1 first so WIN0 wins */
+        if (!(dispcnt & (0x2000 << w))) continue;
+        if (!win_contains(io_read16((u16)(0x044 + w * 2)), y, GBA_HEIGHT)) continue;
+        u16 h = io_read16((u16)(0x040 + w * 2));
+        u8 ctl = (u8)((winin >> (w * 8)) & 0x3F);
+        for (int x = 0; x < GBA_WIDTH; x++)
+            if (win_contains(h, x, GBA_WIDTH)) s_win[x] = ctl;
     }
 }
 
@@ -322,6 +355,7 @@ void display_render_line(int y) {
         s_top_l[x] = s_bot_l[x] = 5;
         s_top_semi[x] = 0;
     }
+    window_line(y, dispcnt);
 
     /* Back to front: priority 3 first; within a priority, higher BG numbers
      * are further back, and OBJs sit in front of BGs of the same priority */
@@ -347,8 +381,8 @@ void display_render_line(int y) {
         }
     }
 
-    /* Colour effects (BLDCNT): alpha blend, brighten, darken. Windows aren't
-     * applied, so an effect covers the whole line. */
+    /* Colour effects (BLDCNT): alpha blend, brighten, darken; only where the
+     * window control enables effects (bit 5) */
     u16 bldcnt = io_read16(0x050), bldalpha = io_read16(0x052);
     int effect = (bldcnt >> 6) & 3;
     int t1 = bldcnt & 0x3F, t2 = (bldcnt >> 8) & 0x3F;
@@ -360,7 +394,8 @@ void display_render_line(int y) {
         u16 c = s_top_c[x];
         int top_in_t1 = (t1 >> s_top_l[x]) & 1, bot_in_t2 = (t2 >> s_bot_l[x]) & 1;
         int r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31;
-        if ((s_top_semi[x] || (effect == 1 && top_in_t1)) && bot_in_t2) {
+        if (!(s_win[x] & 0x20)) { /* effects off in this window */ }
+        else if ((s_top_semi[x] || (effect == 1 && top_in_t1)) && bot_in_t2) {
             u16 d = s_bot_c[x];
             r = (r * eva + (d & 31) * evb) >> 4;
             g = (g * eva + ((d >> 5) & 31) * evb) >> 4;
