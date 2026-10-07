@@ -1156,10 +1156,10 @@ void analysis_run(AnalysisCtx* ctx) {
 
                 /* Find the block containing this target */
                 for (int j = 0; j < ctx->num_blocks; j++) {
-                    BasicBlock* blk = &ctx->blocks[j];
-                    if (target > blk->start && target < blk->end) {
+                    if (target > ctx->blocks[j].start && target < ctx->blocks[j].end) {
                         /* Target is mid-block - split it */
                         BasicBlock* new_blk = add_block(ctx);
+                        BasicBlock* blk = &ctx->blocks[j];   /* add_block may move blocks */
                         new_blk->start = target;
                         new_blk->end = blk->end;
                         new_blk->mode = blk->mode;
@@ -1176,27 +1176,15 @@ void analysis_run(AnalysisCtx* ctx) {
                         blk->is_return = false;
                         blk->has_indirect = false;
 
-                        /* Add new block to the function that owns the original */
+                        /* Every function holding the original gets the new block */
                         for (int fi = 0; fi < ctx->num_functions; fi++) {
                             for (int bi = 0; bi < ctx->functions[fi].num_blocks; bi++) {
-                                if (ctx->functions[fi].block_addrs[bi] == blk->start ||
-                                    ctx->functions[fi].block_addrs[bi] == target) {
-                                    /* Add the new block to this function if not already there */
-                                    bool has_new = false;
-                                    for (int k = 0; k < ctx->functions[fi].num_blocks; k++) {
-                                        if (ctx->functions[fi].block_addrs[k] == target) {
-                                            has_new = true;
-                                            break;
-                                        }
-                                    }
-                                    if (!has_new) {
-                                        function_add_block(&ctx->functions[fi], target);
-                                    }
-                                    goto next_target;
+                                if (ctx->functions[fi].block_addrs[bi] == blk->start) {
+                                    function_add_block(&ctx->functions[fi], target);
+                                    break;
                                 }
                             }
                         }
-                        next_target:
                         splits++;
                         break; /* Found the containing block, move to next target */
                     }
@@ -1408,6 +1396,7 @@ void analysis_run(AnalysisCtx* ctx) {
                         for (int s = 0; s < parent->num_successors; s++)
                             new_blk.successors[s] = parent->successors[s];
 
+                        u32 pstart = parent->start;  /* GROW below may move blocks */
                         /* Truncate parent block */
                         parent->end = entry;
                         parent->num_successors = 1;
@@ -1418,16 +1407,17 @@ void analysis_run(AnalysisCtx* ctx) {
                         ctx->blocks[ctx->num_blocks++] = new_blk;
                         found_bi = ctx->num_blocks - 1;
 
-                        /* Also add to the parent block's owner function */
+                        /* Every function emitting the parent keeps its tail
+                         * (Phase 6 shares blocks): one that lost it fell
+                         * into whatever label came next */
                         for (int oi = 0; oi < ctx->num_functions; oi++) {
                             for (int ok = 0; ok < ctx->functions[oi].num_blocks; ok++) {
-                                if (ctx->functions[oi].block_addrs[ok] == parent->start) {
+                                if (ctx->functions[oi].block_addrs[ok] == pstart) {
                                     function_add_block(&ctx->functions[oi], entry);
-                                    goto split_done;
+                                    break;
                                 }
                             }
                         }
-                        split_done:
                         break;
                     }
                 }
