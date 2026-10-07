@@ -106,6 +106,34 @@ it really goes (`RECOMP_RETURN` sets `g_ret`) and every call site checks it
 too, and the unwind continues to the frame it belongs to. Interrupts save and
 restore `g_ret`, and the interpreter clears it after calling native code.
 
+## Functions that run into another function's prologue
+
+m4a's `SoundMain` checks its lock, takes it (`ident++`), and runs straight on
+into a `PUSH {r4-r7, lr}`. The prologue scan had made that `PUSH` a function
+of its own, so SoundMain's C body ended after taking the lock and returned
+holding it: the sound driver ignored every call from then on, and Advance
+Wars' title screen, which waits on the music, fell back to the attract loop.
+A block that falls through into another function's code now tail-calls it
+when that code is a real prologue (`PUSH`/`STMDB sp!`) and the block didn't end
+in a call. Other fall-throughs still return (see "Function entry and block
+order"); `SWI 0` (SoftReset) is treated as never returning, which removes the
+literal-pool fall-throughs behind the earlier boot breakage.
+
+## BL to another function's BX
+
+m4a calls through the `BX r3` that ends another function's
+`POP {r3}; BX r3`, as a "call via r3". Seen alone, that BX looks like a POP+BX
+return. The pattern only counts as a return when the POP is part of the
+function being translated (`local_code_contains`).
+
+## Shared blocks
+
+Phase 6 used to give each block to exactly one function, "stealing" it from
+any other. Two functions reaching one switch (Advance Wars' script
+interpreter) then left one of them without its cases, which ran in the
+interpreter. Blocks are shared now (each function emits its own copy), and
+jump-table edges are followed like successors.
+
 ## The interpreter's return sentinel
 
 The interpreter replaces LR with a sentinel to know when the routine it was

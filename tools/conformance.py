@@ -31,7 +31,7 @@ def main():
     ap.add_argument("--input", help="button script (docs/headless.md)")
     ap.add_argument("--calls", type=int, default=3, help="calls validated per function")
     ap.add_argument("--log", default=os.path.join("scratch", "conformance.log"))
-    ap.add_argument("--update", action="store_true", help="store the current count as baseline")
+    ap.add_argument("--update", action="store_true", help="store the current result as baseline")
     a = ap.parse_args()
 
     for what, path in (("ROM", a.rom), ("build", a.exe)):
@@ -69,15 +69,20 @@ def main():
         if line.startswith("VALIDATE "):
             print("  " + line)
 
+    failed = total - passed
     if a.update:
         with open(a.baseline, "w") as f:
-            f.write(f"{passed}\n")
-        print(f"baseline set to {passed}")
+            f.write(f"{passed} {total}\n")
+        print(f"baseline set to {passed}/{total}")
         return 0
-    base = int(open(a.baseline).read().split()[0]) if os.path.exists(a.baseline) else 0
-    if passed < base:
-        print(f"REGRESSION: {passed} < baseline {base}")
-        return 1
+    # Regression = more functions failing than the baseline allows. How many
+    # get validated moves with the path a run takes, so passes alone mislead.
+    if os.path.exists(a.baseline):
+        nums = [int(x) for x in open(a.baseline).read().split()]
+        base_failed = nums[1] - nums[0] if len(nums) > 1 else 0
+        if failed > base_failed:
+            print(f"REGRESSION: {failed} failing > baseline {base_failed}")
+            return 1
     return 0
 
 

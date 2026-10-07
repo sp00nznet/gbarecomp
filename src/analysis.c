@@ -574,6 +574,20 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
                                 }
                                 break;
                             }
+                            /* ADD rX, pc, #imm; BX rX: a switch into the ARM
+                             * code that follows (m4a's umul3232H32) */
+                            if (scan_insn.type == THUMB_LOAD_ADDR && !scan_insn.is_sp &&
+                                (u8)scan_insn.rd == bx_reg && scan + 2 == addr) {
+                                u32 target = ((scan + 4) & ~3u) + scan_insn.imm;
+                                if (addr_in_rom(ctx, target)) {
+                                    block->successors[0] = target;
+                                    block->num_successors = 1;
+                                    block->has_indirect = false;
+                                    resolved = true;
+                                    queue_push(ctx, target, CODE_ARM, addr, true);
+                                }
+                                break;
+                            }
                             if (addr - scan > 20) break;
                             if (scan == 0) break;
                         }
@@ -591,6 +605,10 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
                 block->has_indirect =
                     !(insn.hi_op == THUMB_HI_MOV &&
                       detect_thumb_jump_table(ctx, addr, (u8)insn.rs, func));
+            } else if (insn.type == THUMB_SWI && insn.swi_num == 0x00) {
+                /* SoftReset never returns: what follows is usually a literal
+                 * pool, and decoding it as code invents fall-throughs */
+                block->num_successors = 0;
             } else if (insn.type == THUMB_SWI) {
                 /* SWI is a call to BIOS - execution continues after it */
                 block->successors[0] = addr + 2;
@@ -1231,8 +1249,20 @@ void analysis_run(AnalysisCtx* ctx) {
                 if (blk_idx < 0) continue;
                 BasicBlock* blk = &ctx->blocks[blk_idx];
 
-                for (int s = 0; s < blk->num_successors; s++) {
-                    u32 target = blk->successors[s];
+                /* Successors, plus the cases of a jump table ending this
+                 * block: two functions can share one switch (Advance Wars'
+                 * script interpreter), and each needs the cases as its own */
+                u32 succ[2 + 256];
+                int nsucc = 0;
+                for (int s = 0; s < blk->num_successors; s++) succ[nsucc++] = blk->successors[s];
+                for (int t = 0; t < ctx->num_jump_tables; t++) {
+                    const JumpTable* jt = &ctx->jump_tables[t];
+                    if (jt->branch_addr < blk->start || jt->branch_addr >= blk->end) continue;
+                    for (int e = 0; e < jt->num_entries && nsucc < 2 + 256; e++) succ[nsucc++] = jt->targets[e];
+                }
+
+                for (int s = 0; s < nsucc; s++) {
+                    u32 target = succ[s];
                     if (target == 0) continue;
 
                     /* Find target block */
@@ -1245,8 +1275,15 @@ void analysis_run(AnalysisCtx* ctx) {
                     }
                     if (target_idx < 0) continue;
 
-                    /* Already in our function? */
+                    /* Already in our function? (block_owner records the first
+                     * owner only, so check membership itself) */
                     if (block_owner[target_idx] == fi) continue;
+                    {
+                        bool have = false;
+                        for (int k = 0; k < func->num_blocks && !have; k++)
+                            have = func->block_addrs[k] == target;
+                        if (have) continue;
+                    }
 
                     /* If target is a function entry, only merge if current block ends with BL/SWI */
                     {
@@ -1279,22 +1316,12 @@ void analysis_run(AnalysisCtx* ctx) {
                         }
                     }
 
-                    /* Steal from previous owner */
-                    int prev_owner = block_owner[target_idx];
-                    if (prev_owner >= 0 && prev_owner != fi) {
-                        Function* other = &ctx->functions[prev_owner];
-                        for (int ok = 0; ok < other->num_blocks; ok++) {
-                            if (other->block_addrs[ok] == target) {
-                                other->block_addrs[ok] = other->block_addrs[other->num_blocks - 1];
-                                other->num_blocks--;
-                                break;
-                            }
-                        }
-                    }
-
-                    /* Add to our function */
+                    /* Share, don't steal: a block reachable from two
+                     * functions is emitted in both. Stealing left the other
+                     * function with a hole (and its switch cases to the
+                     * interpreter). */
                     function_add_block(func, target);
-                    block_owner[target_idx] = fi;
+                    if (block_owner[target_idx] < 0) block_owner[target_idx] = fi;
                     merged++;
                 }
             }

@@ -181,12 +181,22 @@ extern int g_bx_depth;   /* cpu_bx nesting (generated in game_entry.c) */
 extern u32 g_ret;
 #define RECOMP_RETURN(target) do { g_ret = (u32)(target) | 1u; return; } while (0)
 #define RECOMP_CALLED(retaddr) do { \
-        if (g_ret && ((g_ret ^ (u32)(retaddr)) & ~1u)) return; \
+        if (g_ret && ((g_ret ^ (u32)(retaddr)) & ~1u)) { \
+            if (g_unwind_trace) recomp_unwind_note(retaddr); \
+            return; \
+        } \
         g_ret = 0; \
     } while (0)
+/* GBA_TRACE_UNWIND=N: log the first N call sites an unwind passes through */
+extern int g_unwind_trace;
+void recomp_unwind_note(u32 retaddr);
 int recomp_validate(u32 addr);
+/* Per-frame call histogram for GBA_FUNC_TRACE_AT (on only for those frames) */
+extern int g_hist_on;
+void recomp_hist(u32 addr);
 #define RECOMP_ENTER(addr) do { \
         g_func_ring[g_func_ring_i++ & 4095] = (addr); \
+        if (g_hist_on) recomp_hist(addr); \
         if (g_validate && recomp_validate(addr)) return; \
     } while (0)
 

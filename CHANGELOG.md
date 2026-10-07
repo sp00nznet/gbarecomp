@@ -6,6 +6,7 @@ versions follow SemVer once the first one is tagged.
 ## [Unreleased]
 
 ### Changed
+- The PPU renders per scanline at HBlank with the registers as they are then, composes layers by BG/OBJ priority, applies BLDCNT alpha/brighten/darken, and draws affine BGs (modes 1-2). Windows, mosaic, affine sprites and mode 5 are still missing.
 - `tools/conformance.py` fails on more failing functions than the baseline (`passed total`), not on fewer passes.
 
 ### Added
@@ -34,6 +35,9 @@ versions follow SemVer once the first one is tagged.
 - LICENSE (MIT), CHANGELOG, ROADMAP, `docs/`. (#1)
 
 ### Fixed
+- Interpreter: a jump from RAM code to ROM without a RAM return address is a return or tail call, not a call; `UMULL`/`UMLAL`/`SMULL`/`SMLAL`; `ADD rX, pc; BX rX` into ARM is now analyzed; `SWI 0` is treated as never returning.
+- Two functions sharing a switch: Phase 6 gave each block to one owner, leaving the other function's cases to the interpreter. Blocks are now shared, and jump-table edges are followed.
+- m4a sound driver dead from boot: SoundMain was split at a `PUSH` the prologue scan made a function of and returned holding its lock; the interpreter skipped the RAM mixer because its first bytes look like ASCII; m4a calls through the `BX r3` of another function's epilogue. Every later song start/stop was ignored, which sent the title screen back to the attract loop.
 - `MOV pc, lr` emitted as a call to the caller's continuation instead of a return. (#3)
 - `BX rN` falling through to the next instruction after the callee returned. (#3)
 - Thumb `BX pc` (Thumb->ARM veneer) dispatching on a stale r[15]. (#3)
