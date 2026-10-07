@@ -6,10 +6,8 @@ versions follow SemVer once the first one is tagged.
 ## [Unreleased]
 
 ### Fixed
+- Calls into code already analyzed as part of another function (a bogus function decoded from the bytes before the callee, or a shared tail like `_call_via_r3`) got no function of their own and compiled to empty stubs. They now become entries that Phase 7 splits out. Advance Wars' `_call_via_r3` and its map-icon loader were empty; LttP gains about 7000 functions. (#13)
 - Thumb register-offset loads and stores: the translator had LDRH and LDRSB swapped (format 8 opcode bits 11-10 are STRH, LDRSB, LDRH, LDRSH), and the interpreter had the byte and halfword forms of formats 7 and 8 crossed. Advance Wars' move range drew over the whole map. (#12)
-
-### Added
-- PPU windows: WIN0, WIN1 and the OBJ window mask layers and colour effects per pixel, with wrap-around ranges as mGBA does. (#9)
 
 ### Changed
 - Headless runs only draw the frames they keep (recorded, or the `--screenshot` frame): drawing was half the run time, and Advance Wars' 10000-frame runs went from 26 s to 20 s. (#11)
@@ -18,6 +16,7 @@ versions follow SemVer once the first one is tagged.
 - `tools/conformance.py` fails on more failing functions than the baseline (`passed total`), not on fewer passes.
 
 ### Added
+- PPU windows: WIN0, WIN1 and the OBJ window mask layers and colour effects per pixel, with wrap-around ranges as mGBA does. (#9)
 - Headless-only builds: without SDL2 the generated project builds with `GBA_NO_SDL` instead of failing, so a build farm without SDL2 can build and run QA. The runtime no longer uses SDL (libm for its trig, pacing moved to the display module).
 - Diagnostics: `GBA_WATCH` write watchpoint, `GBA_FUNC_TRACE_AT` per-frame call histogram, `GBA_TRACE_UNWIND`, and `GBA_VALIDATE_RANGE`/`_FROM`/`_EVERY` to aim the validator ([docs/headless.md](docs/headless.md)).
 - Runtime flags shared by every title: `--headless`, `--record out.mp4` (frames
