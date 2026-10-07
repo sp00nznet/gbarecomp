@@ -1164,6 +1164,7 @@ void translate_emit_footer(TranslateCtx* ctx) {
  * over an hour. Functions above this many instructions compile unoptimized;
  * they are rare and mostly straight-line, so little speed is lost. */
 #define HUGE_FUNC_INSNS 1500
+#define HUGE_FUNC_BLOCKS 250
 
 static bool function_is_huge(TranslateCtx* ctx, const Function* func) {
     u32 insns = 0;
@@ -1174,7 +1175,10 @@ static bool function_is_huge(TranslateCtx* ctx, const Function* func) {
                 insns += (bb->end - bb->start) / (bb->mode == CODE_ARM ? 4 : 2);
                 break;
             }
-    return insns > HUGE_FUNC_INSNS;
+    /* Many blocks alone can do it too: a 314-label LttP function (data
+     * decoded as code, under the instruction limit) overflowed cl's own
+     * stack at /O1 (exit 0xC00000FD) */
+    return insns > HUGE_FUNC_INSNS || func->num_blocks > HUGE_FUNC_BLOCKS;
 }
 
 void translate_function(TranslateCtx* ctx, const Function* func) {
