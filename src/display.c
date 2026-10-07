@@ -277,24 +277,44 @@ static void line_objs(int y, u16 dispcnt, int prio) {
         int mode = (a0 >> 10) & 3;
         if (mode == 3) continue;                    /* forbidden */
         if ((mode == 2) != (prio < 0)) continue;    /* OBJ window only in its pass */
-        if (a0 & 0x100) continue;                   /* affine: not drawn yet */
-        if (a0 & 0x200) continue;                   /* disabled */
+        int affine = (a0 >> 8) & 1;
+        if (!affine && (a0 & 0x200)) continue;      /* disabled */
         if (prio >= 0 && ((a2 >> 10) & 3) != prio) continue;
         int shape = a0 >> 14, size = a1 >> 14;
         if (shape > 2) continue;
         int w = obj_width[shape][size], h = obj_height[shape][size];
         int oy = a0 & 0xFF, ox = a1 & 0x1FF;
         if (ox >= 240) ox -= 512;
+        int bw = w, bh = h;                         /* bounding box */
+        if (affine && (a0 & 0x200)) { bw *= 2; bh *= 2; }  /* double size */
         int py = (y - oy) & 0xFF;                   /* Y wraps at 256 */
-        if (py >= h) continue;
+        if (py >= bh) continue;
+        /* affine: texel = P * (pixel - box centre) + sprite centre, 8.8 fixed */
+        s16 pa = 256, pb = 0, pc = 0, pd = 256;
+        if (affine) {
+            u32 pp = ((a1 >> 9) & 31) * 32u;
+            pa = (s16)(oam[pp + 6] | (oam[pp + 7] << 8));
+            pb = (s16)(oam[pp + 14] | (oam[pp + 15] << 8));
+            pc = (s16)(oam[pp + 22] | (oam[pp + 23] << 8));
+            pd = (s16)(oam[pp + 30] | (oam[pp + 31] << 8));
+        }
+        int iy = py - bh / 2;
         u32 tile_idx = a2 & 0x3FF;
         if (bitmap_mode && tile_idx < 512) continue; /* lower OBJ VRAM is the bitmap */
         int bpp8 = (a0 >> 13) & 1, pal = a2 >> 12;
-        int fy = (a1 & 0x2000) ? h - 1 - py : py;
-        for (int px = 0; px < w; px++) {
+        for (int px = 0; px < bw; px++) {
             int sx = ox + px;
             if (sx < 0 || sx >= GBA_WIDTH) continue;
-            int fx = (a1 & 0x1000) ? w - 1 - px : px;
+            int fx, fy;
+            if (affine) {
+                int ix = px - bw / 2;
+                fx = ((pa * ix + pb * iy) >> 8) + w / 2;
+                fy = ((pc * ix + pd * iy) >> 8) + h / 2;
+                if (fx < 0 || fx >= w || fy < 0 || fy >= h) continue;
+            } else {
+                fx = (a1 & 0x1000) ? w - 1 - px : px;
+                fy = (a1 & 0x2000) ? h - 1 - py : py;
+            }
             u32 tx = (u32)fx >> 3, ty = (u32)fy >> 3;
             u32 tn = mapping_1d ? tile_idx + (ty * (u32)(w >> 3) + tx) * (bpp8 ? 2 : 1)
                                 : tile_idx + ty * 32 + tx * (bpp8 ? 2 : 1);
