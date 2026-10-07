@@ -560,7 +560,10 @@ static void hist_dump(void);
 extern int g_hist_on;
 
 static void check_interrupts(void) {
-    if (in_irq || g_validating) return;
+    /* Inside a handler only if it re-enabled IRQs by clearing CPSR's I bit,
+     * as on hardware. Advance Wars runs its frame from the VBlank handler
+     * with HBlank nested in, for its text-box split. */
+    if (g_validating || (in_irq && (cpsr & 0x80))) return;
 
     u16 ime = io_read16(0x208);
     if (!ime) return;
@@ -575,6 +578,11 @@ static void check_interrupts(void) {
                        (iwram[0x7FFE] << 16) | (iwram[0x7FFF] << 24);
     if (handler_addr == 0) return;
 
+    /* IRQ entry: IRQ mode with I set, old CPSR in SPSR */
+    bool was_in_irq = in_irq;
+    u32 saved_cpsr = cpsr, saved_spsr = spsr;
+    spsr = cpu_get_cpsr();
+    cpsr = (cpsr & ~0xFFu) | 0x92u;
     in_irq = true;
 
     /* Set BIOS IF flags at 0x03007FF8 (for IntrWait/VBlankIntrWait) */
@@ -598,8 +606,9 @@ static void check_interrupts(void) {
     /* Restore game state */
     memcpy(r, saved_r, sizeof(r));
     CPU_N = saved_N; CPU_Z = saved_Z; CPU_C = saved_C; CPU_V = saved_V;
+    cpsr = saved_cpsr; spsr = saved_spsr;
 
-    in_irq = false;
+    in_irq = was_in_irq;
 }
 
 /* ---- Scanline Scheduler ---- */
