@@ -17,19 +17,23 @@ conformance harness against a reference.
 
 | Title | Boots | Intro | Title screen | Menus | Gameplay | Conformance |
 |---|---|---|---|---|---|---|
-| Advance Wars (USA, Rev 1) | yes | full attract loop | reached, memory matches mGBA | no (falls back to attract) | no | 154/158 functions |
+| Advance Wars (USA, Rev 1) | yes | full attract loop | yes | yes, matches mGBA screen for screen | first Field Training battle map reached | 151/151 functions |
+| LttP + Four Swords (USA) | yes | - | yes | no (blanks where mGBA goes to file select) | no | - |
 
 The conformance figure is lockstep validation: each recompiled function's
-first calls run natively and in the interpreter from the same state and are
-compared ([docs/conformance.md](docs/conformance.md)). The four failures are
-known interpreter limitations, not native bugs.
+calls run natively and in the interpreter from the same state and are
+compared ([docs/conformance.md](docs/conformance.md)).
 
-Missing: audio output, affine/blend/window effects in the PPU, and the
-remaining control-flow cases listed in [ROADMAP.md](ROADMAP.md).
+Builds work with MSVC and, headless-only, on a clang-cl build farm without
+SDL2. Missing: audio output (the m4a driver runs, nothing is mixed out),
+windows/mosaic/affine sprites in the PPU, recompiling RAM overlays, and the
+other items in [ROADMAP.md](ROADMAP.md).
 
 ## Screenshots
 
-Advance Wars' attract intro, recompiled, captured with `--headless --screenshot`:
+Advance Wars, recompiled, captured with `--headless --screenshot`:
+
+![Advance Wars: title, Nell's welcome, the Field Training briefing and the first battle map](docs/screenshots/advance-wars-menus.png)
 
 ![Advance Wars intro: map, Max, the battle scene and the logo](docs/screenshots/advance-wars-intro.png)
 
