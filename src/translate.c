@@ -1908,6 +1908,10 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "    # /O1 not /O2: huge generated TUs (>2MB) make /O2's regalloc burn 20+ min/file.\n");
         fprintf(f, "    # /MP enables parallel cl.exe across files.\n");
         fprintf(f, "    add_compile_options(/W2 /wd4244 /wd4146 /wd4018 /wd4047 /wd4024 /O1 /MP)\n");
+        fprintf(f, "    # clang-cl (a build farm): every block gets a label, most unused\n");
+        fprintf(f, "    if(CMAKE_C_COMPILER_ID STREQUAL \"Clang\")\n");
+        fprintf(f, "        add_compile_options(-Wno-unused-label)\n");
+        fprintf(f, "    endif()\n");
         fprintf(f, "else()\n");
         fprintf(f, "    add_compile_options(-Wall -Wno-unused-label -Wno-pointer-to-int-cast -O1)\n");
         fprintf(f, "endif()\n\n");
@@ -1932,14 +1936,18 @@ int translate_multi(const GbaRom* rom, const AnalysisCtx* analysis, const char* 
         fprintf(f, "target_include_directories(%s PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})\n\n", rom->game_code);
         /* SDL2 integration */
         fprintf(f, "# SDL2 display\n");
-        fprintf(f, "find_package(SDL2 CONFIG)\n");
+        fprintf(f, "find_package(SDL2 CONFIG QUIET)\n");
         fprintf(f, "if(SDL2_FOUND)\n");
         fprintf(f, "    target_link_libraries(%s PRIVATE SDL2::SDL2 SDL2::SDL2main)\n", rom->game_code);
-        fprintf(f, "else()\n");
-        fprintf(f, "    # Fallback: manual SDL2 paths\n");
+        fprintf(f, "elseif(EXISTS C:/vcpkg/installed/x64-windows/include/SDL2/SDL.h)\n");
         fprintf(f, "    target_include_directories(%s PRIVATE C:/vcpkg/installed/x64-windows/include)\n", rom->game_code);
         fprintf(f, "    target_link_directories(%s PRIVATE C:/vcpkg/installed/x64-windows/lib)\n", rom->game_code);
         fprintf(f, "    target_link_libraries(%s PRIVATE SDL2 SDL2main)\n", rom->game_code);
+        fprintf(f, "else()\n");
+        fprintf(f, "    # No SDL2 (a build farm, CI): a headless-only build, enough for\n");
+        fprintf(f, "    # --headless runs, --record and the conformance harness\n");
+        fprintf(f, "    message(STATUS \"SDL2 not found: building headless-only\")\n");
+        fprintf(f, "    target_compile_definitions(%s PRIVATE GBA_NO_SDL)\n", rom->game_code);
         fprintf(f, "endif()\n\n");
         /* Stack size for deep call chains */
         fprintf(f, "if(MSVC)\n");

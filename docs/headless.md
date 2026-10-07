@@ -20,6 +20,14 @@ AWRE.exe game.gba --headless --frames 600 --screenshot f600.bmp
 AWRE.exe game.gba --record intro.mp4 --frames 1800
 ```
 
+## Headless-only builds (no SDL2)
+
+When CMake finds no SDL2 (a build farm's cross-compiler, CI), the generated
+project builds anyway with `GBA_NO_SDL`: the executable is always headless
+(as if `--headless` were given), and everything above works, including
+`--record`, `--screenshot` and the conformance harness. The runtime itself
+uses no SDL; only the window code in `src/display.c` does.
+
 ## Input scripts
 
 One line per change, `<frame> <keymask hex>`; the mask holds from that frame

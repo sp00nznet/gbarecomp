@@ -10,6 +10,7 @@ versions follow SemVer once the first one is tagged.
 - `tools/conformance.py` fails on more failing functions than the baseline (`passed total`), not on fewer passes.
 
 ### Added
+- Headless-only builds: without SDL2 the generated project builds with `GBA_NO_SDL` instead of failing, so a build farm without SDL2 can build and run QA. The runtime no longer uses SDL (libm for its trig, pacing moved to the display module).
 - Diagnostics: `GBA_WATCH` write watchpoint, `GBA_FUNC_TRACE_AT` per-frame call histogram, `GBA_TRACE_UNWIND`, and `GBA_VALIDATE_RANGE`/`_FROM`/`_EVERY` to aim the validator ([docs/headless.md](docs/headless.md)).
 - Runtime flags shared by every title: `--headless`, `--record out.mp4` (frames
   piped to ffmpeg), `--frames N`, `--screenshot out.bmp`, `--input script.txt`,

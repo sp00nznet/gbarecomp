@@ -16,7 +16,7 @@
 
 #include "gba/gba_runtime.h"
 #include "gba/display.h"
-#include <SDL2/SDL.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
@@ -670,7 +670,7 @@ static void advance_cycles(u32 cycles) {
             if (!g_validating) display_render_frame();  /* never twice per frame */
 
             /* Frame pacing (headless runs flat out) */
-            if (!display_headless()) SDL_Delay(16);
+            display_pace();
 
             {
                 /* GBA_FUNC_TRACE_AT=N[,N...]: histogram of the functions
@@ -1269,7 +1269,7 @@ void gba_swi(u32 number) {
         if (x == 0 && y == 0) {
             r[0] = 0;
         } else {
-            double angle = SDL_atan2((double)y, (double)x);
+            double angle = atan2((double)y, (double)x);
             /* Convert from [-pi, pi] to [0, 0xFFFF] */
             double normalized = angle / (2.0 * 3.14159265358979323846) + 0.5;
             if (normalized < 0) normalized += 1.0;
@@ -1324,8 +1324,8 @@ void gba_swi(u32 number) {
             u16 angle_raw = bus_read16(src + i * 20 + 16);
 
             double angle = (double)angle_raw / 65536.0 * 2.0 * 3.14159265358979323846;
-            double cosA = SDL_cos(angle);
-            double sinA = SDL_sin(angle);
+            double cosA = cos(angle);
+            double sinA = sin(angle);
 
             /* PA = sx * cos(angle) / 256, PB = -sx * sin(angle) / 256, etc. */
             s16 pa = (s16)(cosA * 256.0 * 256.0 / sx);
@@ -1360,8 +1360,8 @@ void gba_swi(u32 number) {
             u16 angle_raw = bus_read16(src + i * 8 + 4);
 
             double angle = (double)angle_raw / 65536.0 * 2.0 * 3.14159265358979323846;
-            double cosA = SDL_cos(angle);
-            double sinA = SDL_sin(angle);
+            double cosA = cos(angle);
+            double sinA = sin(angle);
 
             s16 pa = (s16)(cosA * 256.0 * 256.0 / sx);
             s16 pb = (s16)(-sinA * 256.0 * 256.0 / sx);
