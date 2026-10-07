@@ -18,7 +18,11 @@ const char* display_dump_path(long frame);
 /* Initialize SDL2 window (240x160 at 3x scale). Returns 0 on success. */
 int display_init(void);
 
-/* Render one frame from GBA VRAM/palette/OAM to the SDL window. */
+/* Compose scanline y from the current VRAM/palette/OAM/registers. The runtime
+ * calls it at each visible line's HBlank, so mid-frame register changes show. */
+void display_render_line(int y);
+
+/* Present the composed frame (window, --record, --screenshot). */
 void display_render_frame(void);
 
 /* Poll SDL events. Returns 0 normally, 1 if quit requested. */

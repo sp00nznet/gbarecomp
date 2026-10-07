@@ -23,16 +23,21 @@ Details that matter:
   `longjmp` and run for real, not compared.
 - The stack frame below the entry SP isn't compared: natively the real LR is
   pushed there, in the interpreter its return sentinel.
-- **Either side can be wrong.** The interpreter can't follow a return that
-  pops an outer frame or lands in native code (it treats `BX` to a ROM
-  address as a call), so those functions fail here while the native code is
-  right. Advance Wars' four current failures are all of this kind
-  (`_call_via_r4` into RAM flash routines, the shared-epilogue actor handlers,
-  and the `BX pc` veneer into an ARM routine). A failure is a lead, not a
-  verdict; the reference below settles it.
+- **Either side can be wrong.** A failure is a lead, not a verdict; the
+  reference below settles it. The interpreter used to treat any jump from RAM
+  code into ROM as a call, which made returns past the caller fail here while
+  the native code was right; it now leaves on such a jump and lets the native
+  unwind deliver it (or runs it as a tail call when the target is a function
+  entry). Advance Wars validates 151/151.
+- **It can't see runtime bugs.** Both sides share the same memory, I/O and
+  interpreter for RAM code, so a fault there (Advance Wars' interpreter skipping
+  the m4a mixer) passes validation. The watchpoint and the mGBA reference find
+  those.
 
-`tools/conformance.py` runs this headless, prints the count, and fails when it
-drops below a committed baseline (`--update` raises it). Without the ROM it
+`tools/conformance.py` runs this headless, prints the count, and fails when
+more functions fail than the committed baseline allows (the file holds
+`passed total`; `--update` rewrites it). It compares failures, not passes,
+because how many functions get validated moves with the path a run takes. Without the ROM it
 prints `conformance: skipped -- ...` and exits 0. A title repo keeps its
 baseline and calls it, for example:
 

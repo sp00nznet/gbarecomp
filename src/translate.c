@@ -15,6 +15,23 @@ static bool is_local_label(TranslateCtx* ctx, u32 addr) {
 }
 
 /* Emit a goto or tail-call depending on whether the target is local */
+/* True if `addr` lies inside one of the blocks of the function being translated */
+static bool local_code_contains(TranslateCtx* ctx, u32 addr) {
+    for (int i = 0; i < ctx->num_local_blocks; i++) {
+        int lo = 0, hi = ctx->analysis->num_blocks - 1;
+        while (lo <= hi) {   /* exact start lookup */
+            int mid = (lo + hi) / 2;
+            const BasicBlock* m = &ctx->analysis->blocks[mid];
+            if (m->start == ctx->local_blocks[i]) {
+                if (addr >= m->start && addr < m->end) return true;
+                break;
+            }
+            if (m->start < ctx->local_blocks[i]) lo = mid + 1; else hi = mid - 1;
+        }
+    }
+    return false;
+}
+
 static void emit_goto_or_tailcall(TranslateCtx* ctx, u32 target) {
     if (is_local_label(ctx, target)) {
         for (int i = 0; i < ctx->indent; i++) fprintf(ctx->out, "    ");

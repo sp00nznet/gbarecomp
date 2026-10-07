@@ -1038,6 +1038,7 @@ void bus_write32(u32 addr, u32 value) {
 }
 
 void bus_write16(u32 addr, u16 value) {
+    watch_check(addr, value, 2);
     addr &= ~1u;
     u32 region = addr >> 24;
 
@@ -1075,6 +1076,7 @@ void bus_write16(u32 addr, u16 value) {
 }
 
 void bus_write8(u32 addr, u8 value) {
+    watch_check(addr, value, 1);
     u32 region = addr >> 24;
 
     switch (region) {
@@ -1596,22 +1598,14 @@ void run_iwram_function(u32 target) {
         if (mem) {
             u8 b0 = mem[off], b1 = mem[off+1];
             u32 w = mem[off] | (mem[off+1]<<8) | (mem[off+2]<<16) | (mem[off+3]<<24);
+            /* Only erased/blank memory counts as "not code". Guessing from
+             * printable bytes skipped real code: m4a's mixer starts with
+             * 0x7943 (LDRB r3,[r0,#5]), bytes "Cy", so it never ran and the
+             * sound driver's lock was never released. */
+            (void)b0; (void)b1;
             bool is_data = (w == 0 || w == 0xFFFFFFFF || (w & 0xFFFF0000) == 0xFFFF0000);
-            if (!is_data && (target & 1)) {
-                /* Thumb: check if first halfword looks like ASCII */
-                if (b0 >= 0x20 && b0 < 0x7F && b1 >= 0x20 && b1 < 0x7F)
-                    is_data = true;
-            }
-            if (!is_data && !(target & 1)) {
-                /* ARM: check condition field (bits 28-31). Valid ARM has cond 0x0-0xE.
-                 * Also check that the word doesn't look like a pointer (0x0XXXXXXX) or ASCII. */
-                u8 cond = (w >> 28) & 0xF;
-                if (cond == 0xF) is_data = true; /* NV condition = unlikely real code */
-                /* ASCII 4-byte check */
-                if (b0 >= 0x20 && b0 < 0x7F && b1 >= 0x20 && b1 < 0x7F &&
-                    mem[off+2] >= 0x20 && mem[off+2] < 0x7F && mem[off+3] >= 0x20 && mem[off+3] < 0x7F)
-                    is_data = true;
-            }
+            if (!is_data && !(target & 1) && ((w >> 28) & 0xF) == 0xF)
+                is_data = true; /* ARM NV condition: not code on ARMv4 */
             if (is_data) {
                 r[15] = r[14] & ~1u;
                 return;
@@ -1640,6 +1634,14 @@ void run_iwram_function(u32 target) {
 
     /* Set LR to a sentinel so we know when to stop */
     u32 return_sentinel = 0xDEAD0000;
+#define RAM_LR() (((r[14] >> 24) == 0x02 || (r[14] >> 24) == 0x03))
+    /* Leaving RAM code for ROM without a RAM return address: to a function
+     * entry it's a tail call (run it; its return is ours), anywhere else
+     * it's a return past our caller, which the native unwind delivers. */
+#define LEAVE_TO_ROM(t) do { \
+        if (recomp_lookup((t) & ~1u)) { g_ret = 0; cpu_bx(t); goto done; } \
+        g_ret = (t) | 1u; goto done; \
+    } while (0)
     r[14] = return_sentinel | 1; /* Thumb return address */
 
     int steps = 0;
@@ -1682,9 +1684,13 @@ void run_iwram_function(u32 target) {
                 u32 addr = r[rm];
                 if ((addr & ~1u) == (return_sentinel & ~1u)) break;
                 if ((addr >> 24) == 0x08) {
-                    /* ROM target: call recompiled function and continue */
-                    cpu_bx(addr); g_ret = 0;  /* native return targets mean nothing in here */
-                    continue;
+                    /* ROM target. With LR pointing back into RAM it's a call
+                     * (MOV lr, pc; BX rN): run it natively and carry on.
+                     * Otherwise it's a return or tail jump out of RAM code
+                     * (m4a's mixer pops SoundMain's frame and returns to its
+                     * caller): leave, and let the native unwind take it. */
+                    if (RAM_LR()) { cpu_bx(addr); g_ret = 0; continue; }
+                    LEAVE_TO_ROM(addr);
                 }
                 /* Sanity check: BX to a region that holds no executable code is
                  * almost always an uninitialized function pointer (e.g. game
@@ -1952,6 +1958,10 @@ void run_iwram_function(u32 target) {
                     addr2 += 4;
                 }
                 if (w) r[rn_idx] = u ? base + count * 4 : base - count * 4;
+                if (l && (rlist & 0x8000)) {
+                    if ((r[15] & ~1u) == (return_sentinel & ~1u)) goto done;
+                    if ((r[15] >> 24) == 0x08) { g_ret = r[15] | 1u; goto done; }
+                }
                 continue;
             }
 
@@ -1994,6 +2004,21 @@ void run_iwram_function(u32 target) {
                 if (accumulate) result += r[rn_idx2];
                 r[rd_idx] = result;
                 if (s_mul) cpu_update_nz(result);
+                continue;
+            }
+
+            /* UMULL/UMLAL/SMULL/SMLAL: m4a's mixer reaches its 32x32->64
+             * helper (ARM, in ROM) through the interpreter */
+            if ((insn & 0x0F8000F0) == 0x00800090) {
+                int hi_idx = (insn >> 16) & 0xF, lo_idx = (insn >> 12) & 0xF;
+                int rs_idx = (insn >> 8) & 0xF, rm_idx = insn & 0xF;
+                bool sgn = (insn >> 22) & 1, acc = (insn >> 21) & 1, s_mul = (insn >> 20) & 1;
+                u64 res = sgn ? (u64)((s64)(s32)r[rm_idx] * (s64)(s32)r[rs_idx])
+                              : (u64)r[rm_idx] * (u64)r[rs_idx];
+                if (acc) res += ((u64)r[hi_idx] << 32) | r[lo_idx];
+                r[lo_idx] = (u32)res;
+                r[hi_idx] = (u32)(res >> 32);
+                if (s_mul) { CPU_N = (res >> 63) != 0; CPU_Z = res == 0; }
                 continue;
             }
 
@@ -2709,6 +2734,14 @@ int recomp_validate(u32 addr) {
     while (v_seen[h].addr && v_seen[h].addr != addr) h = (h + 1) & 32767;
     if (!v_seen[h].addr) { v_seen[h].addr = addr; v_funcs++; }
     if (v_seen[h].calls >= g_validate || v_seen[h].failed) return 0;
+    {
+        /* GBA_VALIDATE_EVERY=N: only every Nth call. A validated call runs its
+         * callees unvalidated, so an outer function checked every time would
+         * hide everything below it; skipping lets the callees take turns. */
+        static u32 every;
+        if (!every) { const char* e = getenv("GBA_VALIDATE_EVERY"); every = e ? (u32)atol(e) : 1; if (!every) every = 1; }
+        if (v_seen[h].seen++ % every) return 0;
+    }
     v_seen[h].calls++;
 
     u32 target = recomp_lookup(addr);       /* with the Thumb bit */
@@ -2774,22 +2807,7 @@ int recomp_validate(u32 addr) {
 }
 
 void gba_shutdown(void) {
-    if (getenv("GBA_FUNC_TRACE")) {
-        /* Distinct functions among the last 4096 entries, in first-seen order */
-        static u32 seen[4096], count[4096];
-        u32 n = 0;
-        for (u32 i = 0; i < 4096; i++) {
-            u32 a = g_func_ring[(g_func_ring_i + i) & 4095], k = 0;
-            if (!a) continue;
-            while (k < n && seen[k] != a) k++;
-            if (k == n) { seen[n] = a; count[n++] = 0; }
-            count[k]++;
-        }
-        fprintf(stderr, "[runtime] last 4096 function entries, distinct (count):");
-        for (u32 k = 0; k < n; k++)
-            fprintf(stderr, "%s%08X(%u)", k % 6 ? " " : "\n  ", seen[k], count[k]);
-        fprintf(stderr, "\n");
-    }
+    if (getenv("GBA_FUNC_TRACE")) func_ring_dump();
     if (g_validate)
         fprintf(stderr, "validate: %d/%d functions agree (native vs interpreter)\n",
                 v_funcs - v_fail, v_funcs);

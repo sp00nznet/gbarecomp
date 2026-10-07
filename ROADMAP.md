@@ -2,23 +2,18 @@
 
 ## Next
 
-- **Advance Wars past the title.** The whole attract intro plays and the title
-  screen comes up with memory identical to mGBA's (frame 615), but after Start
-  the title's actors take a different path and the game falls back to the
-  attract loop instead of the menu.
-- **Noreturn detection** (`SWI 0`, panic routines), so a fall-through into
-  another function's code can become a tail call.
-- **Interpreter returns into native frames**, so validation failures are only
-  ever native bugs.
-- **CI**: build on every push; conformance needs a ROM, so CI reports SKIP.
+- **Advance Wars into Field Training** and a full battle: the menus and name
+  entry now match mGBA.
 - **Recompile RAM overlays.** Games copy routines (the m4a sound mixer, IRQ
-  handlers) from ROM to IWRAM and run them there; today the interpreter runs
-  them. Recompiling the ROM source at its RAM address would make every routine
-  native and remove the interpreter from the hot path.
-- **Audio.** The runtime has no mixer: Direct Sound FIFOs and the PSG channels
-  are silent.
-- **PPU completeness.** Affine backgrounds (modes 1/2), window and blend
-  effects (BLDCNT/BLDY are not applied), mosaic, BG priority ordering.
+  handlers, Flash routines) from ROM to IWRAM and run them there; the
+  interpreter runs them today, and their calls into ROM are invisible to
+  analysis (Advance Wars lists two in its entries file). Recompiling the ROM
+  source at its RAM address would make every routine native.
+- **Noreturn detection** beyond `SWI 0` (panic routines), so more
+  fall-throughs into another function's code can become tail calls.
+- **Audio.** The m4a mixer now runs, but the runtime has no output: Direct
+  Sound FIFOs and the PSG channels are silent.
+- **PPU completeness.** Windows, mosaic, affine sprites, mode 5.
 - **Hardware IF semantics.** HBlank and VCount IF bits are set unconditionally;
   hardware gates them on the DISPSTAT enables.
 - **Setup.cmd quick start** for game repos, per the house rules.

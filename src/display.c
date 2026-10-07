@@ -75,6 +75,7 @@ static SDL_Texture*  s_texture  = NULL;
 /* 240x160 ARGB8888 framebuffer */
 static u32 s_framebuf[GBA_WIDTH * GBA_HEIGHT];
 
+
 /* Key state: bit set = pressed. Mapped to GBA button bits. */
 static u16 s_keys_pressed = 0;
 
@@ -141,138 +142,160 @@ static const u8 obj_height[3][4] = {
     { 16, 32, 32, 64 },  /* Vertical */
 };
 
-/* ---------- Mode 3: 240x160 direct-color bitmap ---------- */
+/* ---------- Scanline rendering ----------
+ *
+ * Each line is composed when the runtime reaches its HBlank
+ * (display_render_line), with the registers as they are at that moment.
+ * Games change scroll, BGCNT and affine parameters between lines from HBlank
+ * DMA or interrupts (Advance Wars' dialog boxes do), so rendering the whole
+ * frame at VBlank with the end-of-frame registers drew the wrong layers.
+ *
+ * Layers are drawn back to front in GBA priority order; each pixel keeps its
+ * top two (colour, layer) so the BLDCNT effects can blend the top layer with
+ * the one beneath. Layer ids: 0-3 BG, 4 OBJ, 5 backdrop. Not implemented:
+ * windows, mosaic, affine sprites, mode 5. */
 
-static void render_mode3(void) {
-    for (int y = 0; y < GBA_HEIGHT; y++) {
-        for (int x = 0; x < GBA_WIDTH; x++) {
-            u32 offset = (u32)(y * GBA_WIDTH + x) * 2;
-            u16 color = vram_read16(offset);
-            s_framebuf[y * GBA_WIDTH + x] = gba_to_argb(color);
-        }
+static u16 s_top_c[GBA_WIDTH], s_bot_c[GBA_WIDTH];
+static u8  s_top_l[GBA_WIDTH], s_bot_l[GBA_WIDTH];
+static u8  s_top_semi[GBA_WIDTH];   /* semi-transparent OBJ */
+
+static inline void plot(int x, u16 color, u8 layer, u8 semi) {
+    s_bot_c[x] = s_top_c[x]; s_bot_l[x] = s_top_l[x];
+    s_top_c[x] = color; s_top_l[x] = layer; s_top_semi[x] = semi;
+}
+
+/* Mode 3: 240x160 direct colour, as BG2 */
+static void line_mode3(int y) {
+    for (int x = 0; x < GBA_WIDTH; x++)
+        plot(x, vram_read16((u32)(y * GBA_WIDTH + x) * 2), 2, 0);
+}
+
+/* Mode 4: 240x160 8-bit indexed, two pages, as BG2; index 0 is transparent */
+static void line_mode4(int y, u16 dispcnt) {
+    u32 page = (dispcnt & 0x0010) ? 0xA000 : 0;
+    for (int x = 0; x < GBA_WIDTH; x++) {
+        u8 idx = vram_read8(page + (u32)(y * GBA_WIDTH + x));
+        if (idx) plot(x, pal_read16((u32)idx * 2), 2, 0);
     }
 }
 
-/* ---------- Mode 4: 240x160 8-bit indexed bitmap ---------- */
-
-static void render_mode4(u16 dispcnt) {
-    /* Bit 4 of DISPCNT selects page: 0 = 0x06000000, 1 = 0x0600A000 */
-    u32 page_offset = (dispcnt & 0x0010) ? 0xA000 : 0x0000;
-
-    for (int y = 0; y < GBA_HEIGHT; y++) {
-        for (int x = 0; x < GBA_WIDTH; x++) {
-            u8 idx = vram_read8(page_offset + (u32)(y * GBA_WIDTH + x));
-            u16 color = pal_read16((u32)idx * 2);
-            s_framebuf[y * GBA_WIDTH + x] = gba_to_argb(color);
-        }
-    }
-}
-
-/* ---------- Mode 0: tiled backgrounds ---------- */
-
-static void render_bg_mode0(int bg, u16 dispcnt) {
-    /* Check if this BG is enabled */
-    if (!(dispcnt & (0x0100 << bg)))
-        return;
-
+/* Text background (modes 0, and BG0/BG1 in mode 1) */
+static void line_text_bg(int bg, int y) {
     u16 bgcnt = io_read16((u16)(REG_BG0CNT + bg * 2));
-    u16 hofs  = io_read16((u16)(REG_BG0HOFS + bg * 4)) & 0x1FF;
-    u16 vofs  = io_read16((u16)(REG_BG0VOFS + bg * 4)) & 0x1FF;
+    u32 hofs = io_read16((u16)(REG_BG0HOFS + bg * 4)) & 0x1FF;
+    u32 vofs = io_read16((u16)(REG_BG0VOFS + bg * 4)) & 0x1FF;
+    u32 char_base = (u32)((bgcnt >> 2) & 3) * 0x4000;
+    u32 screen_base = (u32)((bgcnt >> 8) & 0x1F) * 0x800;
+    int bpp8 = (bgcnt >> 7) & 1, size = (bgcnt >> 14) & 3;
+    u32 w_px = (size & 1) ? 512 : 256, h_px = (size & 2) ? 512 : 256;
 
-    /* BGCNT fields */
-    u32 char_base   = (u32)((bgcnt >> 2) & 0x3) * 0x4000;   /* tile data */
-    u32 screen_base = (u32)((bgcnt >> 8) & 0x1F) * 0x800;   /* map data */
-    int bpp8        = (bgcnt >> 7) & 1;                       /* 0=4bpp, 1=8bpp */
-    int screen_size = (bgcnt >> 14) & 0x3;
+    u32 by = (vofs + (u32)y) % h_px;
+    u32 ty = by >> 3, py = by & 7;
+    for (int x = 0; x < GBA_WIDTH; x++) {
+        u32 bx = (hofs + (u32)x) % w_px;
+        u32 tx = bx >> 3, px = bx & 7;
+        /* 32x32-tile screen blocks: SC0 SC1 side by side, SC2 SC3 below */
+        u32 block = (tx >> 5) + ((ty >> 5) * ((size & 1) ? 2 : 1));
+        u16 e = vram_read16(screen_base + block * 0x800 + ((ty & 31) * 32 + (tx & 31)) * 2);
+        u32 fx = (e & 0x400) ? 7 - px : px, fy = (e & 0x800) ? 7 - py : py;
+        u32 tile = e & 0x3FF;
+        u8 ci;
+        if (bpp8) {
+            ci = vram_read8(char_base + tile * 64 + fy * 8 + fx);
+            if (ci) plot(x, pal_read16((u32)ci * 2), (u8)bg, 0);
+        } else {
+            u8 b = vram_read8(char_base + tile * 32 + fy * 4 + fx / 2);
+            ci = (fx & 1) ? (b >> 4) : (b & 15);
+            if (ci) plot(x, pal_read16((u32)(((e >> 12) & 15) * 16 + ci) * 2), (u8)bg, 0);
+        }
+    }
+}
 
-    /*
-     * Screen sizes for regular BG:
-     *   0 = 256x256 (32x32 tiles, 1 screen)
-     *   1 = 512x256 (64x32 tiles, 2 screens horizontal)
-     *   2 = 256x512 (32x64 tiles, 2 screens vertical)
-     *   3 = 512x512 (64x64 tiles, 4 screens)
-     */
-    int map_w_tiles = (screen_size & 1) ? 64 : 32;
-    int map_h_tiles = (screen_size & 2) ? 64 : 32;
-    int map_w_px = map_w_tiles * 8;
-    int map_h_px = map_h_tiles * 8;
+/* Affine background (BG2 in modes 1-2, BG3 in mode 2). The internal
+ * reference point is latched at the start of the frame and whenever the game
+ * writes BGxX/BGxY, then advanced by PB/PD each line, as on hardware. */
+static s32 s_aff_x[2], s_aff_y[2];
+static u32 s_aff_raw_x[2], s_aff_raw_y[2];
 
-    for (int sy = 0; sy < GBA_HEIGHT; sy++) {
-        for (int sx = 0; sx < GBA_WIDTH; sx++) {
-            /* Apply scroll and wrap */
-            int bx = ((int)hofs + sx) % map_w_px;
-            int by = ((int)vofs + sy) % map_h_px;
-            if (bx < 0) bx += map_w_px;
-            if (by < 0) by += map_h_px;
+static s32 sext28(u32 v) { return (s32)(v << 4) >> 4; }
 
-            /* Determine which tile in the map */
-            int tile_x = bx / 8;
-            int tile_y = by / 8;
+static void affine_latch(int i, int force) {
+    u32 base = 0x028 + (u32)i * 0x10;   /* BG2X at 0x028, BG3X at 0x038 */
+    u32 rx = io_read16((u16)base) | ((u32)io_read16((u16)(base + 2)) << 16);
+    u32 ry = io_read16((u16)(base + 4)) | ((u32)io_read16((u16)(base + 6)) << 16);
+    if (force || rx != s_aff_raw_x[i]) { s_aff_raw_x[i] = rx; s_aff_x[i] = sext28(rx); }
+    if (force || ry != s_aff_raw_y[i]) { s_aff_raw_y[i] = ry; s_aff_y[i] = sext28(ry); }
+}
 
-            /* Pixel within the tile */
-            int px = bx & 7;
-            int py = by & 7;
+static void line_affine_bg(int bg, int y) {
+    int i = bg - 2;
+    u32 base = 0x020 + (u32)i * 0x10;   /* BG2PA at 0x020 */
+    s32 pa = (s16)io_read16((u16)base), pb = (s16)io_read16((u16)(base + 2));
+    s32 pc = (s16)io_read16((u16)(base + 4)), pd = (s16)io_read16((u16)(base + 6));
+    u16 bgcnt = io_read16((u16)(REG_BG0CNT + bg * 2));
+    u32 char_base = (u32)((bgcnt >> 2) & 3) * 0x4000;
+    u32 screen_base = (u32)((bgcnt >> 8) & 0x1F) * 0x800;
+    s32 size = 128 << ((bgcnt >> 14) & 3);
+    int wrap = (bgcnt >> 13) & 1;
+    (void)y;
 
-            /*
-             * Screen block addressing for >32x32 maps:
-             * The 32x32 screens are laid out in memory as:
-             *   screen_size 0: [SC0]
-             *   screen_size 1: [SC0][SC1]          (side by side)
-             *   screen_size 2: [SC0]
-             *                  [SC1]               (stacked)
-             *   screen_size 3: [SC0][SC1]
-             *                  [SC2][SC3]
-             */
-            u32 map_addr = screen_base;
-            int local_tx = tile_x;
-            int local_ty = tile_y;
+    affine_latch(i, 0);
+    s32 cx = s_aff_x[i], cy = s_aff_y[i];
+    for (int x = 0; x < GBA_WIDTH; x++, cx += pa, cy += pc) {
+        s32 tx = cx >> 8, ty = cy >> 8;
+        if (wrap) { tx &= size - 1; ty &= size - 1; }
+        else if (tx < 0 || ty < 0 || tx >= size || ty >= size) continue;
+        u8 tile = vram_read8(screen_base + (u32)((ty >> 3) * (size >> 3) + (tx >> 3)));
+        u8 ci = vram_read8(char_base + (u32)tile * 64 + (u32)((ty & 7) * 8 + (tx & 7)));
+        if (ci) plot(x, pal_read16((u32)ci * 2), (u8)bg, 0);
+    }
+    s_aff_x[i] += pb;
+    s_aff_y[i] += pd;
+}
 
-            if (tile_x >= 32) {
-                map_addr += 0x800; /* next screen block horizontally */
-                local_tx -= 32;
+/* Sprites of one priority on line y (regular sprites; affine ones skipped) */
+static void line_objs(int y, u16 dispcnt, int prio) {
+    if (!(dispcnt & 0x1000)) return;
+    int mapping_1d = (dispcnt >> 6) & 1;
+    int bitmap_mode = (dispcnt & 7) >= 3;
+    for (int i = 127; i >= 0; i--) {   /* lower OAM index ends on top */
+        u32 o = (u32)i * 8;
+        u16 a0 = (u16)(oam[o] | (oam[o + 1] << 8));
+        u16 a1 = (u16)(oam[o + 2] | (oam[o + 3] << 8));
+        u16 a2 = (u16)(oam[o + 4] | (oam[o + 5] << 8));
+        int mode = (a0 >> 10) & 3;
+        if (mode >= 2) continue;                    /* OBJ window / forbidden */
+        if (a0 & 0x100) continue;                   /* affine: not drawn yet */
+        if (a0 & 0x200) continue;                   /* disabled */
+        if (((a2 >> 10) & 3) != prio) continue;
+        int shape = a0 >> 14, size = a1 >> 14;
+        if (shape > 2) continue;
+        int w = obj_width[shape][size], h = obj_height[shape][size];
+        int oy = a0 & 0xFF, ox = a1 & 0x1FF;
+        if (ox >= 240) ox -= 512;
+        int py = (y - oy) & 0xFF;                   /* Y wraps at 256 */
+        if (py >= h) continue;
+        u32 tile_idx = a2 & 0x3FF;
+        if (bitmap_mode && tile_idx < 512) continue; /* lower OBJ VRAM is the bitmap */
+        int bpp8 = (a0 >> 13) & 1, pal = a2 >> 12;
+        int fy = (a1 & 0x2000) ? h - 1 - py : py;
+        for (int px = 0; px < w; px++) {
+            int sx = ox + px;
+            if (sx < 0 || sx >= GBA_WIDTH) continue;
+            int fx = (a1 & 0x1000) ? w - 1 - px : px;
+            u32 tx = (u32)fx >> 3, ty = (u32)fy >> 3;
+            u32 tn = mapping_1d ? tile_idx + (ty * (u32)(w >> 3) + tx) * (bpp8 ? 2 : 1)
+                                : tile_idx + ty * 32 + tx * (bpp8 ? 2 : 1);
+            u32 addr = 0x10000 + (tn & 0x3FF) * 32;
+            u8 ci;
+            if (bpp8) ci = vram_read8(addr + (u32)((fy & 7) * 8 + (fx & 7)));
+            else {
+                u8 b = vram_read8(addr + (u32)((fy & 7) * 4 + (fx & 7) / 2));
+                ci = (fx & 1) ? (b >> 4) : (b & 15);
             }
-            if (tile_y >= 32) {
-                /* If width is 64 tiles, vertical offset skips 2 screen blocks */
-                map_addr += (screen_size & 1) ? 0x1000 : 0x800;
-                local_ty -= 32;
-            }
-
-            u32 entry_addr = map_addr + (u32)(local_ty * 32 + local_tx) * 2;
-            u16 entry = vram_read16(entry_addr);
-
-            u16 tile_idx = entry & 0x03FF;
-            int hflip    = (entry >> 10) & 1;
-            int vflip    = (entry >> 11) & 1;
-            int pal_num  = (entry >> 12) & 0xF;
-
-            /* Apply flip */
-            int fx = hflip ? (7 - px) : px;
-            int fy = vflip ? (7 - py) : py;
-
-            u8 color_idx;
-            if (bpp8) {
-                /* 8bpp: each tile is 64 bytes */
-                u32 tile_addr = char_base + (u32)tile_idx * 64;
-                color_idx = vram_read8(tile_addr + (u32)(fy * 8 + fx));
-            } else {
-                /* 4bpp: each tile is 32 bytes, 2 pixels per byte */
-                u32 tile_addr = char_base + (u32)tile_idx * 32;
-                u8 byte = vram_read8(tile_addr + (u32)(fy * 4 + fx / 2));
-                color_idx = (fx & 1) ? (byte >> 4) : (byte & 0x0F);
-            }
-
-            /* Color index 0 is transparent for BG layers > 0 or OBJ overlay */
-            if (color_idx == 0)
-                continue;
-
-            u16 pal_color;
-            if (bpp8) {
-                pal_color = pal_read16((u32)color_idx * 2);
-            } else {
-                pal_color = pal_read16((u32)(pal_num * 16 + color_idx) * 2);
-            }
-
-            s_framebuf[sy * GBA_WIDTH + sx] = gba_to_argb(pal_color);
+            if (!ci) continue;
+            u16 c = bpp8 ? pal_read16(0x200 + (u32)ci * 2) : pal_read16(0x200 + (u32)(pal * 16 + ci) * 2);
+            plot(sx, c, 4, mode == 1);
         }
     }
 }
@@ -480,60 +503,6 @@ int display_init(void) {
 void display_render_frame(void) {
     if (!io_regs || !vram || !palette || !oam)
         return;
-
-    u16 dispcnt = io_read16(REG_DISPCNT);
-    int mode = dispcnt & 0x07;
-
-    /* Clear framebuffer to backdrop color (palette entry 0) */
-    {
-        u16 backdrop = pal_read16(0);
-        u32 bg_color = gba_to_argb(backdrop);
-        for (int i = 0; i < GBA_WIDTH * GBA_HEIGHT; i++)
-            s_framebuf[i] = bg_color;
-    }
-
-    switch (mode) {
-    case 0:
-        /* Mode 0: 4 regular tiled BG layers.
-         * Render back-to-front by priority. BG3 is often lowest priority. */
-        /* Simple approach: render BG3, BG2, BG1, BG0 in that order.
-         * A fully correct implementation would sort by BGCNT priority bits,
-         * but this ordering covers most games. */
-        render_bg_mode0(3, dispcnt);
-        render_bg_mode0(2, dispcnt);
-        render_bg_mode0(1, dispcnt);
-        render_bg_mode0(0, dispcnt);
-        break;
-
-    case 3:
-        render_mode3();
-        break;
-
-    case 4:
-        render_mode4(dispcnt);
-        break;
-
-    case 1:
-        /* Mode 1: BG0, BG1 regular tiled; BG2 affine (stub as regular) */
-        render_bg_mode0(2, dispcnt);
-        render_bg_mode0(1, dispcnt);
-        render_bg_mode0(0, dispcnt);
-        break;
-
-    case 2:
-        /* Mode 2: BG2, BG3 affine only - stub */
-        break;
-
-    case 5:
-        /* Mode 5: 160x128 bitmap, 16bpp, 2 pages - stub */
-        break;
-
-    default:
-        break;
-    }
-
-    /* Render sprites on top */
-    render_objs(dispcnt);
 
     s_frame_no++;
     input_script_step();
