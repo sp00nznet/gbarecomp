@@ -54,10 +54,23 @@ static bool queue_empty(const AnalysisCtx* ctx) {
     return ctx->queue_head == ctx->queue_tail;
 }
 
+/* A call into code already analyzed as part of something else (often a bogus
+ * function decoded from the bytes just before it, or a shared tail such as
+ * _call_via_r3): the callee still needs its own entry, or the call becomes an
+ * empty stub. Registered after Phase 6, like Phase 4b's pointers, so Phase 7
+ * splits the host block and gives it its own copy. Bit 0 = Thumb. */
+static void late_entry(AnalysisCtx* ctx, u32 addr, CodeType mode) {
+    GROW(ctx->late_entries, ctx->num_late_entries, ctx->cap_late_entries, u32);
+    ctx->late_entries[ctx->num_late_entries++] = addr | (mode == CODE_THUMB ? 1u : 0u);
+}
+
 static void queue_push_ex(AnalysisCtx* ctx, u32 addr, CodeType mode, u32 caller, bool is_call, u32 parent_func) {
-    /* Don't queue already-visited addresses */
-    if (is_visited(ctx, addr)) return;
     if (!addr_in_rom(ctx, addr)) return;
+    /* Don't queue already-visited addresses */
+    if (is_visited(ctx, addr)) {
+        if (is_call) late_entry(ctx, addr, mode);
+        return;
+    }
 
     /* Circular buffer growth */
     int next = (ctx->queue_tail + 1) % ctx->queue_cap;
@@ -634,8 +647,11 @@ static void analyze_thumb_block(AnalysisCtx* ctx, u32 start, Function* func) {
 /* ---- Main analysis loop ---- */
 
 static void process_work_item(AnalysisCtx* ctx, WorkItem* item) {
-    if (is_visited(ctx, item->addr)) return;
     if (!addr_in_rom(ctx, item->addr)) return;
+    if (is_visited(ctx, item->addr)) {   /* became visited while queued */
+        if (item->is_call) late_entry(ctx, item->addr, item->mode);
+        return;
+    }
 
     /* If this is a call target, register it as a function */
     Function* func = NULL;
@@ -893,6 +909,11 @@ static void resolve_bx_targets(AnalysisCtx* ctx) {
 
 /* ---- Sort blocks by address ---- */
 
+static int u32_cmp(const void* a, const void* b) {
+    u32 x = *(const u32*)a, y = *(const u32*)b;
+    return (x > y) - (x < y);
+}
+
 static int block_cmp(const void* a, const void* b) {
     const BasicBlock* ba = (const BasicBlock*)a;
     const BasicBlock* bb = (const BasicBlock*)b;
@@ -1103,8 +1124,7 @@ void analysis_run(AnalysisCtx* ctx) {
                 /* Inside code already analyzed: registered after Phase 6, so
                  * it gets its own copy of the blocks (Phase 7) instead of
                  * splitting its host function (or a loop) into tail calls */
-                GROW(ctx->late_entries, ctx->num_late_entries, ctx->cap_late_entries, u32);
-                ctx->late_entries[ctx->num_late_entries++] = target;
+                late_entry(ctx, target, CODE_THUMB);
             } else if (kind == CODE_UNKNOWN && thumb_follows_function_end(ctx, target)) {
                 /* Unanalyzed leaf functions (no PUSH prologue, so Phase 4
                  * misses them) sitting right after another function's end */
@@ -1332,13 +1352,18 @@ void analysis_run(AnalysisCtx* ctx) {
         printf("[analysis] Merged %d blocks in single pass\n", merged);
     }
 
-    /* Late entries from Phase 4b: now that Phase 6 has settled who owns
-     * what, each becomes an (empty) function for Phase 7 to fill */
+    /* Late entries (Phase 4b pointers, calls into analyzed code; bit 0 =
+     * Thumb): now that Phase 6 has settled who owns what, each becomes an
+     * (empty) function for Phase 7 to fill. Sorted first: calls repeat. */
     {
         int before = ctx->num_functions;
-        for (int i = 0; i < ctx->num_late_entries; i++)
-            add_function(ctx, ctx->late_entries[i], CODE_THUMB);
-        printf("[analysis] %d entries from code pointers into existing code\n",
+        qsort(ctx->late_entries, (size_t)ctx->num_late_entries, sizeof(u32), u32_cmp);
+        for (int i = 0; i < ctx->num_late_entries; i++) {
+            u32 e = ctx->late_entries[i];
+            if (i > 0 && e == ctx->late_entries[i - 1]) continue;
+            add_function(ctx, e & ~1u, (e & 1) ? CODE_THUMB : CODE_ARM);
+        }
+        printf("[analysis] %d entries from code pointers and calls into existing code\n",
                ctx->num_functions - before);
     }
 
