@@ -1,157 +1,121 @@
 # gbarecomp
 
-**The first static recompilation toolkit for Game Boy Advance ROMs.**
+A static recompiler for Game Boy Advance ROMs. It reads a ROM, finds the ARM
+and Thumb code, translates it to C, and writes a CMake project that builds a
+native executable against a small GBA runtime (memory map, timers, DMA,
+interrupts, BIOS calls, PPU, input) with SDL2 for the window. No emulator runs
+underneath: the recompiled C is the CPU.
+
+Part of the recomp family (snesrecomp, lynxrecomp, xboxrecomp, ps3recomp,
+pcrecomp, ...) and follows the same house style: toolkit and game repos kept
+apart, generated code never committed, `--headless --record` on every build, a
+conformance harness against a reference.
+
+## Status
+
+**Alpha.** One title is in progress: [Advance Wars](https://github.com/sp00nznet/advancewars).
+
+| Title | Boots | Intro | Title screen | Menus | Gameplay | Conformance |
+|---|---|---|---|---|---|---|
+| Advance Wars (USA, Rev 1) | yes | full attract loop | reached, memory matches mGBA | no (falls back to attract) | no | 154/158 functions |
+
+The conformance figure is lockstep validation: each recompiled function's
+first calls run natively and in the interpreter from the same state and are
+compared ([docs/conformance.md](docs/conformance.md)). The four failures are
+known interpreter limitations, not native bugs.
+
+Missing: audio output, affine/blend/window effects in the PPU, and the
+remaining control-flow cases listed in [ROADMAP.md](ROADMAP.md).
+
+## Screenshots
+
+Advance Wars' attract intro, recompiled, captured with `--headless --screenshot`:
+
+![Advance Wars intro: map, Max, the battle scene and the logo](docs/screenshots/advance-wars-intro.png)
+
+## Getting Started
+
+The toolkit is used from a game repo; the game repo's `Setup.cmd` is the quick
+start (it fetches this repo as a submodule, asks for your ROM and builds). To
+use the toolkit directly:
+
+1. Install Visual Studio 2022 (or its Build Tools) with *Desktop development
+   with C++*, CMake 3.16+, and SDL2 through vcpkg:
+   ```
+   vcpkg install sdl2:x64-windows
+   ```
+2. Build the recompiler:
+   ```
+   cmake -B build -G "Visual Studio 17 2022" -A x64
+   cmake --build build --config Release
+   ```
+3. Translate a ROM you own. Run it from the toolkit folder, because it copies
+   the runtime sources (`src/runtime.c`, `src/display.c`, `include/gba/*.h`)
+   into the output by relative path:
+   ```
+   build\Release\gbarecomp.exe translate game.gba -o out --multi --entries entries.txt
+   ```
+   Expected tail of the output:
+   ```
+   [analysis] Pass 1: 456 new entries from code pointers (1488 analyzed fresh)
+   ...
+   Generated 78 files in: out
+   Functions translated: 7381
+   ```
+4. Build and run the generated project:
+   ```
+   cmake -S out -B out/b -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
+   cmake --build out/b --config Release --parallel
+   out\b\Release\AWRE.exe game.gba --headless --frames 600 --screenshot f600.bmp
+   ```
+   Copy `SDL2.dll` from `<vcpkg>/installed/x64-windows/bin` next to the exe.
+
+The output directory is generated from your ROM and is never committed or
+distributed (see Legal).
+
+## Usage
 
 ```
-   ██████╗ ██████╗  █████╗     ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ███╗██████╗
-  ██╔════╝ ██╔══██╗██╔══██╗    ██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗ ████║██╔══██╗
-  ██║  ███╗██████╔╝███████║    ██████╔╝█████╗  ██║     ██║   ██║██╔████╔██║██████╔╝
-  ██║   ██║██╔══██╗██╔══██║    ██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╔╝██║██╔═══╝
-  ╚██████╔╝██████╔╝██║  ██║    ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚═╝ ██║██║
-   ╚═════╝ ╚═════╝ ╚═╝  ╚═╝    ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝╚═╝     ╚═╝╚═╝
+gbarecomp info <rom.gba>                         ROM header
+gbarecomp disasm <rom.gba> [--start A --count N --thumb|--arm]
+gbarecomp analyze <rom.gba> [--functions] [--detail A] [--entries file]
+gbarecomp translate <rom.gba> -o <dir> --multi [--entries file]
 ```
 
-> **True static recompilation.** No emulator runs underneath. The recompiled C code IS the CPU. Memory is flat arrays, hardware is lightweight C modules, and the only runtime dependency is SDL2 for display.
+`--entries` takes the title's extra entry points, one hex address per line
+(`#` comments). Most titles need few or none: analysis finds jump tables,
+code pointers in ROM data and prologue-less leaf functions on its own
+([docs/analysis.md](docs/analysis.md)).
 
-## How It Works
+Every generated game takes the runtime flags in [docs/headless.md](docs/headless.md):
+`--headless`, `--record out.mp4`, `--frames N`, `--screenshot`, `--input`,
+`--log-every`, `--dump-at`, and the `GBA_VALIDATE`, `GBA_FUNC_TRACE`,
+`GBA_TRACE_INTERP` diagnostics.
 
-```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────────┐
-│  GBA ROM     │────>│  Analyze      │────>│  Translate   │────>│  C Source     │
-│  (.gba)      │     │  ARM + Thumb  │     │  to C code   │     │  (.c/.h)      │
-└─────────────┘     └──────────────┘     └─────────────┘     └──────┬───────┘
-                                                                     │
-                    ┌──────────────┐     ┌─────────────┐            │
-                    │  Native bin   │<────│  Compile     │<───────────┘
-                    │  (.exe/ELF)   │     │  gcc/clang   │     + Standalone
-                    └──────────────┘     └─────────────┘       GBA Runtime
-```
+## Building from source
 
-1. **Analysis** -- Recursive descent CFG with 7-phase pipeline: function discovery, prologue scanning, BX resolution, jump tables, block splitting, connected-component merging (single-pass O(n) with ownership map), and mid-function entry fixup. Discovers 6,300+ functions in Advance Wars.
-2. **Translation** -- Every ARM/Thumb instruction converted to C. Multi-file output (63+ source files) for parallel compilation. BL/SWI continuations properly merged.
-3. **Standalone Runtime** -- Pure C implementation of GBA hardware: flat memory arrays, 4 hardware timers with cascade, DMA with VBlank/HBlank triggers, scanline-based scheduler, interrupt delivery, full BIOS HLE (Div, Sqrt, CpuSet, LZ77, RLE, BitUnPack, ArcTan, IntrWait, etc.)
-4. **Interpreters** -- Built-in ARM and Thumb interpreters handle RAM code (IWRAM/EWRAM routines copied at runtime by the game's crt0)
-5. **Display** -- SDL2 renderer with Mode 0/1/3/4 tiled and bitmap backgrounds, OBJ sprites, palette, 60fps
-
-## Current Status
-
-**Architecture: Standalone static recomp (no emulator)**
-
-| Component | Implementation |
-|-----------|---------------|
-| CPU | Recompiled C (6,304 functions for Advance Wars) |
-| Memory | Flat arrays (EWRAM 256KB, IWRAM 32KB, VRAM 96KB, etc.) |
-| Bus | Direct array access with I/O dispatch |
-| Timers | 4 hardware timers, prescaler, cascade |
-| DMA | 4 channels, immediate/VBlank/HBlank/repeat |
-| Interrupts | IE/IF/IME with handler dispatch via cpu_bx |
-| BIOS | Full HLE: 20+ SWI implementations |
-| PPU | Frame-based renderer (Mode 0/1/3/4, BG, OBJ) |
-| Input | SDL2 keyboard |
-| Save | SRAM + EEPROM_V (8KB) auto-load/save (.sav files) |
-| SIO | Minimal multiplayer transfer simulation; SIOMULTI default 0xFFFF (no cable) |
-| RAM code | ARM + Thumb interpreters for IWRAM/EWRAM + ROM fallback |
-| SoftReset | longjmp-based restart |
-| Translator | Trap stubs for non-ROM call targets; /O1+/MP; runtime auto-copied |
-
-**Advance Wars test game:**
-- 7.3MB standalone executable (SDL2 only dependency)
-- Game init chain completes: all init sub-functions execute, interrupts enabled (IE=0x2001, IME=1)
-- Main game loop running (label_0803880A with VBlank-synced frame callback)
-- IRQ handler at 0x03000718 dispatches to recompiled ROM functions
-- Frames render at 60fps, BIOS calls work (CpuSet, CpuFastSet, IntrWait)
-- Sound engine initializes and runs
-- Missing dispatch entries handled via interpreter fallback (transparent to game code)
-
-**Known issues being worked:**
-- Display still in forced blank (DISPCNT=0x0080) during early init frames -- game needs more init time or has remaining mid-function entry gaps
-- Some functions interpreted instead of dispatched (performance, not correctness)
-- Register comparison verifier has found and fixed several translator bugs
-- Audio engine: stubs only; no mixer / FIFO playback yet
-- Affine BG (Mode 1/2) partial; HBlank-per-line BG2X/Y effects not yet driven by a test ROM
-
-**Next target: Pokémon FireRed (Flash 128KB)**
-
-Picked to drive Flash save support, which the runtime currently lacks. FireRed uses `FLASH1M_V103` -- the larger variant that requires bank switching and the full Atmel/Sanyo/Macronix command sequence. No RTC, no sensors, and the `pret/pokefirered` decomp gives ground-truth C for any function the recompiler mistranslates. Plan: detect Flash by ROM signature, implement command state machine at `0x0E000000-0x0E00FFFF`, back it with a 128KB `.sav`, then bring up FireRed and chase init blockers.
-
-## Bugs Found and Fixed
-
-The register comparison verifier (runs functions through both recompiled C and Thumb interpreter, compares register output) has found several real bugs:
-
-| Bug | Impact | Fix |
-|-----|--------|-----|
-| Thumb Format 2/Format 1 encoding overlap | ADD/SUB instructions silently skipped by interpreter | Check Format 2 before Format 1 |
-| BL continuation blocks split into separate functions | Post-call code unreachable (func_080386E4 had 2 blocks instead of 24) | Single-pass Phase 6 merge with ownership map |
-| SWI continuation blocks split | RegisterRamReset + SoftReset in separate functions | Merge SWI successors in Phase 6 |
-| Phase 6 merge O(n^3) with duplicate block explosion | 890K "merges" across 20 passes, most duplicates | Rewrite to single-pass O(n) with block ownership tracking |
-| Empty functions from mid-function BX targets | cpu_bx dispatches to empty stubs, skipping real code | Phase 7: detect and populate mid-function entries |
-| POP {rN}; BX rN causes double execution | Continuation code runs via cpu_bx AND via C-level label | Detect POP+BX return pattern, emit `return` instead |
-| Interpreter exits on BX-to-ROM | IRQ handler can't call ROM functions, gets stuck | Interpreter calls cpu_bx for ROM targets and continues |
-| VBlank/HBlank IF flags gated behind DISPSTAT | Interrupts never fire if DISPSTAT IRQ enable not set | Set IF unconditionally |
-| ARM MSR/MRS decoded as data-processing | CPSR control writes silently dropped | Check MSR/MRS encoding before data-processing in interpreter |
-| ARM data-processing check ate halfword/multiply encodings | LDRH/STRH/MUL silently mis-decoded | Tighten data-processing mask to exclude halfword/multiply encoding space |
-| Thumb MOV/ADD pc, rN fell through instead of branching | Tail-call/computed-branch idioms ran straight into next block | Emit branch in translator when destination register is PC |
-| cpu_bx to unknown ROM target | Generated code aborted | Fall back to interpreter for ROM targets not in dispatch table |
-| ARM BX to unmapped address | Silent corruption | Bail with diagnostic; dump state on step-limit hit |
-| SIOMULTI registers read as 0x0000 (active link) | Games hung waiting for nonexistent peer | Init SIOMULTI[0..3] = 0xFFFF; minimal transfer simulation |
-
-## Quick Start
-
-```bash
-# Build the recompiler
-cd gbarecomp
-cmake -B build && cmake --build build --config Release
-
-# Analyze a ROM
-./build/gbarecomp info game.gba
-./build/gbarecomp analyze game.gba --functions
-
-# Generate C source (multi-file)
-./build/gbarecomp translate game.gba -o output/ --multi
-
-# Build the game (requires SDL2 via vcpkg)
-cd output/
-cmake -B build -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build --config Release
-
-# Run it
-./build/Release/GAME game.gba
-```
-
-## Architecture
-
-The generated executable is completely standalone:
+As in Getting Started. The optional reference runner needs a built
+[mGBA](https://github.com/mgba-emu/mgba) checkout:
 
 ```
-main()
-  └─ gba_run(game_entry)       ← setjmp for SoftReset
-       └─ game_entry()          ← calls recompiled crt0
-            └─ func_080000C0()  ← ARM crt0: set SP, BX to main
-                 └─ cpu_bx()    ← dispatches to recompiled functions
-                      ├─ func_XXXXXXXX()  ← recompiled game code
-                      │    ├─ bus_read32()  → flat memory arrays
-                      │    ├─ bus_write16() → I/O dispatch (DMA/timer/IRQ)
-                      │    └─ gba_swi()     → BIOS HLE
-                      └─ run_iwram_function() ← ARM/Thumb interpreter for RAM code
+cmake -S tools/oracle -B build-oracle -DMGBA_DIR=<mgba>
+cmake --build build-oracle --config Release
 ```
 
-No emulator. No interpreter loop. The recompiled C code drives everything.
+## Documentation
 
-## Standing on the Shoulders of Giants
-
-### Static Recompilation Pioneers
-- **[N64Recomp](https://github.com/N64Recomp/N64Recomp)** -- Proved static recompilation of console games is practical. The architectural inspiration.
-- **[gb-recompiled](https://github.com/arcanite24/gb-recompiled)** -- Static recompiler for original Game Boy.
-
-### References
-- **[GBATEK](https://problemkaputt.de/gbatek.htm)** -- Martin Korth's GBA technical reference
-- **[mGBA](https://github.com/mgba-emu/mgba)** -- Excellent GBA emulator (used in early prototype, now replaced by standalone runtime)
-- **[pret](https://pret.github.io/)** -- GBA decompilation community
+- [docs/analysis.md](docs/analysis.md): analysis phases and the translation
+  pitfalls found on real code (jump tables, returns, block transfers, compile time).
+- [docs/headless.md](docs/headless.md): runtime flags, input scripts, diagnostics.
+- [docs/conformance.md](docs/conformance.md): lockstep validation and the mGBA reference.
 
 ## Legal
 
-`gbarecomp` does not include or distribute any copyrighted game data. Users must provide their own legally obtained ROM files.
+gbarecomp contains no game data and its output is never distributed: you
+supply your own ROM and the generated C stays on your machine. No BIOS image is
+needed or used; BIOS calls are reimplemented in `src/runtime.c`. mGBA is used
+only as an optional, separately built reference tool.
 
----
+## License
 
-*Built with Claude Code. True static recompilation -- no emulator underneath.*
+MIT, see [LICENSE](LICENSE).

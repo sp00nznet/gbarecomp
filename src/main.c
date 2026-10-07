@@ -25,6 +25,25 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --detail <addr>   Show detailed disassembly of a function\n");
     fprintf(stderr, "\nTranslate options:\n");
     fprintf(stderr, "  -o <file>         Output C file path (required)\n");
+    fprintf(stderr, "  --multi           Write a buildable multi-file project into -o <dir>\n");
+    fprintf(stderr, "\nAnalyze/translate options:\n");
+    fprintf(stderr, "  --entries <file>  Extra entry points, one hex address per line\n");
+}
+
+/* --entries <file>: the title's extra entry points (any command that analyzes) */
+static const char* g_entries_path = NULL;
+
+static AnalysisCtx* create_analysis(const GbaRom* rom) {
+    AnalysisCtx* ctx = analysis_create(rom);
+    if (g_entries_path) {
+        int n = analysis_load_entries(ctx, g_entries_path);
+        if (n < 0) {
+            fprintf(stderr, "Error: cannot read entries file '%s'\n", g_entries_path);
+            exit(1);
+        }
+        printf("Loaded %d extra entry points from %s\n", n, g_entries_path);
+    }
+    return ctx;
 }
 
 static u32 parse_hex(const char* s) {
@@ -125,7 +144,7 @@ static int cmd_analyze(const char* rom_path, int argc, char* argv[]) {
 
     rom_print_info(rom);
 
-    AnalysisCtx* ctx = analysis_create(rom);
+    AnalysisCtx* ctx = create_analysis(rom);
     analysis_run(ctx);
     analysis_print_summary(ctx);
 
@@ -173,7 +192,7 @@ static int cmd_translate(const char* rom_path, int argc, char* argv[]) {
 
     /* Analyze */
     printf("\n--- Analysis Phase ---\n");
-    AnalysisCtx* analysis = analysis_create(rom);
+    AnalysisCtx* analysis = create_analysis(rom);
     analysis_run(analysis);
     analysis_print_summary(analysis);
 
@@ -217,10 +236,14 @@ static int cmd_translate(const char* rom_path, int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
+    setvbuf(stdout, NULL, _IONBF, 0); /* progress survives a crash */
     if (argc < 3) {
         print_usage(argv[0]);
         return 1;
     }
+
+    for (int i = 3; i + 1 < argc; i++)
+        if (strcmp(argv[i], "--entries") == 0) g_entries_path = argv[i + 1];
 
     const char* command = argv[1];
     const char* rom_path = argv[2];
