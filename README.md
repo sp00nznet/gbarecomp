@@ -17,7 +17,7 @@ conformance harness against a reference.
 
 | Title | Boots | Intro | Title screen | Menus | Gameplay | Conformance |
 |---|---|---|---|---|---|---|
-| Advance Wars (USA, Rev 1) | yes | full attract loop | yes | yes, matches mGBA screen for screen | Field Training won (three days, results screen rank A, save), in step with mGBA | 138/138 functions |
+| Advance Wars (USA, Rev 1) | yes | full attract loop | yes | yes, matches mGBA screen for screen | Field Training won (three days, results screen rank A, save), in step with mGBA (boot to the frame, within 4 frames after) | 165/165 functions |
 | LttP + Four Swords (USA) | yes | - | yes | no (blanks where mGBA goes to file select) | no | - |
 
 The conformance figure is lockstep validation: each recompiled function's
