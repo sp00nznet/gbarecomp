@@ -28,8 +28,17 @@
 #include <stdarg.h>
 #include <fcntl.h>
 
+/* ORACLE_SWI=from,to: log each SWI in those frames with its scanline, to
+ * line up against the runtime's GBA_SWI_LOG when timing drifts */
+static struct GBA* s_gba;
+static long s_frame, s_swi_from = -1, s_swi_to = -1;
+
 static void quiet_log(struct mLogger* l, int cat, enum mLogLevel lvl, const char* fmt, va_list ap) {
-    (void)l; (void)cat; (void)lvl; (void)fmt; (void)ap;
+    (void)l; (void)cat; (void)lvl;
+    if (s_frame >= s_swi_from && s_frame <= s_swi_to && !strncmp(fmt, "SWI: ", 5)) {
+        unsigned imm = va_arg(ap, unsigned);
+        fprintf(stderr, "SWI %02X f=%ld v=%d\n", imm, s_frame, s_gba->video.vcount);
+    }
 }
 
 static void dump(struct GBA* gba, const char* path) {
@@ -77,6 +86,11 @@ int main(int argc, char* argv[]) {
     core->loadConfig(core, &core->config);
     core->reset(core);
     struct GBA* gba = core->board;
+    s_gba = gba;
+    {
+        const char* e = getenv("ORACLE_SWI");
+        if (e) sscanf(e, "%ld,%ld", &s_swi_from, &s_swi_to);
+    }
 
     FILE* in = input ? fopen(input, "r") : NULL;
     long next_frame = -1; unsigned next_keys = 0, keys = 0;
@@ -94,6 +108,7 @@ int main(int argc, char* argv[]) {
             keys = next_keys; next_frame = -1;
         }
         core->setKeys(core, keys);
+        s_frame = f;
         core->runFrame(core);
         if (f <= 5 || (log_every && f % log_every == 0)) {
             uint16_t* io = gba->memory.io;

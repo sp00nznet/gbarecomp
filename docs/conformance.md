@@ -67,6 +67,10 @@ py -3 tools/memdiff.py o615.bin r615.bin
 
 Notes:
 
+- When the two drift apart in time, line up their BIOS calls:
+  `ORACLE_SWI=from,to` on the oracle and `GBA_SWI_LOG=from,to` on the
+  build print each SWI with its frame and scanline. Advance Wars' LZ77
+  decompressions showed where its battle-to-map load ran long.
 - Start both from the same save state. The oracle doesn't load a `.sav`, so
   delete the recompiled build's `.sav` before comparing: a save written by an
   older build sent Advance Wars down a different boot path and looked like a
