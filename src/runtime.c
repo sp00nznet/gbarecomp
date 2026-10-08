@@ -234,7 +234,18 @@ static struct {
     int  stage;          /* 0 idle, 1 got AA, 2 got 55 */
     bool id_mode, erase_armed, write_next, bank_next;
     u32  bank;
+    /* Programming takes time: the written sector reads busy (data bit 7
+     * inverted, "data# polling") for 650 cycles after a byte and 30000
+     * after a sector erase, as in mGBA. Games poll until it settles. */
+    u32  busy_until, busy_sector;
 } flash;
+
+static u32 cycle_counter;   /* defined with the scheduler below */
+
+static void flash_settle(u32 off, u32 cycles) {
+    flash.busy_sector = flash.bank * 16 + (off >> 12);
+    flash.busy_until = cycle_counter + cycles;
+}
 
 static u32 backup_size = 0x10000;
 
@@ -262,7 +273,10 @@ static u8 backup_read8(u32 addr) {
             static const u8 id_small[2] = { 0x32, 0x1B }, id_large[2] = { 0x62, 0x13 };
             return flash.large ? id_large[off] : id_small[off];
         }
-        return sram[flash.bank * 0x10000 + off];
+        u8 v = sram[flash.bank * 0x10000 + off];
+        if ((s32)(flash.busy_until - cycle_counter) > 0 && flash.busy_sector == flash.bank * 16 + (off >> 12))
+            return (v ^ 0x80) & 0x80;
+        return v;
     }
     return sram[off];
 }
@@ -271,7 +285,7 @@ static void backup_write8(u32 addr, u8 val) {
     u32 off = addr & 0xFFFF;
     if (!flash.present) { sram[off] = val; return; }
     u8* base = sram + flash.bank * 0x10000;
-    if (flash.write_next) { base[off] = val; flash.write_next = false; return; }
+    if (flash.write_next) { base[off] = val; flash.write_next = false; flash_settle(off, 650); return; }
     if (flash.bank_next) {
         if (off == 0 && flash.large) flash.bank = val & 1;
         flash.bank_next = false; return;
@@ -282,6 +296,7 @@ static void backup_write8(u32 addr, u8 val) {
         flash.stage = 0;
         if (flash.erase_armed && val == 0x30) {           /* sector erase */
             memset(base + (off & 0xF000), 0xFF, 0x1000);
+            flash_settle(off, 30000);
             flash.erase_armed = false; return;
         }
         if (off != 0x5555) return;
