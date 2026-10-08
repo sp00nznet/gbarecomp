@@ -65,6 +65,27 @@ static void emit(TranslateCtx* ctx, const char* fmt, ...) {
     fprintf(ctx->out, "\n");
 }
 
+/* setjmp, as newlib's ARM one starts: STMIA r0!, {.., lr}, possibly behind
+ * a Thumb BX pc veneer and a B */
+static bool is_setjmp(TranslateCtx* ctx, u32 target) {
+    if (!(target & 1) && rom_read16(ctx->rom, target) == 0x4778)   /* BX pc */
+        target = (target + 4) & ~3u;
+    u32 w = rom_read32(ctx->rom, target);
+    if ((w & 0xFF000000u) == 0xEA000000u)   /* B */
+        w = rom_read32(ctx->rom, target + 8 + (u32)((s32)(w << 8) >> 6));
+    return (w & 0xFFFF4000u) == 0xE8A04000u;
+}
+
+/* After a call: a return to somewhere else unwinds (RECOMP_CALLED), except
+ * a longjmp back to this function's setjmp call, which lands on that
+ * continuation wherever the function is now (all state is in r[]) */
+static void emit_called(TranslateCtx* ctx, u32 retaddr) {
+    if (ctx->setjmp_resume && is_local_label(ctx, ctx->setjmp_resume & ~1u))
+        emit(ctx, "if (!((g_ret ^ 0x%08Xu) & ~1u)) { g_ret = 0; goto label_%08X; } /* longjmp */",
+             ctx->setjmp_resume, ctx->setjmp_resume & ~1u);
+    emit(ctx, "RECOMP_CALLED(0x%08Xu);", retaddr);
+}
+
 static void emit_raw(TranslateCtx* ctx, const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -235,6 +256,12 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
         if (insn->s && insn->rd != REG_PC) {
             emit(ctx, "cpu_update_nz(%s);", reg_c(insn->rd));
         }
+        /* MOV pc, X leaves the block: a return for lr, else a jump that
+         * stays in ARM (newlib's setjmp/longjmp end in MOVEQ pc, lr) */
+        if (insn->rd == REG_PC && !strcmp(op2, "r[14]"))
+            emit(ctx, "RECOMP_RETURN(r[14]); /* MOV pc, lr */");
+        else if (insn->rd == REG_PC)
+            emit(ctx, "cpu_bx(r[15] & ~3u); return; /* MOV pc */");
         end_cond(ctx, insn->cond);
         break;
 
@@ -458,7 +485,7 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
         begin_cond(ctx, insn->cond);
         emit(ctx, "r[14] = 0x%08Xu; /* return address */", addr + 4);
         emit(ctx, "g_ret = 0; func_%08X(); /* BL */", target);
-        emit(ctx, "RECOMP_CALLED(0x%08Xu);", addr + 4);
+        emit_called(ctx, addr + 4);
         end_cond(ctx, insn->cond);
         break;
     }
@@ -470,7 +497,7 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
         } else if (addr >= 4 && rom_read32(ctx->rom, addr - 4) == 0xE1A0E00Fu) {
             /* MOV lr, pc; BX rN: an indirect call that comes back here */
             emit(ctx, "g_ret = 0; cpu_bx(%s); /* call via MOV lr, pc */", reg_c(insn->rm));
-            emit(ctx, "RECOMP_CALLED(0x%08Xu);", addr + 4);
+            emit_called(ctx, addr + 4);
         } else {
             emit(ctx, "cpu_bx(%s); return; /* indirect branch */", reg_c(insn->rm));
         }
@@ -937,7 +964,7 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
             } else if (addr >= 2 && rom_read16(ctx->rom, addr - 2) == 0x46FE) {
                 /* MOV lr, pc; BX rN: an indirect call that comes back here */
                 emit(ctx, "g_ret = 0; cpu_bx(%s); /* call via MOV lr, pc */", reg_c((u8)insn->rs));
-                emit(ctx, "RECOMP_CALLED(0x%08Xu);", addr + 2);
+                emit_called(ctx, addr + 2);
             } else {
                 /* Otherwise BX never falls through: without the return, a call
                  * veneer (_call_via_rN) ran on into the next veneer */
@@ -1235,6 +1262,21 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
     ctx->local_blocks = sorted_blocks;
     ctx->num_local_blocks = nblocks;
 
+    /* A Thumb BL to setjmp: its continuation is where a longjmp resumes */
+    ctx->setjmp_resume = 0;
+    for (int b = 0; b < nblocks && !ctx->setjmp_resume; b++)
+        for (int j = 0; j < ctx->analysis->num_blocks; j++) {
+            const BasicBlock* bb = &ctx->analysis->blocks[j];
+            if (bb->start != sorted_blocks[b]) continue;
+            for (u32 a = bb->start; bb->mode == CODE_THUMB && a + 2 < bb->end; a += 2) {
+                u16 hi = rom_read16(ctx->rom, a), lo = rom_read16(ctx->rom, a + 2);
+                if ((hi & 0xF800) != 0xF000 || (lo & 0xF800) != 0xF800) continue;
+                u32 t = a + 4 + (u32)((s32)((u32)hi << 21) >> 9) + ((lo & 0x7FFu) << 1);
+                if (is_setjmp(ctx, t)) { ctx->setjmp_resume = (a + 4) | 1; break; }
+            }
+            break;
+        }
+
     /* Blocks are emitted in address order, so a function that also owns code
      * below its entry (merged predecessors, Phase 7 copies) must jump to the
      * entry first or it would start running at its lowest block */
@@ -1283,7 +1325,7 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
                         emit_comment(ctx, "0x%08X: %s", addr, disasm_buf);
                         emit(ctx, "r[14] = 0x%08Xu; /* return address */", (addr + 4) | 1);
                         emit(ctx, "g_ret = 0; func_%08X(); /* BL */", bl_target);
-                        emit(ctx, "RECOMP_CALLED(0x%08Xu);", (addr + 4) | 1);
+                        emit_called(ctx, (addr + 4) | 1);
                         addr += 4;
                         continue;
                     }

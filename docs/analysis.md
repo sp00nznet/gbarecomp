@@ -106,6 +106,18 @@ it really goes (`RECOMP_RETURN` sets `g_ret`) and every call site checks it
 too, and the unwind continues to the frame it belongs to. Interrupts save and
 restore `g_ret`, and the interpreter clears it after calling native code.
 
+`longjmp` needs one more step: it goes back to the `setjmp` call's
+continuation, but the function that called `setjmp` has moved on, so the
+unwind meets it at some other call site. A function with a Thumb `BL` to
+setjmp (recognized by its `STMIA r0!, {.., lr}`, through a `BX pc` veneer and
+a `B`) checks after every call whether the return is headed for that
+continuation and jumps there. All CPU state lives in `r[]`, so that `goto` is
+the whole resume. Advance Wars' AI calls `setjmp` (at `0x080643CA`), then
+longjmps back from deep in its search (`0x0806461A`). Its `setjmp` and `longjmp` end in
+`TST lr, #1; MOVEQ pc, lr; BX lr`: a conditional return, which keeps its
+fallthrough in the function (only returns do; other conditional PC writes are
+mostly data decoded as ARM, and following them swamps the output).
+
 ## Functions that run into another function's prologue
 
 m4a's `SoundMain` checks its lock, takes it (`ident++`), and runs straight on

@@ -17,6 +17,9 @@ typedef struct {
     /* Current function's local block addresses (for goto validation) */
     u32* local_blocks;
     int num_local_blocks;
+    /* Continuation of this function's setjmp call (0 = none): a longjmp
+     * comes back there from wherever the function is, see emit_called */
+    u32 setjmp_resume;
 } TranslateCtx;
 
 /* Create a translator context. `out` is the output file to write C code to. */
