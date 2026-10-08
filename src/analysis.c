@@ -304,6 +304,17 @@ static void analyze_arm_block(AnalysisCtx* ctx, u32 start, Function* func) {
                 block->num_successors = 0;
             }
 
+            /* A conditional return (newlib's setjmp: MOVEQ pc, lr; BX lr)
+             * falls through: keep the next instruction in this function.
+             * Only returns: other conditional PC writes are mostly data
+             * decoded as ARM, and following them swamps the output. */
+            if (insn.cond != COND_AL && block->is_return) {
+                block->successors[0] = addr + 4;
+                block->num_successors = 1;
+                queue_push_ex(ctx, addr + 4, CODE_ARM, addr, false,
+                             func ? func->entry : 0);
+            }
+
             if (func) function_add_block(func, block->start);
             return;
         }
