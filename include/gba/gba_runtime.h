@@ -151,10 +151,16 @@ void cpu_set_spsr(u32 value, u32 mask);
 u32 bus_read32(u32 addr);
 u16 bus_read16(u32 addr);
 u8  bus_read8(u32 addr);
+u32 bus_read32s(u32 addr);   /* an LDM/POP's later words: no internal cycle */
 
 void bus_write32(u32 addr, u32 value);
 void bus_write16(u32 addr, u16 value);
 void bus_write8(u32 addr, u8 value);
+
+/* Opcode time the generated code charges at each block start, in 16-bit
+ * fetches (an ARM opcode is two, plus a pipeline refill); data accesses
+ * charge themselves, timed as mGBA does (see runtime.c data_cycles) */
+void cpu_fetches(u32 n);
 
 /* ---- Hardware ---- */
 

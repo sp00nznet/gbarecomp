@@ -448,6 +448,9 @@ static void timer_write_control(int idx, u16 value) {
 
 /* Latched source/destination addresses (reloaded on DMA enable) */
 static u32 dma_src_latch[4] = {0};
+/* Who is on the bus, for timing (see data_cycles) */
+enum { BUS_ROM_CODE, BUS_RAM_CODE, BUS_DMA, BUS_BIOS_HLE };
+static u32 bus_mode = BUS_ROM_CODE;
 static u32 dma_dst_latch[4] = {0};
 
 static void dma_transfer(int channel) {
@@ -467,9 +470,10 @@ static void dma_transfer(int channel) {
     int src_ctrl = (cnt_hi >> 7) & 3;
     u32 size = word ? 4 : 2;
 
+    u32 saved_mode = bus_mode;
+    bus_mode = BUS_DMA;
     for (u32 i = 0; i < count; i++) {
         if (word) {
-            /* Direct memory copy for DMA - bypass bus_read/write cycle counting */
             u32 val = bus_read32(src);
             bus_write32(dst, val);
         } else {
@@ -488,6 +492,7 @@ static void dma_transfer(int channel) {
             case 2: break;
         }
     }
+    bus_mode = saved_mode;
 
     /* Update latched addresses */
     dma_src_latch[channel] = src;
@@ -600,7 +605,10 @@ static void check_interrupts(void) {
      * instructions, so the interrupted code's return tracking is untouched. */
     u32 saved_ret = g_ret;
     g_ret = 0;
+    u32 saved_mode = bus_mode;   /* a handler interrupting DMA or a BIOS call */
+    bus_mode = BUS_ROM_CODE;
     cpu_bx(handler_addr);
+    bus_mode = saved_mode;
     g_ret = saved_ret;
 
     /* Restore game state */
@@ -757,6 +765,68 @@ static void advance_cycles(u32 cycles) {
     }
 }
 
+/* Cycles for one data access, by region, as on hardware: 16-bit buses
+ * (EWRAM, ROM, palette/VRAM) take two accesses for a word. Cartridge waits
+ * come from WAITCNT (WS0 for all ROM mirrors, SRAM from bits 0-1). */
+static u32 access_cycles(u32 addr, int wide) {
+    static const u8 nwait[4] = { 4, 3, 2, 8 };
+    switch (addr >> 24) {
+    case 0x02: return wide ? 6 : 3;
+    case 0x05: case 0x06: return wide ? 2 : 1;
+    case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: {
+        u16 w = io_regs[0x204] | (io_regs[0x205] << 8);
+        u32 n = 1 + nwait[(w >> 2) & 3], s = (w & 0x10) ? 2 : 3;
+        return wide ? n + s : n;
+    }
+    case 0x0E: case 0x0F:
+        return 1 + nwait[(io_regs[0x204] | (io_regs[0x205] << 8)) & 3];
+    default: return 1;   /* BIOS, IWRAM, I/O, OAM */
+    }
+}
+
+/* A data access as mGBA times it (src/gba/memory.c, GBAMemoryStall). Code
+ * running from ROM with the prefetch buffer on (WAITCNT bit 14) overlaps a
+ * RAM or I/O access with prefetching, so it costs nothing beyond the
+ * opcode; a cartridge access (ROM, SRAM) costs its waits, a load's internal
+ * cycle, and the nonsequential fetch after it. The HLE BIOS's loops see the
+ * same overlap without the opcode around it: 2 cycles back per access.
+ * Interpreted RAM code pays the access plus the internal cycle; DMA just
+ * the access. */
+static s32 cycle_credit;
+
+static void charge(s32 c) {
+    c += cycle_credit;
+    cycle_credit = c < 0 ? c : 0;
+    if (c > 0) advance_cycles((u32)c);
+}
+
+static s32 data_cycles(u32 addr, int wide, int load) {
+    bool cart = addr >= 0x08000000u;
+    switch (bus_mode) {
+    case BUS_ROM_CODE:
+        if (!(io_regs[0x205] & 0x40)) return access_cycles(addr, wide) + load + 2;
+        return cart ? (s32)access_cycles(addr, wide) + load + 2 : 0;
+    case BUS_BIOS_HLE:
+        return cart ? (s32)access_cycles(addr, wide) + load : -2;
+    case BUS_RAM_CODE: return access_cycles(addr, wide) + load;
+    default:           return access_cycles(addr, wide);
+    }
+}
+
+/* Opcode time, charged by the generated code at each block start: a 16-bit
+ * fetch is 1 cycle plus the cartridge's sequential wait (an ARM opcode is
+ * two). Taken branches refill the pipeline, about one fetch pair per block
+ * on average. GBA_FETCH_X16 scales it (16 = as modelled) to calibrate
+ * against tools/oracle. */
+void cpu_fetches(u32 n) {
+    static u32 x16, frac;
+    if (!x16) { const char* e = getenv("GBA_FETCH_X16"); x16 = e ? (u32)atoi(e) : 16; }
+    u16 w = io_regs[0x204] | (io_regs[0x205] << 8);
+    frac += n * x16 * ((w & 0x10) ? 2u : 3u);
+    charge((s32)(frac >> 4));
+    frac &= 15;
+}
+
 /* ---- I/O Write Hook ---- */
 
 /* Dispatches side effects when the game writes to I/O registers. */
@@ -853,8 +923,10 @@ static inline void mem_write32_raw(u8* mem, u32 off, u32 val) {
     mem[off+3] = (u8)(val >> 24);
 }
 
-u32 bus_read32(u32 addr) {
-    advance_cycles(4);
+static u32 read32_(u32 addr);
+u32 bus_read32(u32 addr) { charge(data_cycles(addr, 1, 1)); return read32_(addr); }
+
+static u32 read32_(u32 addr) {
     addr &= ~3u;
     u32 region = addr >> 24;
     u32 offset;
@@ -932,8 +1004,12 @@ u32 bus_read32(u32 addr) {
     }
 }
 
-u16 bus_read16(u32 addr) {
-    advance_cycles(2);
+u32 bus_read32s(u32 addr) { charge(data_cycles(addr, 1, 0)); return read32_(addr); }
+
+static u16 read16_(u32 addr);
+u16 bus_read16(u32 addr) { charge(data_cycles(addr, 0, 1)); return read16_(addr); }
+
+static u16 read16_(u32 addr) {
     addr &= ~1u;
     u32 region = addr >> 24;
     u32 offset;
@@ -970,8 +1046,10 @@ u16 bus_read16(u32 addr) {
     }
 }
 
-u8 bus_read8(u32 addr) {
-    advance_cycles(2);
+static u8 read8_(u32 addr);
+u8 bus_read8(u32 addr) { charge(data_cycles(addr, 0, 1)); return read8_(addr); }
+
+static u8 read8_(u32 addr) {
     u32 region = addr >> 24;
     u32 offset;
 
@@ -1010,7 +1088,7 @@ static void watch_check(u32 addr, u32 value, int size) {
             in_irq ? " [irq]" : "");
 }
 
-void bus_write32(u32 addr, u32 value) {
+static void bus_write32_(u32 addr, u32 value) {
     watch_check(addr, value, 4);
     addr &= ~3u;
     u32 region = addr >> 24;
@@ -1052,7 +1130,7 @@ void bus_write32(u32 addr, u32 value) {
     }
 }
 
-void bus_write16(u32 addr, u16 value) {
+static void bus_write16_(u32 addr, u16 value) {
     watch_check(addr, value, 2);
     addr &= ~1u;
     u32 region = addr >> 24;
@@ -1090,7 +1168,7 @@ void bus_write16(u32 addr, u16 value) {
     }
 }
 
-void bus_write8(u32 addr, u8 value) {
+static void bus_write8_(u32 addr, u8 value) {
     watch_check(addr, value, 1);
     u32 region = addr >> 24;
 
@@ -1132,6 +1210,10 @@ void bus_write8(u32 addr, u8 value) {
     }
 }
 
+void bus_write32(u32 addr, u32 value) { bus_write32_(addr, value); charge(data_cycles(addr, 1, 0)); }
+void bus_write16(u32 addr, u16 value) { bus_write16_(addr, value); charge(data_cycles(addr, 0, 0)); }
+void bus_write8(u32 addr, u8 value)   { bus_write8_(addr, value);  charge(data_cycles(addr, 0, 0)); }
+
 /* ---- CPSR/SPSR ---- */
 
 u32 cpu_get_cpsr(void) {
@@ -1164,7 +1246,32 @@ void cpu_set_spsr(u32 value, u32 mask) {
 
 /* ---- Software Interrupts (BIOS HLE) ---- */
 
+/* Time the BIOS takes, from mGBA's HLE BIOS (src/gba/bios.c): the call and
+ * return cost the same for every SWI but the waits, plus each routine's own
+ * loop; the routines' memory accesses charge themselves */
+static int clz32_(u32 v) { int n = 0; if (!v) return 32; while (!(v & 0x80000000u)) { v <<= 1; n++; } return n; }
+static void div_cycles(s32 num, s32 den) {
+    int loops = clz32_((u32)den) - clz32_((u32)num);
+    advance_cycles(4 + 13 * (loops < 1 ? 1 : loops) + 7);
+}
+
+static void gba_swi_(u32 number);
 void gba_swi(u32 number) {
+    if (number == 0x00 || number == 0x02 || number == 0x04 || number == 0x05) {
+        gba_swi_(number);
+        return;
+    }
+    /* call and return: 45 + N + (N + S) */
+    u16 w = io_regs[0x204] | (io_regs[0x205] << 8);
+    advance_cycles(45 + 2 * (access_cycles(0x08000000u, 0) - 1) + ((w & 0x10) ? 1 : 2));
+    /* CpuSet and CpuFastSet run as BIOS code (mGBA doesn't HLE them) */
+    u32 saved_mode = bus_mode;
+    bus_mode = (number == 0x0B || number == 0x0C) ? BUS_RAM_CODE : BUS_BIOS_HLE;
+    gba_swi_(number);
+    bus_mode = saved_mode;
+}
+
+static void gba_swi_(u32 number) {
     switch (number) {
     case 0x00: /* SoftReset */
         memset(iwram + 0x7E00, 0, 0x200);
@@ -1234,6 +1341,7 @@ void gba_swi(u32 number) {
             if (abs_result < 0) abs_result = -abs_result;
             r[3] = (u32)abs_result;
         }
+        div_cycles(num, den);
         break;
     }
 
@@ -1247,6 +1355,7 @@ void gba_swi(u32 number) {
             if (abs_result < 0) abs_result = -abs_result;
             r[3] = (u32)abs_result;
         }
+        div_cycles(num, den);
         break;
     }
 
@@ -1313,12 +1422,14 @@ void gba_swi(u32 number) {
             for (u32 i = 0; i < count; i++) {
                 u32 val = fill ? fill_val : bus_read32(src + i * 4);
                 bus_write32(dst + i * 4, val);
+                if (number == 0x0B) advance_cycles(4);
             }
         } else {
             u16 fill_val = bus_read16(src);
             for (u32 i = 0; i < count; i++) {
                 u16 val = fill ? fill_val : bus_read16(src + i * 2);
                 bus_write16(dst + i * 2, val);
+                advance_cycles(4);
             }
         }
         break;
@@ -1402,13 +1513,16 @@ void gba_swi(u32 number) {
         u32 src = r[0];
         u32 dst = r[1];
         u32 header = bus_read32(src);
+        advance_cycles(20);
         u32 decomp_size = header >> 8;
         u32 sp = src + 4;
         u32 dp = 0;
 
         while (dp < decomp_size) {
             u8 flags = bus_read8(sp++);
+            advance_cycles(14);
             for (int i = 7; i >= 0 && dp < decomp_size; i--) {
+                advance_cycles(32);
                 if (flags & (1 << i)) {
                     /* Compressed */
                     u8 b1 = bus_read8(sp++);
@@ -1417,6 +1531,7 @@ void gba_swi(u32 number) {
                     u32 disp = ((u32)(b1 & 0xF) << 8) | b2;
                     u32 ref = dp - disp - 1;
                     for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                        advance_cycles(10);
                         bus_write8(dst + dp, bus_read8(dst + ref + j));
                         dp++;
                     }
@@ -1433,6 +1548,7 @@ void gba_swi(u32 number) {
         u32 src = r[0];
         u32 dst = r[1];
         u32 header = bus_read32(src);
+        advance_cycles(20);
         u32 decomp_size = header >> 8;
         u32 sp = src + 4;
         u32 dp = 0;
@@ -1441,8 +1557,10 @@ void gba_swi(u32 number) {
 
         while (dp < decomp_size) {
             u8 flags = bus_read8(sp++);
+            advance_cycles(14);
             for (int i = 7; i >= 0 && dp < decomp_size; i--) {
                 u8 byte;
+                advance_cycles(32);
                 if (flags & (1 << i)) {
                     u8 b1 = bus_read8(sp++);
                     u8 b2 = bus_read8(sp++);
@@ -1450,6 +1568,7 @@ void gba_swi(u32 number) {
                     u32 disp = ((u32)(b1 & 0xF) << 8) | b2;
                     u32 ref = dp - disp - 1;
                     for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                        advance_cycles(14);
                         byte = bus_read8(dst + ref + j);
                         tmp_buf[tmp_idx++] = byte;
                         if (tmp_idx == 2) {
@@ -1559,7 +1678,15 @@ void gba_swi(u32 number) {
  * DMA helpers). Rather than requiring all RAM code to be pre-compiled,
  * we interpret it on the fly. This covers the common case of init code
  * that the recompiled ROM functions call via BX to RAM addresses. */
+static void run_iwram_function_(u32 target);
 void run_iwram_function(u32 target) {
+    u32 saved_mode = bus_mode;   /* ponytail: calls back into ROM code keep this */
+    bus_mode = BUS_RAM_CODE;
+    run_iwram_function_(target);
+    bus_mode = saved_mode;
+}
+
+static void run_iwram_function_(u32 target) {
     static int call_count = 0;
     /* Quick sanity check: if target has Thumb bit set, check for valid Thumb prologue.
      * If target is even (ARM mode), skip the check - ARM instruction bytes often look like ASCII.
@@ -1629,12 +1756,15 @@ void run_iwram_function(u32 target) {
     int steps = 0;
     int max_steps = 2000000;
 
+    u32 next_pc = pc;   /* a jump elsewhere refills the pipeline: N + S */
     while (steps < max_steps) {
         steps++;
+        if (pc != next_pc) charge(2 * access_cycles(pc, !thumb));
 
         if (!thumb) {
             /* ARM mode interpreter */
-            u32 insn = bus_read32(pc);
+            charge(access_cycles(pc, 1)); u32 insn = read32_(pc);
+            next_pc = pc + 4;
             pc += 4;
 
             /* Check condition */
@@ -2047,7 +2177,8 @@ void run_iwram_function(u32 target) {
         }
 
         /* Thumb mode interpreter */
-        u16 insn = bus_read16(pc);
+        charge(access_cycles(pc, 0)); u16 insn = read16_(pc);
+        next_pc = pc + 2;
         pc += 2;
 
         /* Format 2: Add/Sub - MUST check before Format 1 (overlapping encoding) */
@@ -2362,7 +2493,7 @@ void run_iwram_function(u32 target) {
 
         /* Format 19: Long branch with link (BL) */
         if ((insn & 0xF800) == 0xF000) {
-            u16 insn2 = bus_read16(pc);
+            charge(access_cycles(pc, 0)); u16 insn2 = read16_(pc);
             pc += 2;
             if ((insn2 & 0xF800) == 0xF800) {
                 s32 off_hi = (s32)((insn & 0x07FF) << 21) >> 9;
