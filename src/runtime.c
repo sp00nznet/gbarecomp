@@ -1272,6 +1272,18 @@ static void div_cycles(s32 num, s32 den) {
 
 static void gba_swi_(u32 number);
 void gba_swi(u32 number) {
+    {
+        /* GBA_SWI_LOG=from,to: each SWI in those frames with its scanline,
+         * to line up with tools/oracle's ORACLE_SWI when timing drifts */
+        static long from = -2, to = -1;
+        if (from == -2) {
+            const char* e = getenv("GBA_SWI_LOG");
+            from = -1;
+            if (e) sscanf(e, "%ld,%ld", &from, &to);
+        }
+        if ((long)frame_count >= from && (long)frame_count <= to)
+            fprintf(stderr, "SWI %02X f=%u v=%u\n", number, frame_count, scanline);
+    }
     if (number == 0x00 || number == 0x02 || number == 0x04 || number == 0x05) {
         gba_swi_(number);
         return;

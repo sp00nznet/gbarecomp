@@ -22,6 +22,7 @@ versions follow SemVer once the first one is tagged.
 - `tools/conformance.py` fails on more failing functions than the baseline (`passed total`), not on fewer passes.
 
 ### Added
+- SWI timelines for chasing timing drift: `GBA_SWI_LOG=from,to` in the runtime and `ORACLE_SWI=from,to` in `tools/oracle` print each BIOS call in those frames with its scanline. (#23)
 - Affine sprites: OAM rotation/scaling parameters, double-size boxes, sampled about the sprite centre as on hardware. Before, they were skipped. Advance Wars' results screen lost its "Victory!" title, score labels and rank medal. (#19)
 - PPU windows: WIN0, WIN1 and the OBJ window mask layers and colour effects per pixel, with wrap-around ranges as mGBA does. (#9)
 - Headless-only builds: without SDL2 the generated project builds with `GBA_NO_SDL` instead of failing, so a build farm without SDL2 can build and run QA. The runtime no longer uses SDL (libm for its trig, pacing moved to the display module).
