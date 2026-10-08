@@ -466,6 +466,9 @@ static u32 dma_src_latch[4] = {0};
 /* Who is on the bus, for timing (see data_cycles) */
 enum { BUS_ROM_CODE, BUS_RAM_CODE, BUS_DMA, BUS_BIOS_HLE };
 static u32 bus_mode = BUS_ROM_CODE;
+/* Inside a store-multiple after its first word: mGBA's STM waits for one
+ * VRAM slot and the burst's own cycles cover the rest */
+static bool vram_burst;
 static u32 dma_dst_latch[4] = {0};
 
 static void dma_transfer(int channel) {
@@ -815,15 +818,61 @@ static void charge(s32 c) {
     if (c > 0) advance_cycles((u32)c);
 }
 
+/* While a line is drawn, the CPU waits for a VRAM slot the background
+ * fetches leave free (mGBA's GBAMemoryStallVRAM): each enabled layer takes
+ * slots in a 32-cycle pattern. A word needs two slots. Only CPU code pays
+ * it; mGBA's DMA and HLE BIOS don't, and the prefetcher hides it from ROM
+ * code. */
+static u32 vram_stall(u32 addr, int wide) {
+#define VS_T4(x) (0x011u << (x))
+#define VS_T8(x) (0x010u << (x))
+#define VS_A2 0x100u
+#define VS_A3 0x200u
+#define VS_B  0x400u
+    static const u16 lut[32] = {
+        VS_T4(0) | VS_A3, VS_T4(1) | VS_A3, VS_T4(2) | VS_A2, VS_T4(3) | VS_A2 | VS_B,
+        VS_T4(0) | VS_A3, VS_T4(1) | VS_A3, VS_T4(2) | VS_A2, VS_T4(3) | VS_A2 | VS_B,
+        VS_A3, VS_A3, VS_A2, VS_A2 | VS_B,
+        VS_T8(0) | VS_A3, VS_T8(1) | VS_A3, VS_T8(2) | VS_A2, VS_T8(3) | VS_A2 | VS_B,
+        VS_A3, VS_A3, VS_A2, VS_A2 | VS_B,
+        VS_T4(0) | VS_A3, VS_T4(1) | VS_A3, VS_T4(2) | VS_A2, VS_T4(3) | VS_A2 | VS_B,
+        VS_A3, VS_A3, VS_A2, VS_A2 | VS_B,
+        VS_T8(0) | VS_A3, VS_T8(1) | VS_A3, VS_T8(2) | VS_A2, VS_T8(3) | VS_A2 | VS_B,
+    };
+    enum { HDRAW = 1008 };   /* mGBA's draw period; its HBlank starts here */
+    if ((addr >> 24) != 0x06 || vram_burst || scanline >= VISIBLE_SCANLINES || scanline_cycles >= HDRAW) return 0;
+    u16 dispcnt = io_read16(0x000);
+    u32 mode = dispcnt & 7, mask = 0;
+    if ((dispcnt & 0x80) || (addr & 0x1FFFF) >= (mode >= 3 ? 0x14000u : 0x10000u)) return 0;
+    if (mode <= 1)
+        for (u32 i = 0; i < (mode ? 2u : 4u); i++)
+            if (dispcnt & (0x100 << i))
+                mask |= (io_read16(0x008 + 2 * i) & 0x80) ? VS_T8(i) : VS_T4(i);
+    if (mode == 1 && (dispcnt & 0x400)) mask |= VS_A2;
+    if (mode == 2) mask |= ((dispcnt & 0x400) ? VS_A2 : 0) | ((dispcnt & 0x800) ? VS_A3 : 0);
+    if (mode >= 3 && mode <= 5 && (dispcnt & 0x400)) mask |= VS_B;
+    if (!mask) return 0;
+    s32 until = HDRAW - (s32)scanline_cycles, stall = until, extra = wide;
+    for (s32 i = 0; i < 16; i++)
+        if (!(lut[(-until + i) & 31] & mask) && !extra--) { stall = i; break; }
+    stall -= wide;   /* a word's second half is already in its access time */
+    return stall > 0 ? (u32)stall : 0;
+#undef VS_T4
+#undef VS_T8
+#undef VS_A2
+#undef VS_A3
+#undef VS_B
+}
+
 static s32 data_cycles(u32 addr, int wide, int load) {
     bool cart = addr >= 0x08000000u;
     switch (bus_mode) {
     case BUS_ROM_CODE:
-        if (!(io_regs[0x205] & 0x40)) return access_cycles(addr, wide) + load + 2;
+        if (!(io_regs[0x205] & 0x40)) return access_cycles(addr, wide) + load + 2 + vram_stall(addr, wide);
         return cart ? (s32)access_cycles(addr, wide) + load + 2 : 0;
     case BUS_BIOS_HLE:
         return cart ? (s32)access_cycles(addr, wide) + load : -2;
-    case BUS_RAM_CODE: return access_cycles(addr, wide) + load;
+    case BUS_RAM_CODE: return access_cycles(addr, wide) + load + vram_stall(addr, wide);
     default:           return access_cycles(addr, wide);
     }
 }
@@ -1447,9 +1496,15 @@ static void gba_swi_(u32 number) {
         if (word) {
             u32 fill_val = bus_read32(src);
             for (u32 i = 0; i < count; i++) {
-                u32 val = fill ? fill_val : bus_read32(src + i * 4);
+                /* CpuFastSet moves 8 words per LDMIA/STMIA: one internal
+                 * cycle and one VRAM stall per burst */
+                bool burst = number == 0x0C && (i & 7);
+                u32 val = fill ? fill_val : burst ? bus_read32s(src + i * 4) : bus_read32(src + i * 4);
+                vram_burst = burst;
                 bus_write32(dst + i * 4, val);
+                vram_burst = false;
                 if (number == 0x0B) advance_cycles(4);
+                else if ((i & 7) == 7) advance_cycles(5);   /* BIOS loop per 8 words */
             }
         } else {
             u16 fill_val = bus_read16(src);
