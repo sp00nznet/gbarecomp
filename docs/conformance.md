@@ -71,8 +71,9 @@ Notes:
   delete the recompiled build's `.sav` before comparing: a save written by an
   older build sent Advance Wars down a different boot path and looked like a
   bug for an hour.
-- The recompiled build boots about 15 frames faster than hardware (its
-  instruction timing is approximate), so compare by scene, not frame number,
-  early on.
+- Timing follows mGBA's cycle model but isn't cycle-exact: Advance Wars
+  stays within a few frames of the oracle. An input script whose press lands
+  on the frame a text box opens or finishes can go either way, so keep
+  presses clear of those edges.
 - The I/O region differs in harmless ways (timer counters are latched, sound
   FIFO contents, pending IF bits); look at EWRAM, PAL, VRAM and OAM first.

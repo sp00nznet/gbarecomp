@@ -630,12 +630,15 @@ void translate_arm_insn(TranslateCtx* ctx, const ArmInsn* insn, u32 addr) {
         emit(ctx, "u32 _addr = %s + (u32)(%d);", reg_c(insn->rn), start);
         if (insn->w && !loads_rn)   /* ARM7: an LDM that loads Rn keeps the loaded value */
             emit(ctx, "%s = %s + (u32)(%d);", reg_c(insn->rn), reg_c(insn->rn), insn->u ? 4 * n : -4 * n);
+        const char* rd32 = "bus_read32";   /* one internal cycle per LDM */
         for (int i = 0; i < 16; i++) {
             if (!(insn->reg_list & (1 << i))) continue;
-            if (insn->type == ARM_LDM)
-                emit(ctx, "r[%d] = bus_read32(_addr); _addr += 4;", i);
-            else
+            if (insn->type == ARM_LDM) {
+                emit(ctx, "r[%d] = %s(_addr); _addr += 4;", i, rd32);
+                rd32 = "bus_read32s";
+            } else {
                 emit(ctx, "bus_write32(_addr, r[%d]); _addr += 4;", i);
+            }
         }
         if (insn->type == ARM_LDM && (insn->reg_list & (1 << REG_PC)))
             emit(ctx, "RECOMP_RETURN(r[15]); /* LDM {.., pc} */");
@@ -1034,13 +1037,15 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
         ctx->indent++;
         if (insn->is_load) {
             /* POP */
+            const char* rd32 = "bus_read32";   /* one internal cycle per POP */
             for (int i = 0; i < 8; i++) {
                 if (insn->rlist & (1 << i)) {
-                    emit(ctx, "r[%d] = bus_read32(r[13]); r[13] += 4;", i);
+                    emit(ctx, "r[%d] = %s(r[13]); r[13] += 4;", i, rd32);
+                    rd32 = "bus_read32s";
                 }
             }
             if (insn->pc_or_lr) {
-                emit(ctx, "r[15] = bus_read32(r[13]); r[13] += 4;");
+                emit(ctx, "r[15] = %s(r[13]); r[13] += 4;", rd32);
                 emit(ctx, "RECOMP_RETURN(r[15]); /* POP {PC} */");
             }
         } else {
@@ -1062,10 +1067,12 @@ void translate_thumb_insn(TranslateCtx* ctx, const ThumbInsn* insn, u32 addr) {
         emit(ctx, "{");
         ctx->indent++;
         emit(ctx, "u32 _addr = %s;", reg_c((u8)insn->rs));
+        const char* rd32 = "bus_read32";   /* one internal cycle per LDMIA */
         for (int i = 0; i < 8; i++) {
             if (!(insn->rlist & (1 << i))) continue;
             if (insn->is_load) {
-                emit(ctx, "r[%d] = bus_read32(_addr); _addr += 4;", i);
+                emit(ctx, "r[%d] = %s(_addr); _addr += 4;", i, rd32);
+                rd32 = "bus_read32s";
             } else {
                 emit(ctx, "bus_write32(_addr, r[%d]); _addr += 4;", i);
             }
@@ -1250,6 +1257,7 @@ void translate_function(TranslateCtx* ctx, const Function* func) {
 
         /* Emit label for this block */
         emit_raw(ctx, "label_%08X: ;\n", block->start);
+        emit(ctx, "cpu_fetches(%uu);", (block->end - block->start) / 2 + 2);  /* + a refill */
 
         if (block->mode == CODE_ARM) {
             for (u32 addr = block->start; addr < block->end; addr += 4) {
