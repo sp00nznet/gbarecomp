@@ -69,8 +69,13 @@ Notes:
 
 - When the two drift apart in time, line up their BIOS calls:
   `ORACLE_SWI=from,to` on the oracle and `GBA_SWI_LOG=from,to` on the
-  build print each SWI with its frame and scanline. Advance Wars' LZ77
-  decompressions showed where its battle-to-map load ran long.
+  build print each SWI with its frame, scanline, cycle counter, r0-r2 and
+  lr. The cycle difference between two matching calls is what the code
+  between them cost on each side; that's how Advance Wars' battle load
+  turned out to be VRAM waits inside `CpuFastSet`.
+- `ORACLE_WATCH=addr` prints a RAM byte each frame it changes. Advance
+  Wars' 0x03001D18 is 1 while a text box waits for A, which places input
+  script presses clear of the frames where a line finishes.
 - Start both from the same save state. The oracle doesn't load a `.sav`, so
   delete the recompiled build's `.sav` before comparing: a save written by an
   older build sent Advance Wars down a different boot path and looked like a

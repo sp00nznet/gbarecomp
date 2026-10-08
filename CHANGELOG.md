@@ -23,6 +23,7 @@ versions follow SemVer once the first one is tagged.
 - `tools/conformance.py` fails on more failing functions than the baseline (`passed total`), not on fewer passes.
 
 ### Added
+- SWI logs carry the cycle counter, r0-r2 and lr, so matching calls on the build and the oracle show what the code between them cost; `ORACLE_WATCH=addr` prints a RAM byte each frame it changes, a game-flag timeline for placing input script presses. (#26)
 - SWI timelines for chasing timing drift: `GBA_SWI_LOG=from,to` in the runtime and `ORACLE_SWI=from,to` in `tools/oracle` print each BIOS call in those frames with its scanline. (#23)
 - Affine sprites: OAM rotation/scaling parameters, double-size boxes, sampled about the sprite centre as on hardware. Before, they were skipped. Advance Wars' results screen lost its "Victory!" title, score labels and rank medal. (#19)
 - PPU windows: WIN0, WIN1 and the OBJ window mask layers and colour effects per pixel, with wrap-around ranges as mGBA does. (#9)
