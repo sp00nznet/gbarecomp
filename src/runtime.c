@@ -1331,7 +1331,8 @@ void gba_swi(u32 number) {
             if (e) sscanf(e, "%ld,%ld", &from, &to);
         }
         if ((long)frame_count >= from && (long)frame_count <= to)
-            fprintf(stderr, "SWI %02X f=%u v=%u\n", number, frame_count, scanline);
+            fprintf(stderr, "SWI %02X f=%u v=%u c=%u r0=%08X r1=%08X r2=%08X lr=%08X\n",
+                    number, frame_count, scanline, cycle_counter, r[0], r[1], r[2], r[14]);
     }
     if (number == 0x00 || number == 0x02 || number == 0x04 || number == 0x05) {
         gba_swi_(number);

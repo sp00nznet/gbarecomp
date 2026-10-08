@@ -37,7 +37,10 @@ static void quiet_log(struct mLogger* l, int cat, enum mLogLevel lvl, const char
     (void)l; (void)cat; (void)lvl;
     if (s_frame >= s_swi_from && s_frame <= s_swi_to && !strncmp(fmt, "SWI: ", 5)) {
         unsigned imm = va_arg(ap, unsigned);
-        fprintf(stderr, "SWI %02X f=%ld v=%d\n", imm, s_frame, s_gba->video.vcount);
+        const int32_t* g = s_gba->cpu->gprs;
+        fprintf(stderr, "SWI %02X f=%ld v=%d c=%u r0=%08X r1=%08X r2=%08X lr=%08X\n",
+                imm, s_frame, s_gba->video.vcount, (unsigned)mTimingCurrentTime(&s_gba->timing),
+                (unsigned)g[0], (unsigned)g[1], (unsigned)g[2], (unsigned)g[14]);
     }
 }
 
@@ -92,6 +95,10 @@ int main(int argc, char* argv[]) {
         if (e) sscanf(e, "%ld,%ld", &s_swi_from, &s_swi_to);
     }
 
+    const char* we = getenv("ORACLE_WATCH");
+    uint32_t watch = we ? (uint32_t)strtoul(we, NULL, 16) : 0;
+    int watch_last = -1;
+
     FILE* in = input ? fopen(input, "r") : NULL;
     long next_frame = -1; unsigned next_keys = 0, keys = 0;
 
@@ -121,6 +128,13 @@ int main(int argc, char* argv[]) {
         }
         for (int d = 0; d < ndump; d++)
             if (dump_frame[d] == f) dump(gba, dump_path[d]);
+        if (watch) {
+            /* ORACLE_WATCH=addr: the byte there at each frame end, when it
+             * changes; a game flag timeline to place script presses by */
+            int v = core->rawRead8(core, watch, -1);
+            if (v != watch_last) fprintf(stderr, "[watch] frame %ld: [%08X] = %02X\n", f, watch, v);
+            watch_last = v;
+        }
     }
     if (shot) {
         /* mColor is XBGR8888 here: write a top-down 32-bit BMP (BGRA) */
